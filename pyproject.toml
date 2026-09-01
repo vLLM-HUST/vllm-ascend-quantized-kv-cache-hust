@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-ascend-quantized-kv-cache"
+version = "0.1.0.dev0"
+description = "vllm-ascend-quantized-kv-cache inert vLLM-HUST contract descriptor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
+
+[project.entry-points."vllm_hust.extension_bundles"]
+"org.vllm-hust.quantized-kv-cache" = "vllm_ascend_quantized_kv_cache"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vllm_ascend_quantized_kv_cache"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]

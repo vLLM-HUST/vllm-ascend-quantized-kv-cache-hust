@@ -1,0 +1,1301 @@
+From c5f82a13e863a9b9da26466947e3bf7cfa5a9227 Mon Sep 17 00:00:00 2001
+From: junhuizhang-boop <junhui.zhang@novita.ai>
+Date: Mon, 10 Aug 2026 15:10:37 +0800
+Subject: [PATCH] ci: harden guarded historical benchmark publication replay
+ (#235)
+
+* ci: add guarded historical benchmark publication replay
+
+Download a pinned Actions artifact on a GitHub-hosted runner, validate its identity and admission inputs, and perform a writer-scoped publication with strict base and post-push verification. Add an expected-base guard to the shared sync script to reject races before commit.
+
+Assisted-by: OpenAI Codex
+
+Signed-off-by: Junhui Zhang <junhui.zhang@novita.ai>
+
+* ci: harden historical publication replay
+
+Bind replay to the reviewed source run and benchmark packet, retry controller fetches, and keep writer credentials out of child environments.
+
+Assisted-by: OpenAI Codex
+
+Signed-off-by: Junhui Zhang <junhui.zhang@novita.ai>
+
+---------
+
+Signed-off-by: Junhui Zhang <junhui.zhang@novita.ai>
+---
+ .../replay-ascend-benchmark-publication.yml   | 139 +++++
+ .../scripts/replay_benchmark_publication.sh   | 411 +++++++++++++++
+ .../sync_benchmark_snapshots_to_github.sh     |  17 +
+ tests/ci/test_replay_benchmark_publication.py | 487 ++++++++++++++++++
+ ...y_benchmark_publication_workflow_static.py | 112 ++++
+ ...test_sync_benchmark_snapshots_to_github.py |  32 ++
+ 6 files changed, 1198 insertions(+)
+ create mode 100644 .github/workflows/replay-ascend-benchmark-publication.yml
+ create mode 100755 .github/workflows/scripts/replay_benchmark_publication.sh
+ create mode 100644 tests/ci/test_replay_benchmark_publication.py
+ create mode 100644 tests/ci/test_replay_benchmark_publication_workflow_static.py
+
+diff --git a/.github/workflows/replay-ascend-benchmark-publication.yml b/.github/workflows/replay-ascend-benchmark-publication.yml
+new file mode 100644
+index 000000000..cb751e35b
+--- /dev/null
++++ b/.github/workflows/replay-ascend-benchmark-publication.yml
+@@ -0,0 +1,139 @@
++name: Replay Ascend Benchmark Publication
++
++on:
++  workflow_dispatch:
++    inputs:
++      confirmation:
++        description: Enter publish-31004708110-1 to authorize the approved packet
++        required: true
++        type: string
++
++permissions:
++  actions: read
++  contents: read
++
++concurrency:
++  group: ascend-benchmark-publication-replay-main
++  cancel-in-progress: false
++
++jobs:
++  replay-publication:
++    if: ${{ github.ref == 'refs/heads/main' }}
++    runs-on: ubuntu-latest
++    timeout-minutes: 20
++    env:
++      # This is the reviewed, immutable replay packet. Only confirmation remains
++      # operator-supplied; changing any identity requires a new reviewed commit.
++      SOURCE_RUN_ID: "31004708110"
++      SOURCE_RUN_ATTEMPT: "1"
++      EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"
++      EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"
++      REPLAY_CONFIRMATION: ${{ inputs.confirmation }}
++      REPLAY_ARTIFACT_ROOT: ${{ github.workspace }}/source-artifact
++      BENCHMARK_REPO_DIR: ${{ github.workspace }}/vllm-hust-benchmark
++      WEBSITE_REPO_DIR: ${{ github.workspace }}/vllm-hust-website
++      VLLM_HUST_REPO_DIR: ${{ github.workspace }}
++      EXPECTED_WEBSITE_SHA: 9740d1470e8a9dbd2191f5c082498e24ef414a6e
++      EXPECTED_SYNC_SCRIPT_SHA256: 1e647db41b7bc458cf051c8ae124c51381ea47a694afbc566b7c8aa9b71ec267
++      REPLAY_RECEIPT_FILE: ${{ github.workspace }}/.replay-output/benchmark-publication-replay.env
++      LOCAL_SNAPSHOT_OUTPUT_DIR: ${{ github.workspace }}/.replay-output/benchmark-publication-snapshots
++
++    steps:
++      - name: Checkout Core replay controller
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          persist-credentials: false
++
++      - name: Checkout approved benchmark main
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          repository: vLLM-HUST/vllm-hust-benchmark
++          ref: 734f3fc3cc7a809889ac1780a1fd980e98226cef
++          fetch-depth: 0
++          path: vllm-hust-benchmark
++          persist-credentials: false
++
++      - name: Verify approved source run metadata
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          set -euo pipefail
++          run_json=$(curl --fail --silent --show-error \
++            -H "Accept: application/vnd.github+json" \
++            -H "Authorization: Bearer ${GH_TOKEN}" \
++            -H "X-GitHub-Api-Version: 2022-11-28" \
++            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")
++          jq -e \
++            --arg expected_sha "$EXPECTED_TARGET_SHA" \
++            --arg expected_attempt "$SOURCE_RUN_ATTEMPT" \
++            '(.path == ".github/workflows/ascend-benchmark-leaderboard.yml")
++             and (.event == "push")
++             and (.head_branch == "main")
++             and (.head_sha == $expected_sha)
++             and ((.run_attempt | tostring) == $expected_attempt)
++             and (.status == "completed")
++             and (.conclusion == "success")' \
++            <<<"$run_json" >/dev/null
++
++      - name: Checkout pinned website aggregator
++        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
++        with:
++          repository: vLLM-HUST/vllm-hust-website
++          ref: 9740d1470e8a9dbd2191f5c082498e24ef414a6e
++          path: vllm-hust-website
++          persist-credentials: false
++
++      - name: Download immutable source artifact
++        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
++        with:
++          name: ascend-benchmark-31004708110-1
++          path: source-artifact
++          github-token: ${{ github.token }}
++          repository: ${{ github.repository }}
++          run-id: 31004708110
++
++      - name: Set up validation Python
++        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
++        with:
++          python-version: "3.12"
++
++      - name: Install publication validation dependency
++        run: python -m pip install --disable-pip-version-check jsonschema==4.23.0
++
++      - name: Validate replay without writer credential
++        run: bash .github/workflows/scripts/replay_benchmark_publication.sh preflight
++
++      - name: Publish and verify historical artifact
++        env:
++          REPLAY_WRITER_TOKEN: ${{ secrets.VLLM_HUST_BENCHMARK_GH_TOKEN }}
++        run: |
++          bash .github/workflows/scripts/replay_benchmark_publication.sh publish
++          cat "$REPLAY_RECEIPT_FILE" >> "$GITHUB_ENV"
++
++      - name: Write replay summary
++        if: ${{ always() }}
++        run: |
++          {
++            echo "### Ascend benchmark publication replay"
++            echo
++            echo "- Source run: \`${SOURCE_RUN_ID}\`"
++            echo "- Source attempt: \`${SOURCE_RUN_ATTEMPT}\`"
++            echo "- Expected target SHA: \`${EXPECTED_TARGET_SHA}\`"
++            echo "- Approved benchmark base: \`${EXPECTED_BENCHMARK_MAIN_SHA}\`"
++            if [[ -f "$REPLAY_RECEIPT_FILE" ]]; then
++              sed 's/^/- /' "$REPLAY_RECEIPT_FILE"
++            else
++              echo "- Receipt: \`not-created\`"
++            fi
++          } >> "$GITHUB_STEP_SUMMARY"
++
++      - name: Upload replay receipt
++        if: ${{ always() }}
++        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
++        with:
++          name: benchmark-publication-replay-31004708110-1
++          path: |
++            ${{ github.workspace }}/.replay-output/benchmark-publication-replay.env
++            ${{ github.workspace }}/.replay-output/benchmark-publication-snapshots
++          if-no-files-found: warn
++          retention-days: 30
+diff --git a/.github/workflows/scripts/replay_benchmark_publication.sh b/.github/workflows/scripts/replay_benchmark_publication.sh
+new file mode 100755
+index 000000000..2e243a694
+--- /dev/null
++++ b/.github/workflows/scripts/replay_benchmark_publication.sh
+@@ -0,0 +1,411 @@
++#!/bin/bash
++set -euo pipefail
++
++mode=${1:-}
++case "$mode" in
++  preflight|publish) ;;
++  *)
++    echo "usage: $0 <preflight|publish>" >&2
++    exit 2
++    ;;
++esac
++
++require_env() {
++  local name=$1
++  if [[ -z "${!name:-}" ]]; then
++    echo "$name is required" >&2
++    exit 2
++  fi
++}
++
++for name in \
++  SOURCE_RUN_ID SOURCE_RUN_ATTEMPT EXPECTED_TARGET_SHA \
++  EXPECTED_BENCHMARK_MAIN_SHA REPLAY_CONFIRMATION REPLAY_ARTIFACT_ROOT \
++  BENCHMARK_REPO_DIR WEBSITE_REPO_DIR VLLM_HUST_REPO_DIR \
++  EXPECTED_WEBSITE_SHA EXPECTED_SYNC_SCRIPT_SHA256; do
++  require_env "$name"
++done
++
++REPLAY_FETCH_MAX_ATTEMPTS=${REPLAY_FETCH_MAX_ATTEMPTS:-4}
++REPLAY_FETCH_RETRY_SECONDS=${REPLAY_FETCH_RETRY_SECONDS:-5}
++case "$REPLAY_FETCH_MAX_ATTEMPTS" in
++  ''|*[!0-9]*|0*)
++    echo "REPLAY_FETCH_MAX_ATTEMPTS must be a positive integer" >&2
++    exit 2
++    ;;
++esac
++case "$REPLAY_FETCH_RETRY_SECONDS" in
++  ''|*[!0-9]*)
++    echo "REPLAY_FETCH_RETRY_SECONDS must be a non-negative integer" >&2
++    exit 2
++    ;;
++esac
++
++if [[ "$mode" == "publish" ]]; then
++  require_env REPLAY_WRITER_TOKEN
++  require_env REPLAY_RECEIPT_FILE
++fi
++
++case "$SOURCE_RUN_ID" in
++  ''|*[!0-9]*) echo "SOURCE_RUN_ID must contain only digits" >&2; exit 2 ;;
++esac
++case "$SOURCE_RUN_ATTEMPT" in
++  ''|*[!0-9]*|0*) echo "SOURCE_RUN_ATTEMPT must be a positive integer" >&2; exit 2 ;;
++esac
++for value_name in EXPECTED_TARGET_SHA EXPECTED_BENCHMARK_MAIN_SHA EXPECTED_WEBSITE_SHA; do
++  value=${!value_name}
++  if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
++    echo "$value_name must be a full lowercase Git SHA" >&2
++    exit 2
++  fi
++done
++if [[ ! "$EXPECTED_SYNC_SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
++  echo "EXPECTED_SYNC_SCRIPT_SHA256 must be a lowercase SHA-256" >&2
++  exit 2
++fi
++
++expected_confirmation="publish-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
++if [[ "$REPLAY_CONFIRMATION" != "$expected_confirmation" ]]; then
++  echo "REPLAY_CONFIRMATION must equal $expected_confirmation" >&2
++  exit 2
++fi
++
++submission_run_id="ci-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}-${EXPECTED_TARGET_SHA}"
++relative_submission_dir="submissions/$submission_run_id"
++artifact_name="ascend-benchmark-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
++sync_script="$VLLM_HUST_REPO_DIR/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh"
++required_submission_files=(
++  leaderboard_manifest.json
++  run_leaderboard.json
++  env-manifest.json
++  pip-packages.json
++  checksums.sha256
++  STATUS
++)
++required_snapshot_files=(
++  leaderboard_single.json
++  leaderboard_multi.json
++  leaderboard_compare.json
++  last_updated.json
++)
++
++if [[ ! -x "$sync_script" ]]; then
++  echo "publication sync script is missing or not executable: $sync_script" >&2
++  exit 2
++fi
++actual_sync_sha256=$(sha256sum "$sync_script" | awk '{print $1}')
++if [[ "$actual_sync_sha256" != "$EXPECTED_SYNC_SCRIPT_SHA256" ]]; then
++  echo "publication sync script digest mismatch" >&2
++  echo "expected=$EXPECTED_SYNC_SCRIPT_SHA256" >&2
++  echo "actual=$actual_sync_sha256" >&2
++  exit 2
++fi
++
++if [[ ! -d "$BENCHMARK_REPO_DIR/.git" ]]; then
++  echo "benchmark checkout is missing: $BENCHMARK_REPO_DIR" >&2
++  exit 2
++fi
++if [[ ! -f "$WEBSITE_REPO_DIR/scripts/aggregate_results.py" ]]; then
++  echo "website aggregator is missing: $WEBSITE_REPO_DIR" >&2
++  exit 2
++fi
++website_sha=$(git -C "$WEBSITE_REPO_DIR" rev-parse HEAD)
++if [[ "$website_sha" != "$EXPECTED_WEBSITE_SHA" ]]; then
++  echo "website checkout mismatch: expected $EXPECTED_WEBSITE_SHA, got $website_sha" >&2
++  exit 2
++fi
++
++if [[ -n "$(git -C "$BENCHMARK_REPO_DIR" status --porcelain)" ]]; then
++  echo "benchmark checkout must be clean before replay" >&2
++  exit 2
++fi
++remote_url=$(git -C "$BENCHMARK_REPO_DIR" remote get-url origin)
++if [[ "${ALLOW_LOCAL_REPLAY_REMOTE:-0}" != "1" ]]; then
++  case "$remote_url" in
++    https://github.com/vLLM-HUST/vllm-hust-benchmark|https://github.com/vLLM-HUST/vllm-hust-benchmark.git) ;;
++    *) echo "unexpected benchmark origin: $remote_url" >&2; exit 2 ;;
++  esac
++fi
++fetch_target_branch_with_retry() {
++  local phase=$1
++  local attempt=1
++  while (( attempt <= REPLAY_FETCH_MAX_ATTEMPTS )); do
++    if [[ -n "${askpass_script:-}" ]]; then
++      if env GIT_ASKPASS="$askpass_script" GIT_TERMINAL_PROMPT=0 \
++        git -C "$BENCHMARK_REPO_DIR" fetch origin main; then
++        return 0
++      fi
++    elif git -C "$BENCHMARK_REPO_DIR" fetch origin main; then
++      return 0
++    fi
++    if (( attempt == REPLAY_FETCH_MAX_ATTEMPTS )); then
++      echo "replay ${phase} fetch failed after ${REPLAY_FETCH_MAX_ATTEMPTS} attempts" >&2
++      return 1
++    fi
++    echo "replay ${phase} fetch failed; retrying in ${REPLAY_FETCH_RETRY_SECONDS}s (attempt $attempt/$REPLAY_FETCH_MAX_ATTEMPTS)" >&2
++    sleep "$REPLAY_FETCH_RETRY_SECONDS"
++    attempt=$((attempt + 1))
++  done
++}
++
++fetch_target_branch_with_retry preflight
++benchmark_head=$(git -C "$BENCHMARK_REPO_DIR" rev-parse HEAD)
++benchmark_remote_main=$(git -C "$BENCHMARK_REPO_DIR" rev-parse origin/main)
++if [[ "$benchmark_head" != "$EXPECTED_BENCHMARK_MAIN_SHA" \
++  || "$benchmark_remote_main" != "$EXPECTED_BENCHMARK_MAIN_SHA" ]]; then
++  echo "benchmark main moved; repeat the credential-free rehearsal" >&2
++  echo "expected=$EXPECTED_BENCHMARK_MAIN_SHA" >&2
++  echo "head=$benchmark_head" >&2
++  echo "origin/main=$benchmark_remote_main" >&2
++  exit 2
++fi
++
++submission_candidates=()
++while IFS= read -r candidate; do
++  submission_candidates+=("$candidate")
++done < <(find "$REPLAY_ARTIFACT_ROOT" -type d -path "*/submissions/$submission_run_id" -print)
++if [[ "${#submission_candidates[@]}" -ne 1 ]]; then
++  echo "expected exactly one $relative_submission_dir in $artifact_name; found ${#submission_candidates[@]}" >&2
++  exit 2
++fi
++submission_dir=${submission_candidates[0]}
++
++for file_name in "${required_submission_files[@]}"; do
++  file_path="$submission_dir/$file_name"
++  if [[ ! -f "$file_path" || -L "$file_path" ]]; then
++    echo "required replay evidence must be a regular file: $file_path" >&2
++    exit 2
++  fi
++done
++python3 - "$submission_dir" "$EXPECTED_TARGET_SHA" <<'PY'
++import json
++import re
++import sys
++from pathlib import Path
++
++submission = Path(sys.argv[1])
++expected_sha = sys.argv[2]
++env_manifest = json.loads((submission / "env-manifest.json").read_text())
++leaderboard = json.loads((submission / "run_leaderboard.json").read_text())
++
++git_info = env_manifest.get("git_info", {}).get("vllm_hust", {})
++metadata = leaderboard.get("metadata", {})
++runtime_engine = metadata.get("runtime_provenance", {}).get("engine", {})
++expected_checksum_files = {
++    "leaderboard_manifest.json",
++    "run_leaderboard.json",
++    "env-manifest.json",
++    "pip-packages.json",
++}
++checksum_files = set()
++checksum_pattern = re.compile(r"^[0-9a-f]{64}  \./([^/]+)$")
++for line in (submission / "checksums.sha256").read_text().splitlines():
++    match = checksum_pattern.fullmatch(line)
++    if match is None or match.group(1) not in expected_checksum_files:
++        raise SystemExit(f"unsafe checksum manifest entry: {line!r}")
++    if match.group(1) in checksum_files:
++        raise SystemExit(f"duplicate checksum manifest entry: {match.group(1)}")
++    checksum_files.add(match.group(1))
++if checksum_files != expected_checksum_files:
++    raise SystemExit("checksum manifest does not cover the exact evidence set")
++checks = {
++    "env declared SHA": git_info.get("declared"),
++    "env observed SHA": git_info.get("observed"),
++    "leaderboard Git SHA": metadata.get("git_commit"),
++    "runtime engine SHA": runtime_engine.get("commit"),
++}
++for label, actual in checks.items():
++    if actual != expected_sha:
++        raise SystemExit(f"{label} mismatch: expected {expected_sha}, got {actual}")
++if metadata.get("github_repository") != "vLLM-HUST/vllm-hust":
++    raise SystemExit("leaderboard repository identity mismatch")
++if runtime_engine.get("repository") != "vLLM-HUST/vllm-hust":
++    raise SystemExit("runtime repository identity mismatch")
++PY
++
++if [[ "$(tr -d '[:space:]' < "$submission_dir/STATUS")" != "OK" ]]; then
++  echo "source artifact STATUS is not OK" >&2
++  exit 2
++fi
++(
++  cd "$submission_dir"
++  sha256sum -c checksums.sha256
++)
++
++echo "Replay preflight passed for $artifact_name/$relative_submission_dir"
++if [[ "$mode" == "preflight" ]]; then
++  exit 0
++fi
++
++mkdir -p "$(dirname "$REPLAY_RECEIPT_FILE")"
++: > "$REPLAY_RECEIPT_FILE"
++if [[ -n "${LOCAL_SNAPSHOT_OUTPUT_DIR:-}" ]]; then
++  mkdir -p "$LOCAL_SNAPSHOT_OUTPUT_DIR"
++fi
++
++askpass_root=${RUNNER_TEMP:-/tmp}
++mkdir -p "$askpass_root"
++askpass_dir=$(mktemp -d "$askpass_root/benchmark-replay-askpass.XXXXXX")
++cleanup_askpass() {
++  rm -rf "$askpass_dir"
++}
++trap cleanup_askpass EXIT
++askpass_script="$askpass_dir/askpass.sh"
++askpass_token_file="$askpass_dir/token"
++umask 077
++writer_token="$REPLAY_WRITER_TOKEN"
++printf '%s' "$writer_token" > "$askpass_token_file"
++unset REPLAY_WRITER_TOKEN
++cat > "$askpass_script" <<EOF
++#!/bin/sh
++case "\$1" in
++  *Username*) printf '%s\n' x-access-token ;;
++  *Password*) cat "$askpass_token_file" ;;
++  *) exit 1 ;;
++esac
++EOF
++chmod 700 "$askpass_script"
++
++env -u GITHUB_ACTIONS -u REPLAY_WRITER_TOKEN \
++  PYTHONPATH="$BENCHMARK_REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
++  BENCHMARK_REPO_DIR="$BENCHMARK_REPO_DIR" \
++  WEBSITE_REPO_DIR="$WEBSITE_REPO_DIR" \
++  CURRENT_SUBMISSION_DIR="$submission_dir" \
++  VLLM_HUST_REPO_DIR="$VLLM_HUST_REPO_DIR" \
++  PYTHON_BIN="${PYTHON_BIN:-python3}" \
++  RUN_ID="$submission_run_id" \
++  SNAPSHOT_TARGET_BRANCH=main \
++  SNAPSHOT_EXPECTED_BASE_SHA="$EXPECTED_BENCHMARK_MAIN_SHA" \
++  BENCHMARK_REPO_REMOTE=origin \
++  BENCHMARK_REPO_SLUG=vLLM-HUST/vllm-hust-benchmark \
++  BENCHMARK_REPO_GH_TOKEN= \
++  BENCHMARK_REPO_SSH_KEY= \
++  ALLOW_LOCAL_GIT_RESET=1 \
++  GITHUB_ENV="$REPLAY_RECEIPT_FILE" \
++  LOCAL_SNAPSHOT_OUTPUT_DIR="${LOCAL_SNAPSHOT_OUTPUT_DIR:-}" \
++  SNAPSHOT_MAX_FETCH_ATTEMPTS=4 \
++  SNAPSHOT_FETCH_RETRY_SECONDS=5 \
++  SNAPSHOT_MAX_PUSH_ATTEMPTS=1 \
++  SNAPSHOT_PUSH_RETRY_SECONDS=0 \
++  SNAPSHOT_COMMIT_MESSAGE="chore(data): replay benchmark publication $submission_run_id" \
++  GIT_COMMITTER_NAME="vLLM-HUST Benchmark Bot" \
++  GIT_COMMITTER_EMAIL=benchmark-bot@vllm-hust.local \
++  GIT_ASKPASS="$askpass_script" \
++  GIT_TERMINAL_PROMPT=0 \
++  bash "$sync_script"
++
++receipt_value() {
++  local key=$1
++  local values
++  values=$(sed -n "s/^${key}=//p" "$REPLAY_RECEIPT_FILE")
++  if [[ -z "$values" || "$(printf '%s\n' "$values" | wc -l | tr -d ' ')" -ne 1 ]]; then
++    echo "replay receipt must contain exactly one $key" >&2
++    exit 2
++  fi
++  printf '%s\n' "$values"
++}
++
++sync_status=$(receipt_value GITHUB_SNAPSHOT_SYNC_STATUS)
++sync_verification=$(receipt_value GITHUB_SNAPSHOT_SYNC_VERIFICATION)
++verified_commit=$(receipt_value GITHUB_SNAPSHOT_SYNC_VERIFIED_COMMIT)
++if [[ "$sync_status" != "pushed" && "$sync_status" != "unchanged" ]]; then
++  echo "unexpected replay sync status: $sync_status" >&2
++  exit 2
++fi
++if [[ "$sync_verification" != "verified" ]]; then
++  echo "replay verification did not succeed: $sync_verification" >&2
++  exit 2
++fi
++if [[ ! "$verified_commit" =~ ^[0-9a-f]{40}$ ]]; then
++  echo "invalid verified replay commit: $verified_commit" >&2
++  exit 2
++fi
++
++fetch_target_branch_with_retry post-publish
++remote_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse origin/main)
++if [[ "$remote_commit" != "$verified_commit" ]]; then
++  echo "remote replay commit mismatch" >&2
++  exit 2
++fi
++post_publish_remote_url=$(git -C "$BENCHMARK_REPO_DIR" remote get-url origin)
++if [[ "$post_publish_remote_url" != "$remote_url" ]]; then
++  echo "benchmark origin changed during replay" >&2
++  exit 2
++fi
++if [[ "$sync_status" == "pushed" ]]; then
++  pushed_commit=$(receipt_value GITHUB_SNAPSHOT_SYNC_COMMIT)
++  if [[ "$pushed_commit" != "$verified_commit" ]]; then
++    echo "pushed and verified replay commits differ" >&2
++    exit 2
++  fi
++  parent_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$verified_commit^")
++  if [[ "$parent_commit" != "$EXPECTED_BENCHMARK_MAIN_SHA" ]]; then
++    echo "replay commit parent is not the approved benchmark main" >&2
++    exit 2
++  fi
++fi
++
++for file_name in "${required_submission_files[@]}"; do
++  git -C "$BENCHMARK_REPO_DIR" show \
++    "$verified_commit:$relative_submission_dir/$file_name" \
++    | cmp - "$submission_dir/$file_name"
++done
++for file_name in "${required_snapshot_files[@]}"; do
++  git -C "$BENCHMARK_REPO_DIR" cat-file -e \
++    "$verified_commit:leaderboard-data/snapshots/$file_name"
++done
++
++while IFS= read -r changed_path; do
++  case "$changed_path" in
++    "$relative_submission_dir"/*) ;;
++    leaderboard-data/snapshots/leaderboard_single.json) ;;
++    leaderboard-data/snapshots/leaderboard_multi.json) ;;
++    leaderboard-data/snapshots/leaderboard_compare.json) ;;
++    leaderboard-data/snapshots/last_updated.json) ;;
++    *) echo "unexpected replay path: $changed_path" >&2; exit 2 ;;
++  esac
++done < <(git -C "$BENCHMARK_REPO_DIR" diff --name-only \
++  "$EXPECTED_BENCHMARK_MAIN_SHA..$verified_commit")
++
++if git -C "$BENCHMARK_REPO_DIR" cat-file -e "$EXPECTED_BENCHMARK_MAIN_SHA:archive" 2>/dev/null; then
++  before_archive=$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$EXPECTED_BENCHMARK_MAIN_SHA:archive")
++  after_archive=$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$verified_commit:archive")
++  if [[ "$before_archive" != "$after_archive" ]]; then
++    echo "archive tree changed during replay" >&2
++    exit 2
++  fi
++fi
++
++git -C "$BENCHMARK_REPO_DIR" diff --check \
++  "$EXPECTED_BENCHMARK_MAIN_SHA..$verified_commit"
++(
++  cd "$BENCHMARK_REPO_DIR/$relative_submission_dir"
++  sha256sum -c checksums.sha256
++)
++post_validation_python=${POST_VALIDATION_PYTHON_BIN:-python3}
++PYTHONPATH="$BENCHMARK_REPO_DIR/src" "$post_validation_python" \
++  "$BENCHMARK_REPO_DIR/scripts/verify_submission_checksums.py" \
++  --root "$BENCHMARK_REPO_DIR/submissions"
++PYTHONPATH="$BENCHMARK_REPO_DIR/src" "$post_validation_python" \
++  "$BENCHMARK_REPO_DIR/scripts/validate_public_leaderboard_snapshots.py" \
++  --snapshot-dir "$BENCHMARK_REPO_DIR/leaderboard-data/snapshots"
++PYTHONPATH="$BENCHMARK_REPO_DIR/src" "$post_validation_python" - \
++  "$BENCHMARK_REPO_DIR/leaderboard-data/snapshots" <<'PY'
++import sys
++from pathlib import Path
++
++from vllm_hust_benchmark.integration import validate_public_snapshot_trend_admission
++
++validate_public_snapshot_trend_admission(Path(sys.argv[1]))
++PY
++
++{
++  echo "REPLAY_RESULT=verified"
++  echo "REPLAY_SOURCE_RUN_ID=$SOURCE_RUN_ID"
++  echo "REPLAY_SOURCE_RUN_ATTEMPT=$SOURCE_RUN_ATTEMPT"
++  echo "REPLAY_SOURCE_ARTIFACT=$artifact_name"
++  echo "REPLAY_EXPECTED_TARGET_SHA=$EXPECTED_TARGET_SHA"
++  echo "REPLAY_APPROVED_BENCHMARK_BASE=$EXPECTED_BENCHMARK_MAIN_SHA"
++} >> "$REPLAY_RECEIPT_FILE"
++
++echo "Historical benchmark publication replay verified at $verified_commit"
+diff --git a/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh b/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh
+index 543709198..2674584e6 100755
+--- a/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh
++++ b/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh
+@@ -7,6 +7,7 @@ CURRENT_SUBMISSION_DIR=${CURRENT_SUBMISSION_DIR:?CURRENT_SUBMISSION_DIR is requi
+ VLLM_HUST_REPO_DIR=${VLLM_HUST_REPO_DIR:-${VLLM_HUST_REPO:-$BENCHMARK_REPO_DIR/../vllm-hust}}
+ PYTHON_BIN=${PYTHON_BIN:-python3}
+ SNAPSHOT_TARGET_BRANCH=${SNAPSHOT_TARGET_BRANCH:-main}
++SNAPSHOT_EXPECTED_BASE_SHA=${SNAPSHOT_EXPECTED_BASE_SHA:-}
+ SNAPSHOT_OUTPUT_DIR=${SNAPSHOT_OUTPUT_DIR:-$BENCHMARK_REPO_DIR/leaderboard-data/snapshots}
+ LOCAL_SNAPSHOT_OUTPUT_DIR=${LOCAL_SNAPSHOT_OUTPUT_DIR:-}
+ SNAPSHOT_MAX_PUSH_ATTEMPTS=${SNAPSHOT_MAX_PUSH_ATTEMPTS:-4}
+@@ -80,6 +81,12 @@ fetch_target_branch_with_retry() {
+ 
+ validate_fetch_retry_configuration
+ 
++if [[ -n "$SNAPSHOT_EXPECTED_BASE_SHA" \
++  && ! "$SNAPSHOT_EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
++  echo "SNAPSHOT_EXPECTED_BASE_SHA must be a full lowercase Git SHA" >&2
++  exit 2
++fi
++
+ configure_push_remote() {
+   local remote_url=
+ 
+@@ -166,8 +173,18 @@ export VLLM_HUST_WEBSITE_REPO="$WEBSITE_REPO_DIR"
+ export VLLM_HUST_REPO="$VLLM_HUST_REPO_DIR"
+ 
+ prepare_publication_commit() {
++  local fetched_target_sha
++
+   reset_publication_staging || return $?
+   fetch_target_branch_with_retry prepare || return $?
++  if [[ -n "$SNAPSHOT_EXPECTED_BASE_SHA" ]]; then
++    fetched_target_sha=$(git -C "$BENCHMARK_REPO_DIR" rev-parse \
++      "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH") || return $?
++    if [[ "$fetched_target_sha" != "$SNAPSHOT_EXPECTED_BASE_SHA" ]]; then
++      echo "benchmark publication base moved: expected $SNAPSHOT_EXPECTED_BASE_SHA, got $fetched_target_sha" >&2
++      return 2
++    fi
++  fi
+   git -C "$BENCHMARK_REPO_DIR" checkout -B "$SNAPSHOT_TARGET_BRANCH" "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH" || return $?
+ 
+   mkdir -p "$staged_submission_dir" || return $?
+diff --git a/tests/ci/test_replay_benchmark_publication.py b/tests/ci/test_replay_benchmark_publication.py
+new file mode 100644
+index 000000000..1c367c71d
+--- /dev/null
++++ b/tests/ci/test_replay_benchmark_publication.py
+@@ -0,0 +1,487 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++SCRIPT_PATH = REPO_ROOT / ".github/workflows/scripts/replay_benchmark_publication.sh"
++SYNC_SCRIPT = (
++    REPO_ROOT / ".github/workflows/scripts/sync_benchmark_snapshots_to_github.sh"
++)
++
++
++def run(
++    command: list[str],
++    cwd: Path,
++    *,
++    env: dict[str, str] | None = None,
++    check: bool = True,
++) -> subprocess.CompletedProcess[str]:
++    result = subprocess.run(
++        command,
++        cwd=cwd,
++        env=env,
++        check=False,
++        text=True,
++        capture_output=True,
++    )
++    if check:
++        assert result.returncode == 0, result.stdout + result.stderr
++    return result
++
++
++def init_repo(path: Path, files: dict[str, str]) -> str:
++    path.mkdir(parents=True)
++    run(["git", "init", "-b", "main"], path)
++    run(["git", "config", "user.name", "Test"], path)
++    run(["git", "config", "user.email", "test@example.com"], path)
++    for relative_path, content in files.items():
++        target = path / relative_path
++        target.parent.mkdir(parents=True, exist_ok=True)
++        target.write_text(content, encoding="utf-8")
++    run(["git", "add", "."], path)
++    run(["git", "commit", "-m", "seed"], path)
++    return run(["git", "rev-parse", "HEAD"], path).stdout.strip()
++
++
++def write_artifact(
++    root: Path,
++    *,
++    run_id: str,
++    attempt: str,
++    target_sha: str,
++) -> Path:
++    submission = (
++        root
++        / f"ci-{run_id}-{attempt}-{target_sha}"
++        / "submissions"
++        / f"ci-{run_id}-{attempt}-{target_sha}"
++    )
++    submission.mkdir(parents=True)
++    files = {
++        "leaderboard_manifest.json": json.dumps(
++            {
++                "schema_version": "leaderboard-export-manifest/v2",
++                "entries": [],
++            }
++        )
++        + "\n",
++        "run_leaderboard.json": json.dumps(
++            {
++                "metadata": {
++                    "git_commit": target_sha,
++                    "github_repository": "vLLM-HUST/vllm-hust",
++                    "runtime_provenance": {
++                        "engine": {
++                            "repository": "vLLM-HUST/vllm-hust",
++                            "commit": target_sha,
++                        }
++                    },
++                }
++            }
++        )
++        + "\n",
++        "env-manifest.json": json.dumps(
++            {
++                "git_info": {
++                    "vllm_hust": {
++                        "declared": target_sha,
++                        "observed": target_sha,
++                    }
++                }
++            }
++        )
++        + "\n",
++        "pip-packages.json": "[]\n",
++    }
++    for name, content in files.items():
++        (submission / name).write_text(content, encoding="utf-8")
++    checksums = "".join(
++        f"{hashlib.sha256((submission / name).read_bytes()).hexdigest()}  ./{name}\n"
++        for name in files
++    )
++    (submission / "checksums.sha256").write_text(checksums, encoding="utf-8")
++    (submission / "STATUS").write_text("OK\n", encoding="utf-8")
++    return submission
++
++
++@pytest.fixture
++def replay_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
++    run_id = "31004708110"
++    attempt = "1"
++    target_sha = "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"
++    artifact_root = tmp_path / "artifact"
++    write_artifact(
++        artifact_root,
++        run_id=run_id,
++        attempt=attempt,
++        target_sha=target_sha,
++    )
++
++    seed = tmp_path / "benchmark-seed"
++    benchmark_sha = init_repo(
++        seed,
++        {
++            "README.md": "benchmark\n",
++            "archive/README.md": "archive\n",
++            "submissions/.gitkeep": "",
++        },
++    )
++    remote = tmp_path / "benchmark-remote.git"
++    run(["git", "init", "--bare", str(remote)], tmp_path)
++    run(["git", "remote", "add", "origin", str(remote)], seed)
++    run(["git", "push", "origin", "HEAD:main"], seed)
++    run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], remote)
++
++    benchmark = tmp_path / "benchmark"
++    run(["git", "clone", str(remote), str(benchmark)], tmp_path)
++    website = tmp_path / "website"
++    website_sha = init_repo(
++        website,
++        {"scripts/aggregate_results.py": "# fake\n"},
++    )
++    fake_python = tmp_path / "fake-python"
++    fake_python.write_text(
++        """#!/bin/bash
++set -euo pipefail
++if [[ "$1" == "-m" && "$2" == "vllm_hust_benchmark.cli" ]]; then
++  shift 3
++  output_dir=""
++  while [[ "$#" -gt 0 ]]; do
++    case "$1" in
++      --output-dir) output_dir=$2; shift 2 ;;
++      *) shift ;;
++    esac
++  done
++  mkdir -p "$output_dir"
++  printf '{}\\n' > "$output_dir/leaderboard_single.json"
++  printf '{}\\n' > "$output_dir/leaderboard_multi.json"
++  printf '{}\\n' > "$output_dir/leaderboard_compare.json"
++  printf '{}\\n' > "$output_dir/last_updated.json"
++  exit 0
++fi
++if [[ "$1" == "-" ]]; then
++  cat >/dev/null
++fi
++exit 0
++""",
++        encoding="utf-8",
++    )
++    fake_python.chmod(0o755)
++
++    env = os.environ.copy()
++    env.update(
++        {
++            "ALLOW_LOCAL_REPLAY_REMOTE": "1",
++            "BENCHMARK_REPO_DIR": str(benchmark),
++            "EXPECTED_BENCHMARK_MAIN_SHA": benchmark_sha,
++            "EXPECTED_SYNC_SCRIPT_SHA256": hashlib.sha256(
++                SYNC_SCRIPT.read_bytes()
++            ).hexdigest(),
++            "EXPECTED_TARGET_SHA": target_sha,
++            "EXPECTED_WEBSITE_SHA": website_sha,
++            "REPLAY_ARTIFACT_ROOT": str(artifact_root),
++            "REPLAY_CONFIRMATION": f"publish-{run_id}-{attempt}",
++            "REPLAY_RECEIPT_FILE": str(tmp_path / "receipt.env"),
++            "RUNNER_TEMP": str(tmp_path / "runner-temp"),
++            "PYTHON_BIN": str(fake_python),
++            "POST_VALIDATION_PYTHON_BIN": str(fake_python),
++            "SOURCE_RUN_ATTEMPT": attempt,
++            "SOURCE_RUN_ID": run_id,
++            "VLLM_HUST_REPO_DIR": str(REPO_ROOT),
++            "WEBSITE_REPO_DIR": str(website),
++        }
++    )
++    return env, remote
++
++
++def test_preflight_accepts_exact_historical_artifact(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, _remote = replay_environment
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "preflight"],
++        REPO_ROOT,
++        env=env,
++    )
++
++    assert "Replay preflight passed" in result.stdout
++    assert not Path(env["REPLAY_RECEIPT_FILE"]).exists()
++
++
++def test_preflight_rejects_confirmation_before_publication(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, remote = replay_environment
++    original_remote = run(
++        ["git", "rev-parse", "refs/heads/main"], remote
++    ).stdout.strip()
++    env["REPLAY_CONFIRMATION"] = "publish-wrong"
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "preflight"],
++        REPO_ROOT,
++        env=env,
++        check=False,
++    )
++
++    assert result.returncode == 2
++    assert "REPLAY_CONFIRMATION must equal" in result.stderr
++    assert (
++        run(["git", "rev-parse", "refs/heads/main"], remote).stdout.strip()
++        == original_remote
++    )
++
++
++def test_preflight_rejects_artifact_target_mismatch(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, _remote = replay_environment
++    env_manifest = next(Path(env["REPLAY_ARTIFACT_ROOT"]).rglob("env-manifest.json"))
++    payload = json.loads(env_manifest.read_text(encoding="utf-8"))
++    payload["git_info"]["vllm_hust"]["observed"] = "0" * 40
++    env_manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
++    submission = env_manifest.parent
++    checksum_lines = []
++    for name in (
++        "leaderboard_manifest.json",
++        "run_leaderboard.json",
++        "env-manifest.json",
++        "pip-packages.json",
++    ):
++        digest = hashlib.sha256((submission / name).read_bytes()).hexdigest()
++        checksum_lines.append(f"{digest}  ./{name}\n")
++    (submission / "checksums.sha256").write_text(
++        "".join(checksum_lines), encoding="utf-8"
++    )
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "preflight"],
++        REPO_ROOT,
++        env=env,
++        check=False,
++    )
++
++    assert result.returncode != 0
++    assert "env observed SHA mismatch" in result.stderr
++
++
++def test_preflight_rejects_unsafe_checksum_manifest_path(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, _remote = replay_environment
++    checksum_manifest = next(
++        Path(env["REPLAY_ARTIFACT_ROOT"]).rglob("checksums.sha256")
++    )
++    checksum_manifest.write_text(
++        checksum_manifest.read_text(encoding="utf-8")
++        + f"{'0' * 64}  ./../../outside\n",
++        encoding="utf-8",
++    )
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "preflight"],
++        REPO_ROOT,
++        env=env,
++        check=False,
++    )
++
++    assert result.returncode != 0
++    assert "unsafe checksum manifest entry" in result.stderr
++
++
++def test_preflight_rejects_benchmark_main_that_moved_after_rehearsal(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, remote = replay_environment
++    seed = remote.parent / "benchmark-update"
++    run(["git", "clone", str(remote), str(seed)], remote.parent)
++    run(["git", "config", "user.name", "Test"], seed)
++    run(["git", "config", "user.email", "test@example.com"], seed)
++    (seed / "README.md").write_text("moved\n", encoding="utf-8")
++    run(["git", "add", "README.md"], seed)
++    run(["git", "commit", "-m", "move main"], seed)
++    run(["git", "push", "origin", "HEAD:main"], seed)
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "preflight"],
++        REPO_ROOT,
++        env=env,
++        check=False,
++    )
++
++    assert result.returncode == 2
++    assert "benchmark main moved" in result.stderr
++    assert not Path(env["REPLAY_RECEIPT_FILE"]).exists()
++
++
++def test_preflight_retries_transient_fetch_failure(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, _remote = replay_environment
++    fake_bin = Path(env["REPLAY_RECEIPT_FILE"]).parent / "fake-bin"
++    fake_bin.mkdir()
++    fetch_count = fake_bin / "fetch-count"
++    real_git = shutil.which("git")
++    assert real_git is not None
++    (fake_bin / "git").write_text(
++        f"""#!/bin/bash
++set -euo pipefail
++count=0
++if [[ -f {str(fetch_count)!r} ]]; then count=$(< {str(fetch_count)!r}); fi
++if [[ \"$*\" == *\" fetch origin main\"* ]]; then
++  count=$((count + 1))
++  printf '%s\\n' \"$count\" > {str(fetch_count)!r}
++  if [[ \"$count\" -eq 1 ]]; then exit 1; fi
++fi
++exec {real_git!r} \"$@\"
++""",
++        encoding="utf-8",
++    )
++    (fake_bin / "git").chmod(0o755)
++    env["PATH"] = f"{fake_bin}:{env['PATH']}"
++    env["REPLAY_FETCH_MAX_ATTEMPTS"] = "2"
++    env["REPLAY_FETCH_RETRY_SECONDS"] = "0"
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "preflight"],
++        REPO_ROOT,
++        env=env,
++    )
++
++    assert "Replay preflight passed" in result.stdout
++    assert fetch_count.read_text(encoding="utf-8").strip() == "2"
++
++
++def test_publish_requires_writer_after_all_static_inputs_are_valid(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, _remote = replay_environment
++    env.pop("REPLAY_WRITER_TOKEN", None)
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "publish"],
++        REPO_ROOT,
++        env=env,
++        check=False,
++    )
++
++    assert result.returncode == 2
++    assert "REPLAY_WRITER_TOKEN is required" in result.stderr
++
++
++def test_publish_pushes_and_verifies_via_local_bare_remote(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, remote = replay_environment
++    env["REPLAY_WRITER_TOKEN"] = "test-writer-token"
++    benchmark = Path(env["BENCHMARK_REPO_DIR"])
++    expected_base = env["EXPECTED_BENCHMARK_MAIN_SHA"]
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "publish"],
++        REPO_ROOT,
++        env=env,
++    )
++
++    assert "Historical benchmark publication replay verified" in result.stdout
++    receipt = Path(env["REPLAY_RECEIPT_FILE"]).read_text(encoding="utf-8")
++    assert "GITHUB_SNAPSHOT_SYNC_STATUS=pushed\n" in receipt
++    assert "GITHUB_SNAPSHOT_SYNC_VERIFICATION=verified\n" in receipt
++    assert "REPLAY_RESULT=verified\n" in receipt
++    remote_head = run(["git", "rev-parse", "refs/heads/main"], remote).stdout.strip()
++    assert remote_head != expected_base
++    assert (
++        run(["git", "rev-parse", f"{remote_head}^"], benchmark).stdout.strip()
++        == expected_base
++    )
++    changed_paths = set(
++        run(
++            ["git", "diff", "--name-only", f"{expected_base}..{remote_head}"],
++            benchmark,
++        ).stdout.splitlines()
++    )
++    submission_prefix = (
++        "submissions/ci-31004708110-1-4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0/"
++    )
++    assert changed_paths
++    assert all(
++        path.startswith(submission_prefix)
++        or path.startswith("leaderboard-data/snapshots/")
++        for path in changed_paths
++    )
++    assert run(["git", "remote", "get-url", "origin"], benchmark).stdout.strip() == str(
++        remote
++    )
++
++
++def test_publish_does_not_export_writer_token_to_sync_children(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, _remote = replay_environment
++    env["REPLAY_WRITER_TOKEN"] = "test-writer-token"
++    token_env_log = Path(env["REPLAY_RECEIPT_FILE"]).with_name("token-env.log")
++    fake_python = Path(env["PYTHON_BIN"])
++    probe_python = token_env_log.with_name("probe-python")
++    probe_python.write_text(
++        f"""#!/bin/bash
++set -euo pipefail
++if [[ -n \"${{GITHUB_ENV:-}}\" ]]; then
++  if [[ \"${{REPLAY_WRITER_TOKEN+x}}\" == x ]]; then
++    printf 'set\\n' > {str(token_env_log)!r}
++  else
++    printf 'unset\\n' > {str(token_env_log)!r}
++  fi
++fi
++exec {str(fake_python)!r} \"$@\"
++""",
++        encoding="utf-8",
++    )
++    probe_python.chmod(0o755)
++    env["PYTHON_BIN"] = str(probe_python)
++
++    run(
++        ["bash", str(SCRIPT_PATH), "publish"],
++        REPO_ROOT,
++        env=env,
++    )
++
++    assert token_env_log.read_text(encoding="utf-8").strip() == "unset"
++
++
++def test_publish_failure_cleans_askpass_and_preserves_remote(
++    replay_environment: tuple[dict[str, str], Path],
++) -> None:
++    env, remote = replay_environment
++    env["REPLAY_WRITER_TOKEN"] = "test-writer-token"
++    original_remote = run(
++        ["git", "rev-parse", "refs/heads/main"], remote
++    ).stdout.strip()
++    failing_python = Path(env["RUNNER_TEMP"]).parent / "failing-python"
++    failing_python.write_text("#!/bin/bash\nexit 9\n", encoding="utf-8")
++    failing_python.chmod(0o755)
++    env["PYTHON_BIN"] = str(failing_python)
++
++    result = run(
++        ["bash", str(SCRIPT_PATH), "publish"],
++        REPO_ROOT,
++        env=env,
++        check=False,
++    )
++
++    assert result.returncode == 9
++    assert (
++        run(["git", "rev-parse", "refs/heads/main"], remote).stdout.strip()
++        == original_remote
++    )
++    runner_temp = Path(env["RUNNER_TEMP"])
++    assert not list(runner_temp.glob("benchmark-replay-askpass.*"))
+diff --git a/tests/ci/test_replay_benchmark_publication_workflow_static.py b/tests/ci/test_replay_benchmark_publication_workflow_static.py
+new file mode 100644
+index 000000000..c2126510f
+--- /dev/null
++++ b/tests/ci/test_replay_benchmark_publication_workflow_static.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++from pathlib import Path
++
++import yaml
++
++WORKFLOW_PATH = (
++    Path(__file__).resolve().parents[2]
++    / ".github/workflows/replay-ascend-benchmark-publication.yml"
++)
++
++
++def workflow_text() -> str:
++    return WORKFLOW_PATH.read_text(encoding="utf-8")
++
++
++def workflow_yaml() -> dict:
++    return yaml.safe_load(workflow_text())
++
++
++def test_replay_workflow_is_manual_main_only_and_github_hosted() -> None:
++    workflow = workflow_yaml()
++    job = workflow["jobs"]["replay-publication"]
++
++    assert set(workflow[True]) == {"workflow_dispatch"}
++    assert job["if"] == "${{ github.ref == 'refs/heads/main' }}"
++    assert job["runs-on"] == "ubuntu-latest"
++    assert "self-hosted" not in workflow_text()
++    assert "ascend-benchmark" not in str(job["runs-on"])
++
++
++def test_replay_workflow_has_minimal_permissions_and_no_hf_path() -> None:
++    workflow = workflow_yaml()
++
++    assert workflow["permissions"] == {
++        "actions": "read",
++        "contents": "read",
++    }
++    assert "HF_TOKEN" not in workflow_text()
++    assert "publish_to_hf" not in workflow_text()
++
++
++def test_replay_workflow_downloads_exact_source_run_artifact() -> None:
++    text = workflow_text()
++
++    assert "confirmation:" in text
++    assert 'SOURCE_RUN_ID: "31004708110"' in text
++    assert 'SOURCE_RUN_ATTEMPT: "1"' in text
++    assert 'EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"' in text
++    assert (
++        'EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"'
++        in text
++    )
++    assert "source_run_id:" not in text
++    assert "expected_target_sha:" not in text
++    assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in text
++    assert "name: ascend-benchmark-31004708110-1" in text
++    assert "run-id: 31004708110" in text
++    assert "repository: ${{ github.repository }}" in text
++
++
++def test_replay_workflow_verifies_source_run_before_download() -> None:
++    text = workflow_text()
++
++    verify_start = text.index("      - name: Verify approved source run metadata")
++    download_start = text.index("      - name: Download immutable source artifact")
++    verify_block = text[verify_start:download_start]
++
++    assert "actions/runs/${SOURCE_RUN_ID}" in verify_block
++    assert '".github/workflows/ascend-benchmark-leaderboard.yml"' in verify_block
++    assert '"push"' in verify_block
++    assert '"main"' in verify_block
++    assert ".head_sha == $expected_sha" in verify_block
++    assert ".run_attempt | tostring" in verify_block
++    assert '.status == "completed"' in verify_block
++    assert '.conclusion == "success"' in verify_block
++
++
++def test_writer_secret_is_scoped_to_publish_step() -> None:
++    text = workflow_text()
++    preflight_start = text.index(
++        "      - name: Validate replay without writer credential"
++    )
++    publish_start = text.index("      - name: Publish and verify historical artifact")
++    summary_start = text.index("      - name: Write replay summary")
++
++    assert "REPLAY_WRITER_TOKEN" not in text[:publish_start]
++    assert (
++        "REPLAY_WRITER_TOKEN: "
++        "${{ secrets.VLLM_HUST_BENCHMARK_GH_TOKEN }}"
++        in text[publish_start:summary_start]
++    )
++    assert (
++        "replay_benchmark_publication.sh preflight"
++        in text[preflight_start:publish_start]
++    )
++    assert (
++        "replay_benchmark_publication.sh publish" in text[publish_start:summary_start]
++    )
++
++
++def test_replay_checkouts_do_not_persist_credentials() -> None:
++    text = workflow_text()
++
++    assert text.count("persist-credentials: false") == 3
++    assert "cancel-in-progress: false" in text
++    assert "EXPECTED_SYNC_SCRIPT_SHA256:" in text
++    assert "REPLAY_RECEIPT_FILE:" in text
++    assert "jsonschema==4.23.0" in text
++    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
+diff --git a/tests/ci/test_sync_benchmark_snapshots_to_github.py b/tests/ci/test_sync_benchmark_snapshots_to_github.py
+index f061c578c..4cf7b9dc3 100644
+--- a/tests/ci/test_sync_benchmark_snapshots_to_github.py
++++ b/tests/ci/test_sync_benchmark_snapshots_to_github.py
+@@ -374,6 +374,38 @@ def test_invalid_snapshot_does_not_change_benchmark_remote(
+     )
+ 
+ 
++def test_expected_base_mismatch_rejects_before_publication(tmp_path):
++    env, remote, benchmark_repo, github_env = prepare_sync_environment(
++        tmp_path, "expected-base-mismatch"
++    )
++    remote_head = run(
++        ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
++    ).stdout.strip()
++    env["SNAPSHOT_EXPECTED_BASE_SHA"] = "0" * 40
++
++    result = subprocess.run(
++        ["bash", str(SCRIPT_PATH)],
++        cwd=tmp_path,
++        check=False,
++        text=True,
++        capture_output=True,
++        env=env,
++    )
++
++    assert result.returncode == 2, result.stdout + result.stderr
++    assert "benchmark publication base moved" in result.stderr
++    assert (
++        run(
++            ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
++        ).stdout.strip()
++        == remote_head
++    )
++    assert not (benchmark_repo / "submissions" / "expected-base-mismatch").exists()
++    assert "GITHUB_SNAPSHOT_SYNC_STATUS=rejected" in github_env.read_text(
++        encoding="utf-8"
++    )
++
++
+ def test_push_retry_rebuilds_staging_from_fresh_remote(tmp_path):
+     remote, seed = init_bare_remote(tmp_path)
+     stale_submission = seed / "submissions" / "stale-ci"
+-- 
+2.53.0.windows.3
+

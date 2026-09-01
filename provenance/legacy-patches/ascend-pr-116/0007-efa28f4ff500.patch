@@ -1,0 +1,1297 @@
+From efa28f4ff5008efbe03cc7feb6439e10f5530efb Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Fri, 3 Jul 2026 14:14:30 +0000
+Subject: [PATCH] feat: add triton KIVI cache pack/unpack kernels with
+ attention_v1 refactor
+
+- Add kivi_cache.py with triton-based pack/unpack kernels for INT4 KV cache
+- Refactor attention_v1.py KIVI path to use new triton kernels
+- Reduce code duplication and improve maintainability
+---
+ vllm_ascend/attention/attention_v1.py | 279 +-------
+ vllm_ascend/ops/triton/kivi_cache.py  | 946 ++++++++++++++++++++++++++
+ 2 files changed, 970 insertions(+), 255 deletions(-)
+ create mode 100644 vllm_ascend/ops/triton/kivi_cache.py
+
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index 021d990cc..07459de11 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -65,7 +65,11 @@ from vllm_ascend.compilation.acl_graph import (
+ )
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+-from vllm_ascend.ops.triton.kivi_cache import kivi_pack_key_cache, kivi_pack_value_cache
++from vllm_ascend.ops.triton.kivi_cache import (
++    kivi_dequant_gather_cache,
++    kivi_pack_key_cache,
++    kivi_pack_value_cache,
++)
+ from vllm_ascend.utils import weak_ref_tensors
+ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+ 
+@@ -1410,7 +1414,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                     attn_metadata=attn_metadata,
+                     output=output,
+                 )
+-            dense_key, dense_value = self._gather_dequant_kivi_paged_cache(
++            dense_key, dense_value = self._gather_dequant_kivi_paged_cache_vectorized(
+                 attn_metadata.block_tables,
+                 seq_lens,
+                 query.dtype,
+@@ -1450,17 +1454,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             torch.zeros((), dtype=dtype, device=device),
+         ).unsqueeze(0)
+     
+-    def _unpack_int4(self, packed: torch.Tensor) -> torch.Tensor:
+-        """Vectorized unpack of int32 into 8 int4 lanes (last dim).
+-
+-        Uses pure tensor ops (no Python list comprehension) for
+-        performance on both CUDA and Ascend NPU.
+-        """
+-        packed_i32 = packed.to(torch.int32)
+-        shifts = torch.arange(8, device=packed.device, dtype=torch.int32) * 4
+-        unpacked = (packed_i32.unsqueeze(-1) >> shifts) & 0xF
+-        return unpacked.to(torch.float32)
+-
+     def _check_kivi_cache_bound(self) -> None:
+         if (
+             self.k_quant_cache is None
+@@ -1887,179 +1880,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         )
+ 
+ 
+-    def _dequant_kivi_key_blocks(
+-        self,
+-        k_quant: torch.Tensor,
+-        k_scale: torch.Tensor,
+-        k_mn: torch.Tensor,
+-        target_dtype: torch.dtype,
+-    ) -> torch.Tensor:
+-        # k_quant: [B, blocks, kv_heads, head_size, block_size / 8]
+-        q = self._unpack_int4(k_quant).flatten(-2)
+-        block_size = q.shape[-1]
+-        # -> [B, blocks, kv_heads, head_size, block_size]
+-
+-        scale = k_scale.repeat_interleave(self.kivi_group_size, dim=-1)[..., :block_size]
+-        mn = k_mn.repeat_interleave(self.kivi_group_size, dim=-1)[..., :block_size]
+-
+-        deq = q.to(scale.dtype) * scale + mn
+-        # -> [B, blocks, block_size, kv_heads, head_size]
+-        return deq.permute(0, 1, 4, 2, 3).contiguous().to(target_dtype)
+-
+-
+-    def _dequant_kivi_value_blocks(
+-        self,
+-        v_quant: torch.Tensor,
+-        v_scale: torch.Tensor,
+-        v_mn: torch.Tensor,
+-        target_dtype: torch.dtype,
+-    ) -> torch.Tensor:
+-        # v_quant: [B, blocks, block_size, kv_heads, head_size / 8]
+-        q = self._unpack_int4(v_quant).flatten(-2)
+-        head_size = q.shape[-1]
+-
+-        scale = v_scale.repeat_interleave(self.kivi_group_size, dim=-1)[..., :head_size]
+-        mn = v_mn.repeat_interleave(self.kivi_group_size, dim=-1)[..., :head_size]
+-
+-        deq = q.to(scale.dtype) * scale + mn
+-        # -> [B, blocks, block_size, kv_heads, head_size]
+-        return deq.contiguous().to(target_dtype)
+-
+-    def _normalize_kivi_block_layout(
+-        self,
+-        blocks: torch.Tensor,
+-        batch_size: int,
+-        max_blocks: int,
+-        cache_block_size: int,
+-        name: str,
+-    ) -> torch.Tensor:
+-        if blocks.ndim != 5:
+-            raise RuntimeError(
+-                f"KIVI {name} cache must be 5D after dequant, got shape={tuple(blocks.shape)}."
+-            )
+-
+-        if blocks.shape[0] != batch_size:
+-            raise RuntimeError(
+-                f"KIVI {name} batch mismatch after dequant: "
+-                f"expected {batch_size}, got {blocks.shape[0]}."
+-            )
+-
+-        if blocks.shape[1] == max_blocks and blocks.shape[2] == cache_block_size:
+-            return blocks
+-
+-        if blocks.shape[1] == cache_block_size and blocks.shape[2] == max_blocks:
+-            return blocks.transpose(1, 2).contiguous()
+-
+-        raise RuntimeError(
+-            f"KIVI {name} cache layout mismatch: shape={tuple(blocks.shape)}, "
+-            f"expected (*, {max_blocks}, {cache_block_size}, ...)."
+-        )
+-
+-
+-    def _gather_dequant_kivi_paged_cache(
+-        self,
+-        block_table: torch.Tensor,
+-        seq_lens: list[int],
+-        target_dtype: torch.dtype,
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
+-        block_table = block_table.to(torch.long)
+-        batch_size = len(seq_lens)
+-        block_table = block_table[:batch_size]
+-        _, max_blocks = block_table.shape
+-        flat_ids = block_table.reshape(-1).clamp_min(0)
+-
+-        k_quant = self.k_quant_cache[flat_ids].view(
+-            batch_size, max_blocks, *self.k_quant_cache.shape[1:]
+-        )
+-        k_scale = self.k_scale_cache[flat_ids].view(
+-            batch_size, max_blocks, *self.k_scale_cache.shape[1:]
+-        )
+-        k_mn = self.k_mn_cache[flat_ids].view(
+-            batch_size, max_blocks, *self.k_mn_cache.shape[1:]
+-        )
+-
+-        v_quant = self.v_quant_cache[flat_ids].view(
+-            batch_size, max_blocks, *self.v_quant_cache.shape[1:]
+-        )
+-        v_scale = self.v_scale_cache[flat_ids].view(
+-            batch_size, max_blocks, *self.v_scale_cache.shape[1:]
+-        )
+-        v_mn = self.v_mn_cache[flat_ids].view(
+-            batch_size, max_blocks, *self.v_mn_cache.shape[1:]
+-        )
+-
+-        cache_block_size = self.k_quant_cache.shape[-1] * 8
+-        k_blocks = self._dequant_kivi_key_blocks(k_quant, k_scale, k_mn, target_dtype)
+-        v_blocks = self._dequant_kivi_value_blocks(v_quant, v_scale, v_mn, target_dtype)
+-        k_blocks = self._normalize_kivi_block_layout(
+-            k_blocks, batch_size, max_blocks, cache_block_size, "key"
+-        )
+-        v_blocks = self._normalize_kivi_block_layout(
+-            v_blocks, batch_size, max_blocks, cache_block_size, "value"
+-        )
+-
+-        ordered_slots = self._get_kivi_ordered_slots(block_table, seq_lens)
+-
+-        dense_k_parts = []
+-        dense_v_parts = []
+-        for req_idx, req_slots in enumerate(ordered_slots):
+-            req_block_lookup = {
+-                int(block_id): block_pos
+-                for block_pos, block_id in enumerate(block_table[req_idx].tolist())
+-                if int(block_id) >= 0
+-            }
+-
+-            req_dense_k = []
+-            req_dense_v = []
+-            for slot in req_slots:
+-                key = None
+-                value = None
+-                key = self._lookup_kivi_residual_tensor(
+-                    slot,
+-                    is_key=True,
+-                    target_dtype=target_dtype,
+-                    target_device=k_blocks.device,
+-                )
+-                value = self._lookup_kivi_residual_tensor(
+-                    slot,
+-                    is_key=False,
+-                    target_dtype=target_dtype,
+-                    target_device=v_blocks.device,
+-                )
+-                if key is None:
+-                    block_id = slot // cache_block_size
+-                    block_offset = slot % cache_block_size
+-                    block_pos = req_block_lookup.get(block_id)
+-                    if block_pos is None:
+-                        raise RuntimeError(
+-                            f"KIVI key cache missing block_id={block_id} for req_idx={req_idx}."
+-                        )
+-                    key = k_blocks[req_idx, block_pos, block_offset]
+-                if value is None:
+-                    block_id = slot // cache_block_size
+-                    block_offset = slot % cache_block_size
+-                    block_pos = req_block_lookup.get(block_id)
+-                    if block_pos is None:
+-                        raise RuntimeError(
+-                            f"KIVI value cache missing block_id={block_id} for req_idx={req_idx}."
+-                        )
+-                    value = v_blocks[req_idx, block_pos, block_offset]
+-
+-                req_dense_k.append(key.to(target_dtype))
+-                req_dense_v.append(value.to(target_dtype))
+-
+-            if req_dense_k:
+-                dense_k_parts.append(torch.stack(req_dense_k, dim=0))
+-                dense_v_parts.append(torch.stack(req_dense_v, dim=0))
+-
+-        if not dense_k_parts:
+-            empty = k_blocks.new_empty((0, self.num_kv_heads, self.head_size))
+-            return empty, empty
+-
+-        dense_k = torch.cat(dense_k_parts, dim=0)
+-        dense_v = torch.cat(dense_v_parts, dim=0)
+-        return dense_k.contiguous(), dense_v.contiguous()    
+-
+     def _gather_dequant_kivi_paged_cache_vectorized(
+         self,
+         block_table: torch.Tensor,
+@@ -2067,76 +1887,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         target_dtype: torch.dtype,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         cache_device = self.k_quant_cache.device
+-        block_table = block_table[:len(seq_lens)].to(
++        batch_size = len(seq_lens)
++        block_table = block_table[:batch_size].to(
+             device=cache_device, dtype=torch.long
++        ).contiguous()
++        seq_lens_t = torch.tensor(
++            seq_lens, dtype=torch.long, device=cache_device
++        ).contiguous()
++        dense_k, dense_v = kivi_dequant_gather_cache(
++            self.k_quant_cache,
++            self.k_scale_cache,
++            self.k_mn_cache,
++            self.v_quant_cache,
++            self.v_scale_cache,
++            self.v_mn_cache,
++            block_table,
++            seq_lens_t,
++            target_dtype,
++            self.kivi_group_size,
+         )
+-        _, max_blocks = block_table.shape
+-        cache_block_size = self.k_quant_cache.shape[-1] * 8
+-        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=cache_device)
+-        block_counts = torch.div(
+-            seq_lens_t + cache_block_size - 1,
+-            cache_block_size,
+-            rounding_mode="floor",
+-        )
+-        block_positions = torch.arange(
+-            max_blocks, dtype=torch.long, device=cache_device
+-        )
+-        valid_block_mask = block_positions.unsqueeze(0) < block_counts.unsqueeze(1)
+-        valid_req_idx, valid_block_pos = valid_block_mask.nonzero(as_tuple=True)
+-        valid_block_ids = block_table[valid_block_mask]
+-        if bool((valid_block_ids < 0).any()):
+-            raise RuntimeError("KIVI block_table has invalid block ids for live tokens.")
+-
+-        if valid_block_ids.numel() == 0:
+-            empty = self.k_quant_cache.new_empty(
+-                (0, self.num_kv_heads, self.head_size),
+-                dtype=target_dtype,
+-            )
+-            return empty, empty
+-
+-        num_valid_blocks = int(valid_block_ids.numel())
+-        k_quant = self.k_quant_cache[valid_block_ids].view(
+-            num_valid_blocks, 1, *self.k_quant_cache.shape[1:]
+-        )
+-        k_scale = self.k_scale_cache[valid_block_ids].view(
+-            num_valid_blocks, 1, *self.k_scale_cache.shape[1:]
+-        )
+-        k_mn = self.k_mn_cache[valid_block_ids].view(
+-            num_valid_blocks, 1, *self.k_mn_cache.shape[1:]
+-        )
+-        v_quant = self.v_quant_cache[valid_block_ids].view(
+-            num_valid_blocks, 1, *self.v_quant_cache.shape[1:]
+-        )
+-        v_scale = self.v_scale_cache[valid_block_ids].view(
+-            num_valid_blocks, 1, *self.v_scale_cache.shape[1:]
+-        )
+-        v_mn = self.v_mn_cache[valid_block_ids].view(
+-            num_valid_blocks, 1, *self.v_mn_cache.shape[1:]
+-        )
+-
+-        k_blocks = self._dequant_kivi_key_blocks(k_quant, k_scale, k_mn, target_dtype)
+-        v_blocks = self._dequant_kivi_value_blocks(v_quant, v_scale, v_mn, target_dtype)
+-        k_blocks = self._normalize_kivi_block_layout(
+-            k_blocks, num_valid_blocks, 1, cache_block_size, "key"
+-        )
+-        v_blocks = self._normalize_kivi_block_layout(
+-            v_blocks, num_valid_blocks, 1, cache_block_size, "value"
+-        )
+-        k_blocks = k_blocks[:, 0]
+-        v_blocks = v_blocks[:, 0]
+-
+-        valid_tokens_in_block = (
+-            seq_lens_t[valid_req_idx] - valid_block_pos * cache_block_size
+-        ).clamp(max=cache_block_size)
+-        token_positions = torch.arange(
+-            cache_block_size, dtype=torch.long, device=cache_device
+-        )
+-        valid_token_mask = (
+-            token_positions.unsqueeze(0) < valid_tokens_in_block.unsqueeze(1)
+-        )
+-
+-        dense_k = k_blocks[valid_token_mask]
+-        dense_v = v_blocks[valid_token_mask]
+ 
+         dense_k_parts: list[torch.Tensor] = []
+         dense_v_parts: list[torch.Tensor] = []
+@@ -2180,7 +1949,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             dense_v_parts.append(req_v)
+ 
+         if not dense_k_parts:
+-            empty = k_blocks.new_empty((0, self.num_kv_heads, self.head_size))
++            empty = dense_k.new_empty((0, self.num_kv_heads, self.head_size))
+             return empty, empty
+ 
+         return (
+diff --git a/vllm_ascend/ops/triton/kivi_cache.py b/vllm_ascend/ops/triton/kivi_cache.py
+new file mode 100644
+index 000000000..c3c92e2b5
+--- /dev/null
++++ b/vllm_ascend/ops/triton/kivi_cache.py
+@@ -0,0 +1,946 @@
++import torch
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
++
++
++def _check_same_device(name: str, tensor: torch.Tensor, ref: torch.Tensor) -> None:
++    if tensor.device != ref.device:
++        raise RuntimeError(
++            f"{name} must be on device {ref.device}, got {tensor.device}."
++        )
++
++
++def _check_contiguous(name: str, tensor: torch.Tensor) -> None:
++    if not tensor.is_contiguous():
++        raise RuntimeError(f"{name} must be contiguous.")
++
++
++def _check_slot_mapping(slot_mapping: torch.Tensor, num_tokens: int) -> None:
++    if slot_mapping.ndim != 1:
++        raise RuntimeError(
++            f"slot_mapping must be 1D, got shape={tuple(slot_mapping.shape)}."
++        )
++    if slot_mapping.numel() != num_tokens:
++        raise RuntimeError(
++            "slot_mapping length must match num_tokens, got "
++            f"{slot_mapping.numel()} vs {num_tokens}."
++        )
++    if slot_mapping.dtype not in (torch.int32, torch.int64):
++        raise RuntimeError(
++            f"slot_mapping must be int32/int64, got {slot_mapping.dtype}."
++        )
++
++
++def _check_value_cache_layout(
++    v_quant_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    v_mn_cache: torch.Tensor,
++    *,
++    num_kv_heads: int,
++    head_size: int,
++    group_size: int,
++) -> None:
++    if v_quant_cache.ndim != 4:
++        raise RuntimeError(
++            f"v_quant_cache must be 4D, got shape={tuple(v_quant_cache.shape)}."
++        )
++    if v_scale_cache.ndim != 4 or v_mn_cache.ndim != 4:
++        raise RuntimeError(
++            "v_scale_cache and v_mn_cache must be 4D, got "
++            f"{tuple(v_scale_cache.shape)} and {tuple(v_mn_cache.shape)}."
++        )
++
++    num_blocks, block_size, cache_heads, packed_head_size = v_quant_cache.shape
++    expected_quant = (num_blocks, block_size, num_kv_heads, head_size // 8)
++    expected_scale = (num_blocks, block_size, num_kv_heads, head_size // group_size)
++    if tuple(v_quant_cache.shape) != expected_quant:
++        raise RuntimeError(
++            "v_quant_cache layout mismatch: got "
++            f"{tuple(v_quant_cache.shape)}, expected {expected_quant}."
++        )
++    if tuple(v_scale_cache.shape) != expected_scale:
++        raise RuntimeError(
++            "v_scale_cache layout mismatch: got "
++            f"{tuple(v_scale_cache.shape)}, expected {expected_scale}."
++        )
++    if tuple(v_mn_cache.shape) != expected_scale:
++        raise RuntimeError(
++            "v_mn_cache layout mismatch: got "
++            f"{tuple(v_mn_cache.shape)}, expected {expected_scale}."
++        )
++    if packed_head_size != head_size // 8 or cache_heads != num_kv_heads:
++        raise RuntimeError("v_quant_cache head layout does not match input value tensor.")
++
++
++def _check_key_cache_layout(
++    k_quant_cache: torch.Tensor,
++    k_scale_cache: torch.Tensor,
++    k_mn_cache: torch.Tensor,
++    *,
++    num_kv_heads: int,
++    head_size: int,
++    group_size: int,
++) -> int:
++    if k_quant_cache.ndim != 4:
++        raise RuntimeError(
++            f"k_quant_cache must be 4D, got shape={tuple(k_quant_cache.shape)}."
++        )
++    if k_scale_cache.ndim != 4 or k_mn_cache.ndim != 4:
++        raise RuntimeError(
++            "k_scale_cache and k_mn_cache must be 4D, got "
++            f"{tuple(k_scale_cache.shape)} and {tuple(k_mn_cache.shape)}."
++        )
++
++    num_blocks, cache_heads, cache_head_size, packed_block_size = k_quant_cache.shape
++    block_size = packed_block_size * 8
++    expected_quant = (num_blocks, num_kv_heads, head_size, block_size // 8)
++    expected_scale = (num_blocks, num_kv_heads, head_size, block_size // group_size)
++    if tuple(k_quant_cache.shape) != expected_quant:
++        raise RuntimeError(
++            "k_quant_cache layout mismatch: got "
++            f"{tuple(k_quant_cache.shape)}, expected {expected_quant}."
++        )
++    if tuple(k_scale_cache.shape) != expected_scale:
++        raise RuntimeError(
++            "k_scale_cache layout mismatch: got "
++            f"{tuple(k_scale_cache.shape)}, expected {expected_scale}."
++        )
++    if tuple(k_mn_cache.shape) != expected_scale:
++        raise RuntimeError(
++            "k_mn_cache layout mismatch: got "
++            f"{tuple(k_mn_cache.shape)}, expected {expected_scale}."
++        )
++    if cache_heads != num_kv_heads or cache_head_size != head_size:
++        raise RuntimeError("k_quant_cache head layout does not match input key tensor.")
++    return block_size
++
++
++def _check_key_slot_groups(
++    slot_mapping: torch.Tensor,
++    *,
++    block_size: int,
++    group_size: int,
++) -> None:
++    if bool((slot_mapping < 0).any()):
++        raise RuntimeError("kivi_pack_key_cache requires all slot_mapping entries to be valid.")
++
++    slot_groups = slot_mapping.view(-1, group_size)
++    first_slots = slot_groups[:, :1]
++    offsets = torch.arange(
++        group_size,
++        device=slot_mapping.device,
++        dtype=slot_mapping.dtype,
++    ).view(1, -1)
++    if not bool((slot_groups == first_slots + offsets).all()):
++        raise RuntimeError(
++            "kivi_pack_key_cache requires each token group to map to contiguous slots."
++        )
++    if not bool(((first_slots % group_size) == 0).all()):
++        raise RuntimeError(
++            "kivi_pack_key_cache requires each token group to be group-size aligned."
++        )
++    if not bool(((slot_groups // block_size) == (first_slots // block_size)).all()):
++        raise RuntimeError(
++            "kivi_pack_key_cache requires each token group to stay within one cache block."
++        )
++
++
++def _check_block_table(block_table: torch.Tensor) -> None:
++    if block_table.ndim != 2:
++        raise RuntimeError(
++            f"block_table must be 2D, got shape={tuple(block_table.shape)}."
++        )
++    if block_table.dtype not in (torch.int32, torch.int64):
++        raise RuntimeError(
++            f"block_table must be int32/int64, got {block_table.dtype}."
++        )
++
++
++def _check_seq_lens(seq_lens: torch.Tensor, batch_size: int) -> None:
++    if seq_lens.ndim != 1:
++        raise RuntimeError(
++            f"seq_lens must be 1D, got shape={tuple(seq_lens.shape)}."
++        )
++    if seq_lens.numel() != batch_size:
++        raise RuntimeError(
++            f"seq_lens length must match batch size, got {seq_lens.numel()} vs {batch_size}."
++        )
++    if seq_lens.dtype not in (torch.int32, torch.int64):
++        raise RuntimeError(f"seq_lens must be int32/int64, got {seq_lens.dtype}.")
++
++
++@triton.jit
++def _kivi_pack_value_cache_kernel(
++    value_ptr,
++    slot_mapping_ptr,
++    v_quant_cache_ptr,
++    v_scale_cache_ptr,
++    v_mn_cache_ptr,
++    num_tokens,
++    block_size: tl.constexpr,
++    num_kv_heads: tl.constexpr,
++    head_size: tl.constexpr,
++    group_size: tl.constexpr,
++    num_groups: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    num_programs = tl.num_programs(0)
++    total_groups = num_tokens * num_kv_heads * num_groups
++
++    group_offsets = tl.arange(0, group_size)
++    lanes = tl.arange(0, 8)
++    shifts = lanes * 4
++
++    for linear_idx in tl.range(pid, total_groups, num_programs):
++        group_idx = linear_idx % num_groups
++        tmp = linear_idx // num_groups
++        head_idx = tmp % num_kv_heads
++        token_idx = tmp // num_kv_heads
++
++        slot = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
++        if slot >= 0:
++            block_idx = slot // block_size
++            block_offset = slot - block_idx * block_size
++            head_start = group_idx * group_size
++            value_base = (
++                token_idx * num_kv_heads * head_size
++                + head_idx * head_size
++                + head_start
++            )
++
++            values = tl.load(value_ptr + value_base + group_offsets).to(tl.float32)
++            mn = tl.min(values, axis=0)
++            mx = tl.max(values, axis=0)
++            scale = tl.maximum((mx - mn) / 15.0, 1.0e-6)
++
++            scale_offset = (
++                block_idx * block_size * num_kv_heads * num_groups
++                + block_offset * num_kv_heads * num_groups
++                + head_idx * num_groups
++                + group_idx
++            )
++            tl.store(v_scale_cache_ptr + scale_offset, scale)
++            tl.store(v_mn_cache_ptr + scale_offset, mn)
++
++            for pack_base in tl.range(0, group_size, 8):
++                pack_values = tl.load(
++                    value_ptr + value_base + pack_base + lanes
++                ).to(tl.float32)
++                quant = tl.minimum(
++                    tl.maximum(tl.round((pack_values - mn) / scale), 0), 15
++                ).to(tl.int32)
++                packed = tl.sum(
++                    ((quant.to(tl.int64) & 0xF) << shifts.to(tl.int64)),
++                    axis=0,
++                ).to(tl.int32)
++                pack_idx = (head_start + pack_base) // 8
++                quant_offset = (
++                    block_idx * block_size * num_kv_heads * (head_size // 8)
++                    + block_offset * num_kv_heads * (head_size // 8)
++                    + head_idx * (head_size // 8)
++                    + pack_idx
++                )
++                tl.store(v_quant_cache_ptr + quant_offset, packed)
++
++
++@triton.jit
++def _kivi_pack_key_cache_kernel(
++    key_ptr,
++    slot_mapping_ptr,
++    k_quant_cache_ptr,
++    k_scale_cache_ptr,
++    k_mn_cache_ptr,
++    num_tokens,
++    block_size: tl.constexpr,
++    num_kv_heads: tl.constexpr,
++    head_size: tl.constexpr,
++    group_size: tl.constexpr,
++    block_dim_size: tl.constexpr,
++    num_dim_tiles: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    num_programs = tl.num_programs(0)
++    num_token_groups = num_tokens // group_size
++    total_tiles = num_token_groups * num_kv_heads * num_dim_tiles
++
++    dim_offsets = tl.arange(0, block_dim_size)
++    dim_mask = dim_offsets < head_size
++    token_offsets = tl.arange(0, group_size)
++    lanes = tl.arange(0, 8)
++    shifts = lanes[:, None] * 4
++
++    for linear_idx in tl.range(pid, total_tiles, num_programs):
++        dim_tile_idx = linear_idx % num_dim_tiles
++        tmp = linear_idx // num_dim_tiles
++        head_idx = tmp % num_kv_heads
++        token_group_idx = tmp // num_kv_heads
++        token_start = token_group_idx * group_size
++        dim_start = dim_tile_idx * block_dim_size
++        dims = dim_start + dim_offsets
++        dim_mask = dims < head_size
++
++        first_slot = tl.load(slot_mapping_ptr + token_start).to(tl.int64)
++        if first_slot >= 0:
++            block_idx = first_slot // block_size
++            group_offset = first_slot - block_idx * block_size
++            cache_group_idx = group_offset // group_size
++
++            values = tl.load(
++                key_ptr
++                + (token_start + token_offsets[:, None]) * num_kv_heads * head_size
++                + head_idx * head_size
++                + dims[None, :],
++                mask=dim_mask[None, :],
++                other=0.0,
++            ).to(tl.float32)
++            mn = tl.min(values, axis=0)
++            mx = tl.max(values, axis=0)
++            scale = tl.maximum((mx - mn) / 15.0, 1.0e-6)
++
++            scale_offsets = (
++                block_idx * num_kv_heads * head_size * (block_size // group_size)
++                + head_idx * head_size * (block_size // group_size)
++                + dims * (block_size // group_size)
++                + cache_group_idx
++            )
++            tl.store(k_scale_cache_ptr + scale_offsets, scale, mask=dim_mask)
++            tl.store(k_mn_cache_ptr + scale_offsets, mn, mask=dim_mask)
++
++            for pack_base in tl.range(0, group_size, 8):
++                pack_values = tl.load(
++                    key_ptr
++                    + (token_start + pack_base + lanes[:, None])
++                    * num_kv_heads
++                    * head_size
++                    + head_idx * head_size
++                    + dims[None, :],
++                    mask=dim_mask[None, :],
++                    other=0.0,
++                ).to(tl.float32)
++                quant = tl.minimum(
++                    tl.maximum(
++                        tl.round((pack_values - mn[None, :]) / scale[None, :]),
++                        0,
++                    ),
++                    15,
++                ).to(tl.int32)
++                packed = tl.sum(
++                    ((quant.to(tl.int64) & 0xF) << shifts.to(tl.int64)),
++                    axis=0,
++                ).to(tl.int32)
++                pack_idx = (group_offset + pack_base) // 8
++                quant_offsets = (
++                    block_idx * num_kv_heads * head_size * (block_size // 8)
++                    + head_idx * head_size * (block_size // 8)
++                    + dims * (block_size // 8)
++                    + pack_idx
++                )
++                tl.store(k_quant_cache_ptr + quant_offsets, packed, mask=dim_mask)
++
++
++@triton.jit
++def _kivi_dequant_gather_key_cache_kernel(
++    k_quant_cache_ptr,
++    k_scale_cache_ptr,
++    k_mn_cache_ptr,
++    block_table_ptr,
++    cu_seq_lens_ptr,
++    key_out_ptr,
++    total_tokens,
++    block_table_stride: tl.constexpr,
++    block_size: tl.constexpr,
++    num_kv_heads: tl.constexpr,
++    head_size: tl.constexpr,
++    group_size: tl.constexpr,
++    batch_size: tl.constexpr,
++    block_dim_size: tl.constexpr,
++):
++    token_start = tl.program_id(0) * block_dim_size
++    head_idx = tl.program_id(1)
++    dim_start = tl.program_id(2) * block_dim_size
++
++    token_offsets = token_start + tl.arange(0, block_dim_size)
++    dim_offsets = dim_start + tl.arange(0, block_dim_size)
++    token_mask = token_offsets < total_tokens
++    dim_mask = dim_offsets < head_size
++
++    req_idx = tl.zeros((block_dim_size,), dtype=tl.int64)
++    local_pos = token_offsets.to(tl.int64)
++    for idx in tl.range(0, batch_size):
++        start = tl.load(cu_seq_lens_ptr + idx).to(tl.int64)
++        end = tl.load(cu_seq_lens_ptr + idx + 1).to(tl.int64)
++        in_req = (token_offsets >= start) & (token_offsets < end)
++        req_idx = tl.where(in_req, idx, req_idx)
++        local_pos = tl.where(in_req, token_offsets.to(tl.int64) - start, local_pos)
++
++    logical_block_idx = local_pos // block_size
++    block_offset = local_pos - logical_block_idx * block_size
++    block_id = tl.load(
++        block_table_ptr + req_idx * block_table_stride + logical_block_idx,
++        mask=token_mask,
++        other=-1,
++    ).to(tl.int64)
++    live_mask = token_mask & (block_id >= 0)
++
++    key_group_idx = block_offset // group_size
++    key_pack_idx = block_offset // 8
++    key_lane = block_offset - key_pack_idx * 8
++    key_shift = key_lane[:, None] * 4
++    num_key_groups = block_size // group_size
++    key_quant_offsets = (
++        block_id[:, None] * num_kv_heads * head_size * (block_size // 8)
++        + head_idx * head_size * (block_size // 8)
++        + dim_offsets[None, :] * (block_size // 8)
++        + key_pack_idx[:, None]
++    )
++    key_scale_offsets = (
++        block_id[:, None] * num_kv_heads * head_size * num_key_groups
++        + head_idx * head_size * num_key_groups
++        + dim_offsets[None, :] * num_key_groups
++        + key_group_idx[:, None]
++    )
++    key_mask = live_mask[:, None] & dim_mask[None, :]
++    key_packed = tl.load(k_quant_cache_ptr + key_quant_offsets, mask=key_mask, other=0)
++    key_scale = tl.load(k_scale_cache_ptr + key_scale_offsets, mask=key_mask, other=0.0)
++    key_mn = tl.load(k_mn_cache_ptr + key_scale_offsets, mask=key_mask, other=0.0)
++    key_q = ((key_packed.to(tl.int32) >> key_shift.to(tl.int32)) & 0xF).to(tl.float32)
++    key_deq = key_q * key_scale + key_mn
++    out_offsets = (
++        token_offsets[:, None] * num_kv_heads * head_size
++        + head_idx * head_size
++        + dim_offsets[None, :]
++    )
++    tl.store(key_out_ptr + out_offsets, key_deq, mask=key_mask)
++
++
++@triton.jit
++def _kivi_dequant_gather_value_cache_kernel(
++    v_quant_cache_ptr,
++    v_scale_cache_ptr,
++    v_mn_cache_ptr,
++    block_table_ptr,
++    cu_seq_lens_ptr,
++    value_out_ptr,
++    total_tokens,
++    block_table_stride: tl.constexpr,
++    block_size: tl.constexpr,
++    num_kv_heads: tl.constexpr,
++    head_size: tl.constexpr,
++    group_size: tl.constexpr,
++    batch_size: tl.constexpr,
++    block_dim_size: tl.constexpr,
++):
++    token_start = tl.program_id(0) * block_dim_size
++    head_idx = tl.program_id(1)
++    dim_start = tl.program_id(2) * block_dim_size
++
++    token_offsets = token_start + tl.arange(0, block_dim_size)
++    dim_offsets = dim_start + tl.arange(0, block_dim_size)
++    token_mask = token_offsets < total_tokens
++    dim_mask = dim_offsets < head_size
++
++    req_idx = tl.zeros((block_dim_size,), dtype=tl.int64)
++    local_pos = token_offsets.to(tl.int64)
++    for idx in tl.range(0, batch_size):
++        start = tl.load(cu_seq_lens_ptr + idx).to(tl.int64)
++        end = tl.load(cu_seq_lens_ptr + idx + 1).to(tl.int64)
++        in_req = (token_offsets >= start) & (token_offsets < end)
++        req_idx = tl.where(in_req, idx, req_idx)
++        local_pos = tl.where(in_req, token_offsets.to(tl.int64) - start, local_pos)
++
++    logical_block_idx = local_pos // block_size
++    block_offset = local_pos - logical_block_idx * block_size
++    block_id = tl.load(
++        block_table_ptr + req_idx * block_table_stride + logical_block_idx,
++        mask=token_mask,
++        other=-1,
++    ).to(tl.int64)
++    live_mask = token_mask & (block_id >= 0)
++
++    value_group_idx = dim_offsets // group_size
++    value_pack_idx = dim_offsets // 8
++    value_lane = dim_offsets - value_pack_idx * 8
++    value_shift = value_lane[None, :] * 4
++    num_value_groups = head_size // group_size
++    value_quant_offsets = (
++        block_id[:, None] * block_size * num_kv_heads * (head_size // 8)
++        + block_offset[:, None] * num_kv_heads * (head_size // 8)
++        + head_idx * (head_size // 8)
++        + value_pack_idx[None, :]
++    )
++    value_scale_offsets = (
++        block_id[:, None] * block_size * num_kv_heads * num_value_groups
++        + block_offset[:, None] * num_kv_heads * num_value_groups
++        + head_idx * num_value_groups
++        + value_group_idx[None, :]
++    )
++    value_mask = live_mask[:, None] & dim_mask[None, :]
++    value_packed = tl.load(
++        v_quant_cache_ptr + value_quant_offsets, mask=value_mask, other=0
++    )
++    value_scale = tl.load(
++        v_scale_cache_ptr + value_scale_offsets, mask=value_mask, other=0.0
++    )
++    value_mn = tl.load(
++        v_mn_cache_ptr + value_scale_offsets, mask=value_mask, other=0.0
++    )
++    value_q = (
++        (value_packed.to(tl.int32) >> value_shift.to(tl.int32)) & 0xF
++    ).to(tl.float32)
++    value_deq = value_q * value_scale + value_mn
++    out_offsets = (
++        token_offsets[:, None] * num_kv_heads * head_size
++        + head_idx * head_size
++        + dim_offsets[None, :]
++    )
++    tl.store(value_out_ptr + out_offsets, value_deq, mask=value_mask)
++
++
++def kivi_pack_value_cache(
++    value: torch.Tensor, #形状是 [num_tokens, num_kv_heads, head_size]
++    slot_mapping: torch.Tensor,
++    v_quant_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    v_mn_cache: torch.Tensor,
++    group_size: int,
++) -> None:
++    num_tokens, num_kv_heads, head_size = value.shape
++    if num_tokens == 0:
++        return
++
++    assert group_size % 8 == 0
++    assert head_size % group_size == 0
++    assert head_size % 8 == 0
++
++    _check_contiguous("value", value)
++    _check_contiguous("slot_mapping", slot_mapping)
++    _check_contiguous("v_quant_cache", v_quant_cache)
++    _check_contiguous("v_scale_cache", v_scale_cache)
++    _check_contiguous("v_mn_cache", v_mn_cache)
++    _check_same_device("slot_mapping", slot_mapping, value)
++    _check_same_device("v_quant_cache", v_quant_cache, value)
++    _check_same_device("v_scale_cache", v_scale_cache, value)
++    _check_same_device("v_mn_cache", v_mn_cache, value)
++    _check_slot_mapping(slot_mapping, num_tokens)
++    _check_value_cache_layout(
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        group_size=group_size,
++    )
++
++    _kivi_pack_value_cache_kernel[(get_vectorcore_num(),)](
++        value,
++        slot_mapping,
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        num_tokens,
++        v_quant_cache.shape[1],
++        num_kv_heads,
++        head_size,
++        group_size,
++        head_size // group_size,
++    )
++
++
++def kivi_pack_key_cache(
++    key: torch.Tensor, #形状是 [num_tokens, num_kv_heads, head_size]
++    slot_mapping: torch.Tensor,
++    k_quant_cache: torch.Tensor,
++    k_scale_cache: torch.Tensor,
++    k_mn_cache: torch.Tensor,
++    group_size: int,
++) -> None:
++    num_tokens, num_kv_heads, head_size = key.shape
++    if num_tokens == 0:
++        return
++
++    assert group_size % 8 == 0
++    assert num_tokens % group_size == 0
++    assert head_size % 8 == 0
++
++    _check_contiguous("key", key)
++    _check_contiguous("slot_mapping", slot_mapping)
++    _check_contiguous("k_quant_cache", k_quant_cache)
++    _check_contiguous("k_scale_cache", k_scale_cache)
++    _check_contiguous("k_mn_cache", k_mn_cache)
++    _check_same_device("slot_mapping", slot_mapping, key)
++    _check_same_device("k_quant_cache", k_quant_cache, key)
++    _check_same_device("k_scale_cache", k_scale_cache, key)
++    _check_same_device("k_mn_cache", k_mn_cache, key)
++    _check_slot_mapping(slot_mapping, num_tokens)
++    block_size = _check_key_cache_layout(   #blocksize=128
++        k_quant_cache, #k_quant_cache.shape == [num_blocks, num_kv_heads, head_size, block_size // 8]
++        k_scale_cache, #k_scale_cache.shape == [num_blocks, num_kv_heads, head_size, block_size // group_size]
++        k_mn_cache,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        group_size=group_size,
++    )
++    _check_key_slot_groups(
++        slot_mapping,
++        block_size=block_size,
++        group_size=group_size,
++    )
++
++    _kivi_pack_key_cache_kernel[(get_vectorcore_num(),)](
++        key,
++        slot_mapping,
++        k_quant_cache,
++        k_scale_cache,
++        k_mn_cache,
++        num_tokens,
++        block_size,
++        num_kv_heads,
++        head_size,
++        group_size,
++        min(64, triton.next_power_of_2(head_size)),
++        triton.cdiv(head_size, min(64, triton.next_power_of_2(head_size))),
++    )
++
++
++def _check_dequant_gather_metadata(
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    *,
++    num_blocks: int,
++    block_size: int,
++) -> tuple[torch.Tensor, int, int]:
++    batch_size = int(seq_lens.numel())
++    _check_block_table(block_table)
++    _check_seq_lens(seq_lens, batch_size)
++    _check_contiguous("block_table", block_table)
++    _check_contiguous("seq_lens", seq_lens)
++
++    if block_table.shape[0] != batch_size:
++        raise RuntimeError(
++            f"block_table batch size must match seq_lens, got {block_table.shape[0]} vs {batch_size}."
++        )
++    max_seq_len = int(seq_lens.max().item()) if batch_size > 0 else 0
++    if max_seq_len > block_table.shape[1] * block_size:
++        raise RuntimeError(
++            "block_table does not cover the longest KIVI sequence: "
++            f"max_seq_len={max_seq_len}, max_blocks={block_table.shape[1]}, "
++            f"block_size={block_size}."
++        )
++
++    block_counts = torch.div(
++        seq_lens.to(torch.long) + block_size - 1,
++        block_size,
++        rounding_mode="floor",
++    )
++    block_positions = torch.arange(
++        block_table.shape[1],
++        dtype=torch.long,
++        device=block_table.device,
++    )
++    live_block_mask = block_positions.unsqueeze(0) < block_counts.unsqueeze(1)
++    live_block_ids = block_table[live_block_mask]
++    if bool((live_block_ids < 0).any().item()):
++        raise RuntimeError("KIVI block_table has invalid block ids for live tokens.")
++    if bool((live_block_ids >= num_blocks).any().item()):
++        raise RuntimeError(
++            "KIVI block_table references blocks outside the int4 cache."
++        )
++
++    total_tokens = int(seq_lens.sum().item())
++    cu_seq_lens = torch.empty(
++        (batch_size + 1,),
++        dtype=torch.long,
++        device=seq_lens.device,
++    )
++    cu_seq_lens[0] = 0
++    cu_seq_lens[1:] = torch.cumsum(seq_lens.to(torch.long), dim=0)
++    return cu_seq_lens, batch_size, total_tokens
++
++
++def _launch_kivi_dequant_gather_key_cache(
++    k_quant_cache: torch.Tensor,
++    k_scale_cache: torch.Tensor,
++    k_mn_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    cu_seq_lens: torch.Tensor,
++    *,
++    batch_size: int,
++    total_tokens: int,
++    target_dtype: torch.dtype,
++    group_size: int,
++) -> torch.Tensor:
++    _, num_kv_heads, head_size, packed_block_size = k_quant_cache.shape
++    block_size = packed_block_size * 8
++    key_out = torch.empty(
++        (total_tokens, num_kv_heads, head_size),
++        dtype=target_dtype,
++        device=k_quant_cache.device,
++    )
++    if total_tokens == 0:
++        return key_out
++
++    block_dim_size = min(64, triton.next_power_of_2(head_size))
++    grid = (
++        triton.cdiv(total_tokens, block_dim_size),
++        num_kv_heads,
++        triton.cdiv(head_size, block_dim_size),
++    )
++    _kivi_dequant_gather_key_cache_kernel[grid](
++        k_quant_cache,
++        k_scale_cache,
++        k_mn_cache,
++        block_table,
++        cu_seq_lens,
++        key_out,
++        total_tokens,
++        block_table.stride(0),
++        block_size,
++        num_kv_heads,
++        head_size,
++        group_size,
++        batch_size,
++        block_dim_size,
++    )
++    return key_out
++
++
++def _launch_kivi_dequant_gather_value_cache(
++    v_quant_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    v_mn_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    cu_seq_lens: torch.Tensor,
++    *,
++    batch_size: int,
++    total_tokens: int,
++    target_dtype: torch.dtype,
++    group_size: int,
++) -> torch.Tensor:
++    _, block_size, num_kv_heads, packed_head_size = v_quant_cache.shape
++    head_size = packed_head_size * 8
++    value_out = torch.empty(
++        (total_tokens, num_kv_heads, head_size),
++        dtype=target_dtype,
++        device=v_quant_cache.device,
++    )
++    if total_tokens == 0:
++        return value_out
++
++    block_dim_size = min(64, triton.next_power_of_2(head_size))
++    grid = (
++        triton.cdiv(total_tokens, block_dim_size),
++        num_kv_heads,
++        triton.cdiv(head_size, block_dim_size),
++    )
++    _kivi_dequant_gather_value_cache_kernel[grid](
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        block_table,
++        cu_seq_lens,
++        value_out,
++        total_tokens,
++        block_table.stride(0),
++        block_size,
++        num_kv_heads,
++        head_size,
++        group_size,
++        batch_size,
++        block_dim_size,
++    )
++    return value_out
++
++
++def kivi_dequant_gather_key_cache(
++    k_quant_cache: torch.Tensor,
++    k_scale_cache: torch.Tensor,
++    k_mn_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    target_dtype: torch.dtype,
++    group_size: int,
++) -> torch.Tensor:
++    if block_table.shape[0] != seq_lens.numel():
++        block_table = block_table[:seq_lens.numel()]
++
++    _check_contiguous("k_quant_cache", k_quant_cache)
++    _check_contiguous("k_scale_cache", k_scale_cache)
++    _check_contiguous("k_mn_cache", k_mn_cache)
++    _check_same_device("k_scale_cache", k_scale_cache, k_quant_cache)
++    _check_same_device("k_mn_cache", k_mn_cache, k_quant_cache)
++    _check_same_device("block_table", block_table, k_quant_cache)
++    _check_same_device("seq_lens", seq_lens, k_quant_cache)
++
++    num_blocks, num_kv_heads, head_size, packed_block_size = k_quant_cache.shape
++    block_size = packed_block_size * 8
++    if group_size % 8 != 0:
++        raise RuntimeError(
++            f"KIVI INT4 key dequant requires group_size ({group_size}) to be divisible by 8."
++        )
++    _check_key_cache_layout(
++        k_quant_cache,
++        k_scale_cache,
++        k_mn_cache,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        group_size=group_size,
++    )
++    cu_seq_lens, batch_size, total_tokens = _check_dequant_gather_metadata(
++        block_table,
++        seq_lens,
++        num_blocks=num_blocks,
++        block_size=block_size,
++    )
++    return _launch_kivi_dequant_gather_key_cache(
++        k_quant_cache,
++        k_scale_cache,
++        k_mn_cache,
++        block_table,
++        cu_seq_lens,
++        batch_size=batch_size,
++        total_tokens=total_tokens,
++        target_dtype=target_dtype,
++        group_size=group_size,
++    )
++
++
++def kivi_dequant_gather_value_cache(
++    v_quant_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    v_mn_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    target_dtype: torch.dtype,
++    group_size: int,
++) -> torch.Tensor:
++    if block_table.shape[0] != seq_lens.numel():
++        block_table = block_table[:seq_lens.numel()]
++
++    _check_contiguous("v_quant_cache", v_quant_cache)
++    _check_contiguous("v_scale_cache", v_scale_cache)
++    _check_contiguous("v_mn_cache", v_mn_cache)
++    _check_same_device("v_scale_cache", v_scale_cache, v_quant_cache)
++    _check_same_device("v_mn_cache", v_mn_cache, v_quant_cache)
++    _check_same_device("block_table", block_table, v_quant_cache)
++    _check_same_device("seq_lens", seq_lens, v_quant_cache)
++
++    num_blocks, block_size, num_kv_heads, packed_head_size = v_quant_cache.shape
++    head_size = packed_head_size * 8
++    if group_size % 8 != 0:
++        raise RuntimeError(
++            f"KIVI INT4 value dequant requires group_size ({group_size}) to be divisible by 8."
++        )
++    _check_value_cache_layout(
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        group_size=group_size,
++    )
++    if v_quant_cache.shape[0] != num_blocks or v_quant_cache.shape[1] != block_size:
++        raise RuntimeError(
++            "KIVI key/value cache block layout mismatch: "
++            f"key num_blocks={num_blocks}, block_size={block_size}; "
++            f"value shape={tuple(v_quant_cache.shape)}."
++        )
++    cu_seq_lens, batch_size, total_tokens = _check_dequant_gather_metadata(
++        block_table,
++        seq_lens,
++        num_blocks=num_blocks,
++        block_size=block_size,
++    )
++    return _launch_kivi_dequant_gather_value_cache(
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        block_table,
++        cu_seq_lens,
++        batch_size=batch_size,
++        total_tokens=total_tokens,
++        target_dtype=target_dtype,
++        group_size=group_size,
++    )
++
++
++def kivi_dequant_gather_cache(
++    k_quant_cache: torch.Tensor,
++    k_scale_cache: torch.Tensor,
++    k_mn_cache: torch.Tensor,
++    v_quant_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    v_mn_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    target_dtype: torch.dtype,
++    group_size: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if block_table.shape[0] != seq_lens.numel():
++        block_table = block_table[:seq_lens.numel()]
++
++    _check_contiguous("k_quant_cache", k_quant_cache)
++    _check_contiguous("k_scale_cache", k_scale_cache)
++    _check_contiguous("k_mn_cache", k_mn_cache)
++    _check_contiguous("v_quant_cache", v_quant_cache)
++    _check_contiguous("v_scale_cache", v_scale_cache)
++    _check_contiguous("v_mn_cache", v_mn_cache)
++    _check_same_device("k_scale_cache", k_scale_cache, k_quant_cache)
++    _check_same_device("k_mn_cache", k_mn_cache, k_quant_cache)
++    _check_same_device("v_quant_cache", v_quant_cache, k_quant_cache)
++    _check_same_device("v_scale_cache", v_scale_cache, k_quant_cache)
++    _check_same_device("v_mn_cache", v_mn_cache, k_quant_cache)
++    _check_same_device("block_table", block_table, k_quant_cache)
++    _check_same_device("seq_lens", seq_lens, k_quant_cache)
++
++    num_blocks, num_kv_heads, head_size, packed_block_size = k_quant_cache.shape
++    block_size = packed_block_size * 8
++    if group_size % 8 != 0:
++        raise RuntimeError(
++            f"KIVI INT4 dequant requires group_size ({group_size}) to be divisible by 8."
++        )
++    _check_key_cache_layout(
++        k_quant_cache,
++        k_scale_cache,
++        k_mn_cache,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        group_size=group_size,
++    )
++    _check_value_cache_layout(
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        group_size=group_size,
++    )
++    cu_seq_lens, batch_size, total_tokens = _check_dequant_gather_metadata(
++        block_table,
++        seq_lens,
++        num_blocks=num_blocks,
++        block_size=block_size,
++    )
++    key_out = _launch_kivi_dequant_gather_key_cache(
++        k_quant_cache,
++        k_scale_cache,
++        k_mn_cache,
++        block_table,
++        cu_seq_lens,
++        batch_size=batch_size,
++        total_tokens=total_tokens,
++        target_dtype=target_dtype,
++        group_size=group_size,
++    )
++    value_out = _launch_kivi_dequant_gather_value_cache(
++        v_quant_cache,
++        v_scale_cache,
++        v_mn_cache,
++        block_table,
++        cu_seq_lens,
++        batch_size=batch_size,
++        total_tokens=total_tokens,
++        target_dtype=target_dtype,
++        group_size=group_size,
++    )
++    return key_out, value_out
+-- 
+2.53.0.windows.3
+

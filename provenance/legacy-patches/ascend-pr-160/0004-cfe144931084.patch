@@ -1,0 +1,319 @@
+From cfe1449310841237c88440dd8c015c1a225ec438 Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Sat, 15 Aug 2026 08:09:55 +0000
+Subject: [PATCH] feat(kv-cache): implement real INT4 packed KV
+ write/read/dequant attention backend
+
+Co-authored-by: Claude
+Signed-off-by: SuccinctPaul <SuccinctPaul@users.noreply.github.com>
+---
+ vllm_ascend/attention/attention_v1.py       | 263 ++++++++++++++++++++
+ vllm_ascend/quantization/methods/kv_int4.py |   9 +-
+ 2 files changed, 270 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index 27210fb44a..46a104b598 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -2150,3 +2150,266 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
+             if self.is_kv_producer:
+                 attn_metadata.reshape_cache_event.record()
+         return query, key, value, output
++
++
++class AscendInt4AttentionBackendImpl(AscendAttentionBackendImpl):
++    """INT4 KV cache backend for dense-attention models.
++
++    Per-token-head symmetric INT4 KV cache, packed 2x int4/byte.  The packed
++    data lives in the first ``head_size // 2`` elements of each head and the
++    per-token-head fp32 scale is stored inline in the four trailing slots of
++    the same head (matching the core ``INT4_PER_TOKEN_HEAD`` layout, so the
++    core KV cache page-size already budgets the inline scale).
++
++    Ascend FIA cannot consume packed INT4 pages directly, so the read path
++    gathers the paged cache, unpacks, dequantizes into dense fp16 KV and runs
++    a dense TND FIA.  The write path quantizes, packs and stores both the
++    packed data and the per-token-head scale.
++    """
++
++    _INT4_SCALE_PAD = 4  # fp32 scale appended to each head (4 uint8 slots)
++
++    @staticmethod
++    def get_kv_cache_shape(
++        num_blocks: int,
++        block_size: int,
++        num_kv_heads: int,
++        head_size: int,
++        cache_dtype_str: str = "",
++    ) -> tuple[int, ...]:
++        if cache_dtype_str == "int4":
++            return (
++                2,
++                num_blocks,
++                block_size,
++                num_kv_heads,
++                head_size // 2 + AscendInt4AttentionBackendImpl._INT4_SCALE_PAD,
++            )
++        return (2, num_blocks, block_size, num_kv_heads, head_size)
++
++    def _int4_scale_view(self, cache: torch.Tensor) -> torch.Tensor:
++        """fp32 view of the inline per-(block, slot, head) scale.
++
++        The per-token-head scale lives in the last fp32 slot of each head, i.e.
++        bytes ``[head_size // 2, head_size // 2 + 4)``, so it is the last fp32
++        element of every head.
++        """
++        assert cache.shape[-1] % 4 == 0, f"INT4 padded head must be fp32-aligned: {cache.shape[-1]}"
++        return cache.view(torch.float32)[..., -1]
++
++    @staticmethod
++    def _pack_int4(q: torch.Tensor) -> torch.Tensor:
++        """Pack two int4 nibbles per byte: (even, odd) -> ((odd<<4)|even)."""
++        nib = q.to(torch.int64) & 0xF
++        lo = nib[..., 0::2] & 0xF
++        hi = nib[..., 1::2] & 0xF
++        return ((lo) | (hi << 4)).to(torch.uint8)
++
++    def _quantize_kv_to_int4(self, key: torch.Tensor, value: torch.Tensor, num_actual_tokens: int):
++        """Per-token-head symmetric INT4 quantize + pack."""
++        actual_key = key[:num_actual_tokens]
++        actual_value = value[:num_actual_tokens]
++        k_scale = torch.clamp(actual_key.abs().amax(dim=-1) / 7.0, min=1e-6)
++        v_scale = torch.clamp(actual_value.abs().amax(dim=-1) / 7.0, min=1e-6)
++        kq = torch.round(actual_key / k_scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int8)
++        vq = torch.round(actual_value / v_scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int8)
++        return (
++            self._pack_int4(kq),
++            self._pack_int4(vq),
++            k_scale.float(),
++            v_scale.float(),
++        )
++
++    def _reshape_and_cache_int4(
++        self,
++        k_packed: torch.Tensor,
++        v_packed: torch.Tensor,
++        k_scale: torch.Tensor,
++        v_scale: torch.Tensor,
++        attn_metadata: AscendMetadata,
++    ) -> None:
++        block_size = self.key_cache.shape[1]
++        hs_half = self.head_size // 2
++        slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
++        blk = slots // block_size
++        slot_in = slots % block_size
++        self.key_cache[blk, slot_in, :, :hs_half] = k_packed
++        self.value_cache[blk, slot_in, :, :hs_half] = v_packed
++        self._int4_scale_view(self.key_cache)[blk, slot_in, :] = k_scale
++        self._int4_scale_view(self.value_cache)[blk, slot_in, :] = v_scale
++
++    def _dequant_paged_int4_to_dense(
++        self,
++        block_table: torch.Tensor,
++        seq_lens: list,
++        target_dtype: torch.dtype,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Gather paged packed-INT4 KV blocks, unpack and dequantize to dense."""
++        batch = block_table.shape[0]
++        max_blocks = block_table.shape[1]
++        block_size = self.key_cache.shape[1]
++        padded = max_blocks * block_size
++        hs_half = self.head_size // 2
++        flat = block_table.reshape(-1)
++
++        def _unpack(cache: torch.Tensor) -> torch.Tensor:
++            packed = cache[flat][..., :hs_half].view(batch, padded, self.num_kv_heads, hs_half)
++            scale = self._int4_scale_view(cache)[flat].view(batch, padded, self.num_kv_heads)
++            lo = packed & 0xF
++            hi = (packed >> 4) & 0xF
++            vals = torch.zeros(
++                batch,
++                padded,
++                self.num_kv_heads,
++                self.head_size,
++                dtype=torch.int16,
++                device=cache.device,
++            )
++            vals[..., 0::2] = lo
++            vals[..., 1::2] = hi
++            vals = torch.where(vals >= 8, vals - 16, vals).float()
++            return vals * scale.unsqueeze(-1)
++
++        kd = _unpack(self.key_cache).to(target_dtype)
++        vd = _unpack(self.value_cache).to(target_dtype)
++        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=self.key_cache.device)
++        pos = torch.arange(padded, dtype=torch.long, device=self.key_cache.device).unsqueeze(0)
++        valid = (pos < seq_lens_t.unsqueeze(1)).view(-1)
++        kd = kd.view(batch * padded, self.num_kv_heads, self.head_size)[valid]
++        vd = vd.view(batch * padded, self.num_kv_heads, self.head_size)[valid]
++        return kd, vd
++
++    def _dense_tnd_fia(
++        self,
++        query: torch.Tensor,
++        dense_k: torch.Tensor,
++        dense_v: torch.Tensor,
++        actual_seq_lengths,
++        actual_seq_lengths_kv,
++        atten_mask,
++        block_size: int,
++    ) -> torch.Tensor:
++        attn_out, _ = torch_npu.npu_fused_infer_attention_score(
++            query=query,
++            key=dense_k,
++            value=dense_v,
++            atten_mask=atten_mask,
++            block_table=None,
++            input_layout="TND",
++            block_size=block_size,
++            actual_seq_lengths=actual_seq_lengths,
++            actual_seq_lengths_kv=actual_seq_lengths_kv,
++            num_key_value_heads=self.num_kv_heads,
++            num_heads=self.num_heads,
++            scale=self.scale,
++            sparse_mode=3,
++        )
++        return attn_out
++
++    def _forward_int4_decode(
++        self,
++        query: torch.Tensor,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        batch_size = len(attn_metadata.seq_lens_list)
++        block_size = self.key_cache.shape[1]
++        dense_k, dense_v = self._dequant_paged_int4_to_dense(
++            attn_metadata.block_tables, attn_metadata.seq_lens_list, query.dtype
++        )
++        seq_lens_t = torch.tensor(attn_metadata.seq_lens_list, dtype=torch.int32, device=query.device)
++        kv_seq = seq_lens_t.cumsum(0)
++        q_seq = torch.arange(1, batch_size + 1, dtype=torch.int32, device=query.device)
++        attn_out = self._dense_tnd_fia(
++            query[:batch_size],
++            dense_k,
++            dense_v,
++            q_seq,
++            kv_seq,
++            attn_metadata.attn_mask,
++            block_size,
++        )
++        output[:batch_size] = attn_out.view(batch_size, self.num_heads, self.head_size)
++        return output
++
++    def _forward_int4_prefill(
++        self,
++        query: torch.Tensor,
++        float_key: torch.Tensor | None,
++        float_value: torch.Tensor | None,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
++        num_tokens = int(actual_seq_qlen[-1])
++        block_size = self.key_cache.shape[1]
++        prefill_q = query[:num_tokens]
++
++        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
++            dense_k = float_key[:num_tokens]
++            dense_v = float_value[:num_tokens]
++            seq_kv = actual_seq_qlen
++        else:
++            seq_lens = attn_metadata.seq_lens_list
++            dense_k, dense_v = self._dequant_paged_int4_to_dense(attn_metadata.block_tables, seq_lens, query.dtype)
++            seq_kv = torch.tensor(seq_lens, dtype=torch.int32, device=query.device).cumsum(0)
++
++        attn_out = self._dense_tnd_fia(
++            prefill_q,
++            dense_k,
++            dense_v,
++            actual_seq_qlen,
++            seq_kv,
++            attn_metadata.attn_mask,
++            block_size,
++        )
++        output[:num_tokens] = attn_out.view(num_tokens, self.num_heads, self.head_size)
++        return output
++
++    def forward(
++        self,
++        layer: AttentionLayer,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: tuple[torch.Tensor],
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor | None = None,
++        output_scale: torch.Tensor | None = None,
++        output_block_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert output is not None, "Output tensor must be provided."
++        if _EXTRA_CTX.capturing:
++            raise NotImplementedError(
++                "INT4 KV cache graph capture is not yet supported by AscendInt4AttentionBackendImpl."
++            )
++        if output_scale is not None or output_block_scale is not None:
++            raise NotImplementedError("fused output quantization is not yet supported for INT4 KV cache")
++
++        if attn_metadata is None:
++            return output.fill_(0)
++
++        if self.key_cache is None:
++            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
++
++        # Write path: quantize + pack + inline-scale store for non-decode states.
++        if key is not None and value is not None and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
++            k_packed, v_packed, k_scale, v_scale = self._quantize_kv_to_int4(
++                key, value, attn_metadata.num_actual_tokens
++            )
++            self._reshape_and_cache_int4(k_packed, v_packed, k_scale, v_scale, attn_metadata)
++
++        # Pooling / encoder branch.
++        if attn_metadata.model_runner_type == "pooling":
++            return self._forward_encoder_attention(query, key, value, attn_metadata, output)
++
++        state = attn_metadata.attn_state
++        if state == AscendAttentionState.DecodeOnly:
++            return self._forward_int4_decode(query, attn_metadata, output)
++        if state in (
++            AscendAttentionState.PrefillNoCache,
++            AscendAttentionState.PrefillCacheHit,
++            AscendAttentionState.ChunkedPrefill,
++        ):
++            return self._forward_int4_prefill(query, key, value, attn_metadata, output)
++        raise NotImplementedError(f"INT4 KV cache unsupported attention state: {state}")
+diff --git a/vllm_ascend/quantization/methods/kv_int4.py b/vllm_ascend/quantization/methods/kv_int4.py
+index 18917854db..b420c19f9c 100644
+--- a/vllm_ascend/quantization/methods/kv_int4.py
++++ b/vllm_ascend/quantization/methods/kv_int4.py
+@@ -17,7 +17,6 @@
+ """INT4 KV cache quantization for dense-attention models."""
+ 
+ import torch
+-
+ from vllm.logger import init_logger
+ 
+ from .base import AscendAttentionScheme
+@@ -41,6 +40,12 @@ class AscendKVCacheInt4Method(AscendAttentionScheme):
+ 
+     def create_weights(self, layer: torch.nn.Module) -> None:
+         layer.kv_cache_torch_dtype = torch.uint8
++        # Upgrade impl to the INT4-specific subclass so the packed KBV write /
++        # gather-unpack-dequant read path is always used.
++        if hasattr(layer, "impl"):
++            from vllm_ascend.attention.attention_v1 import AscendInt4AttentionBackendImpl
++
++            layer.impl.__class__ = AscendInt4AttentionBackendImpl
+         dtype = torch.get_default_dtype()
+         layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
+         layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
+@@ -66,4 +71,4 @@ class AscendKVCacheInt4Method(AscendAttentionScheme):
+             "not be called. INT4 KV cache quantization is handled by the "
+             "attention backend."
+         )
+-        raise RuntimeError(err_msg)
+\ No newline at end of file
++        raise RuntimeError(err_msg)
+-- 
+2.53.0.windows.3
+

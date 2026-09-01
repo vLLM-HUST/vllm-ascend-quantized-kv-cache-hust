@@ -1,0 +1,109 @@
+From 0a46364814eedd3314f04eff3490c3ab422438bd Mon Sep 17 00:00:00 2001
+From: Jingyuan Tian <49518565+CubeLander@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 23:55:33 +0800
+Subject: [PATCH] fix(ops): pass Catlass include to matmul-allreduce kernel
+ (#242)
+
+## What this fixes
+
+The full/default Ascend 910B package build fails while compiling
+`matmul_allreduce_add_rmsnorm` because its op-specific compile options
+are
+registered under the stale `MatmulAllreduceAddRmsnormTensorList` key.
+The
+actual generated op type is `MatmulAllreduceAddRmsnorm`, so the kernel
+never
+receives the Catlass include path and fails on `catlass/catlass.hpp`.
+
+This change:
+
+- registers the options under the actual op name;
+- passes the repository's pinned Catlass include root to the kernel
+compiler;
+- adds a focused source-level regression test for the op name and
+include.
+
+## Validation
+
+- `git diff --check`
+- `ruff format --check
+tests/ut/test_matmul_allreduce_add_rmsnorm_cmake.py`
+- `ruff check tests/ut/test_matmul_allreduce_add_rmsnorm_cmake.py`
+- focused pytest: `1 passed`
+- clean single-op CANN 9.0.0 package build on Ascend 910B: passed
+  - exact generated key: `MatmulAllreduceAddRmsnorm`
+  - Catlass include present in generated compile options
+- both generated parameter variants produced JSON/object artifacts and
+were packaged
+
+- clean full/default CANN 9.0.0 package build on the exact public
+integration: passed
+  - all 52 default candidates accounted for, with no exclusions
+- native extension and kernels built and imported CPU-only; 73 ops
+registered
+  - no NPU runtime claim is made by this build gate
+
+- vLLM version: v0.23.0
+- vLLM main:
+https://github.com/vllm-project/vllm/commit/a30addc7548a9a8b9b3323a7bc3eb7d7c4895d1c
+
+Signed-off-by: Fletcher Tian <jingyuan_tian@qq.com>
+---
+ .../op_host/CMakeLists.txt                    |  3 +-
+ ...test_matmul_allreduce_add_rmsnorm_cmake.py | 29 +++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ut/test_matmul_allreduce_add_rmsnorm_cmake.py
+
+diff --git a/csrc/mc2/matmul_allreduce_add_rmsnorm/op_host/CMakeLists.txt b/csrc/mc2/matmul_allreduce_add_rmsnorm/op_host/CMakeLists.txt
+index 7bf18ab75b..88c2595e8a 100644
+--- a/csrc/mc2/matmul_allreduce_add_rmsnorm/op_host/CMakeLists.txt
++++ b/csrc/mc2/matmul_allreduce_add_rmsnorm/op_host/CMakeLists.txt
+@@ -7,8 +7,9 @@ if (BUILD_OPEN_PROJECT)
+ endif()
+ 
+ add_ops_compile_options(
+-    OP_NAME MatmulAllreduceAddRmsnormTensorList
++    OP_NAME MatmulAllreduceAddRmsnorm
+     OPTIONS
++        -I${CMAKE_SOURCE_DIR}/third_party/catlass/include
+         --cce-auto-sync=off
+         -Wno-deprecated-declarations
+         -Werror
+diff --git a/tests/ut/test_matmul_allreduce_add_rmsnorm_cmake.py b/tests/ut/test_matmul_allreduce_add_rmsnorm_cmake.py
+new file mode 100644
+index 0000000000..b5baf34c13
+--- /dev/null
++++ b/tests/ut/test_matmul_allreduce_add_rmsnorm_cmake.py
+@@ -0,0 +1,29 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++import re
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++CMAKE_FILE = REPO_ROOT / "csrc" / "mc2" / "matmul_allreduce_add_rmsnorm" / "op_host" / "CMakeLists.txt"
++
++
++def _compile_options_block() -> str:
++    source = CMAKE_FILE.read_text(encoding="utf-8")
++    match = re.search(
++        r"add_ops_compile_options\(\s*OP_NAME\s+MatmulAllreduceAddRmsnorm\s+"
++        r"OPTIONS(?P<options>.*?)\n\)",
++        source,
++        flags=re.DOTALL,
++    )
++    assert match is not None, "matmul-allreduce compile-options block is missing"
++    return match.group(0)
++
++
++def test_matmul_allreduce_compile_options_use_registered_op_and_catlass() -> None:
++    source = CMAKE_FILE.read_text(encoding="utf-8")
++    block = _compile_options_block()
++
++    assert "OP_NAME MatmulAllreduceAddRmsnorm\n" in block
++    assert "-I${CMAKE_SOURCE_DIR}/third_party/catlass/include" in block
++    assert "MatmulAllreduceAddRmsnormTensorList" not in source
+-- 
+2.53.0.windows.3
+

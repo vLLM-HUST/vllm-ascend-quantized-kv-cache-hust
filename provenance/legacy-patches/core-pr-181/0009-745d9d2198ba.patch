@@ -1,0 +1,31 @@
+From 745d9d2198ba9f47f19db4df24c0f954b3cce9ee Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Sat, 15 Aug 2026 08:11:01 +0000
+Subject: [PATCH] fix(kv-cache): budget inline INT4 per-token-head scale memory
+ in page size
+
+Co-authored-by: Claude
+Signed-off-by: SuccinctPaul <SuccinctPaul@users.noreply.github.com>
+---
+ vllm/v1/kv_cache_interface.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 5253141d7..5d8fc8fdb 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -251,7 +251,10 @@ class AttentionSpec(KVCacheSpec):
+         # Per-token-head scales are stored in separate tensors managed
+         # by the attention backend, but the memory is carved from the
+         # raw KV cache allocation so it must be budgeted here.
+-        if self.kv_quant_mode.is_per_token_head:
++        if self.kv_quant_mode.is_per_token_head or self.kv_quant_mode.is_int4:
++            # INT4 (packed 2x int4/byte) also stores per-token-head dynamic
++            # scales inline in an fp32 slot appended to each head, so the raw
++            # KV cache allocation must budget that scale memory here too.
+             real_page_size += (
+                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
+             )
+-- 
+2.53.0.windows.3
+

@@ -14,4 +14,6 @@ Primary history:
 - [Ascend #160 CLOSED_UNMERGED](https://github.com/intellistream/vllm-ascend-hust-legacy-20260831/pull/160)
 - [Ascend #207 CLOSED_UNMERGED](https://github.com/intellistream/vllm-ascend-hust-legacy-20260831/pull/207)
 
+Original commit patches for the scoped PRs are preserved under `provenance/legacy-patches/`. Mixed core PR #161 is intentionally excluded from blind archival and must be mined file-by-file.
+
 Closed does not mean merged, and open does not mean accepted. These references are migration evidence, not a release receipt. Exact commits, files, authors, licenses, tests, constraints, and benchmark receipts must be recorded before implementation code is accepted.

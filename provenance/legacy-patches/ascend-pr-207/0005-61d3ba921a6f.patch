@@ -1,0 +1,135 @@
+From 61d3ba921a6f264b9bd24342fdf3b6ca48fa992a Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Sun, 16 Aug 2026 12:58:57 +0000
+Subject: [PATCH] fix(quantization): correct NPU int8 grouped matmul quant
+ kernel call and format drift
+
+Use the native npu_grouped_matmul_swiglu_quant_v2 API with quant_mode
+params for the A5 fallback path, returning 3 values to match call sites.
+Apply ruff 0.14 formatting to layernorm/utils changed hunks.
+---
+ vllm_ascend/device/device_op.py | 16 ++++++++++------
+ vllm_ascend/ops/layernorm.py    | 11 +++--------
+ vllm_ascend/utils.py            | 19 +++++--------------
+ 3 files changed, 18 insertions(+), 28 deletions(-)
+
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 0399a6de8f..1202d09623 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -971,16 +971,20 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+                 )
+                 return out, out_scale, None
+             else:
+-                return torch_npu.npu_grouped_matmul_swiglu_quant_v2(
++                out, out_scale = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
+                     x=x,
+-                    weight=weight,
+-                    group_list=group_list,
+-                    weight_scale=weight_scale,
++                    weight=[weight],
++                    weight_scale=[weight_scale],
+                     x_scale=x_scale,
++                    group_list=group_list,
+                     bias=bias,
+-                    swiglu_limit=swiglu_limit,
+-                    use_mxfp_quant=False,
++                    quant_dtype=0,
++                    dequant_dtype=0,
++                    quant_mode=0,
++                    dequant_mode=0,
++                    group_list_type=0,
+                 )
++                return out, out_scale, None
+ 
+         # W4A8 mxfp
+         if mxfp_quant_dtype == QuantType.W4A8MXFP:
+diff --git a/vllm_ascend/ops/layernorm.py b/vllm_ascend/ops/layernorm.py
+index b51a5b84ce..a0b80b1981 100644
+--- a/vllm_ascend/ops/layernorm.py
++++ b/vllm_ascend/ops/layernorm.py
+@@ -41,8 +41,7 @@ class AscendRMSNorm(RMSNorm):
+ 
+         # quantization with anti_method m4 will generate none-zero norm bias
+         if vllm_config.quant_config is not None and any(
+-            "norm.bias" in name
+-            for name in getattr(vllm_config.quant_config, "quant_description", [])
++            "norm.bias" in name for name in getattr(vllm_config.quant_config, "quant_description", [])
+         ):
+             self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
+             self.bias.weight_loader = self._bias_weight_loader
+@@ -70,9 +69,7 @@ class AscendRMSNorm(RMSNorm):
+ 
+         if residual is not None:
+             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
+-            x, _, residual = torch_npu.npu_add_rms_norm(
+-                x, residual, self.weight, self.variance_epsilon
+-            )
++            x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
+             if self.bias is not None:
+                 x.add_(self.bias)
+             return x, residual
+@@ -96,9 +93,7 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
+ 
+         if residual is not None:
+             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
+-            x, _, residual = torch_npu.npu_add_rms_norm(
+-                x, residual, 1.0 + self.weight, self.variance_epsilon
+-            )
++            x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
+             return x, residual
+ 
+         x = DeviceOperator.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index 078d79b7a5..932c9625b2 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -369,19 +369,15 @@ def is_add_rms_norm_bias_custom_op_available() -> bool:
+         libopapi = ctypes.CDLL("libopapi.so")
+     except OSError as exc:
+         logger.warning_once(
+-            "Disable npu_add_rms_norm_bias custom op because libopapi.so "
+-            "cannot be loaded: %s",
++            "Disable npu_add_rms_norm_bias custom op because libopapi.so cannot be loaded: %s",
+             exc,
+         )
+         return False
+ 
+-    missing_symbols = [
+-        symbol for symbol in _ADD_RMS_NORM_BIAS_REQUIRED_SYMBOLS if not hasattr(libopapi, symbol)
+-    ]
++    missing_symbols = [symbol for symbol in _ADD_RMS_NORM_BIAS_REQUIRED_SYMBOLS if not hasattr(libopapi, symbol)]
+     if missing_symbols:
+         logger.warning_once(
+-            "Disable npu_add_rms_norm_bias custom op because libopapi.so "
+-            "misses required symbol(s): %s",
++            "Disable npu_add_rms_norm_bias custom op because libopapi.so misses required symbol(s): %s",
+             ", ".join(missing_symbols),
+         )
+         return False
+@@ -634,10 +630,7 @@ def vllm_version_is(target_vllm_version: str):
+         current_version = get_vllm_upstream_version()
+         target_version = _normalize_vllm_compat_version(target_vllm_version)
+     except InvalidVersion as exc:
+-        raise ValueError(
+-            f"Invalid target vllm version {target_vllm_version}. "
+-            "Please use x.y.z or x.y.zrcN."
+-        ) from exc
++        raise ValueError(f"Invalid target vllm version {target_vllm_version}. Please use x.y.z or x.y.zrcN.") from exc
+ 
+     return current_version == target_version
+ 
+@@ -749,9 +742,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
+     )
+ 
+     is_moe_model = bool(
+-        vllm_config is not None
+-        and vllm_config.model_config is not None
+-        and vllm_config.model_config.is_moe
++        vllm_config is not None and vllm_config.model_config is not None and vllm_config.model_config.is_moe
+     )
+ 
+     global REGISTERED_ASCEND_OPS
+-- 
+2.53.0.windows.3
+

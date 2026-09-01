@@ -1,0 +1,28 @@
+From 333a3495eb9fa1b5899118b11348aa072f049013 Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Fri, 24 Jul 2026 03:31:38 +0000
+Subject: [PATCH] chore: add code
+
+---
+ vllm_ascend/ops/fused_moe/moe_runtime_args.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_ascend/ops/fused_moe/moe_runtime_args.py b/vllm_ascend/ops/fused_moe/moe_runtime_args.py
+index 55ac8fcd8a..fef14ad03f 100644
+--- a/vllm_ascend/ops/fused_moe/moe_runtime_args.py
++++ b/vllm_ascend/ops/fused_moe/moe_runtime_args.py
+@@ -59,7 +59,10 @@ from __future__ import annotations
+ 
+ import torch
+ 
+-import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
++try:
++    import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
++except ImportError:
++    _stage_params = None
+ from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
+     MoEAllGatherCombineMetadata,
+     MoEAllToAllCombineMetadata,
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,524 @@
+From ddd5cff56267d83bfb64188f82b6f4f58028114e Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Thu, 2 Jul 2026 10:59:47 +0000
+Subject: [PATCH] feat: KIVI INT4 fast decode and chunked-prefill FIA paths
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add _forward_kivi_decode_fast: DecodeOnly→FIA_TND with vectorized
+  dequantization (_gather_dequant_kivi_paged_cache_vectorized)
+- Add _forward_kivi_prefill_fia: PrefillNoCache→FIA_TND direct path
+- Add _forward_kivi_chunked_prefill: split decode/prefill FIA path
+- Add _overlay_kivi_residual_tensors for residual cache injection
+- Change default kivi_group_size and kivi_residual_length from 32 to 128
+- Add KIVI diagnostic counters and step logging (every 10 steps)
+- Fix AscendYaRNRotaryEmbedding.__init__ to initialize use_mtp and
+  force_native_qwen2_rope fields required by AscendRotaryEmbedding.forward_oot()
+
+Co-authored-by: Claude <noreply@anthropic.com>
+---
+ vllm_ascend/attention/attention_v1.py | 416 +++++++++++++++++++++++++-
+ vllm_ascend/ops/rotary_embedding.py   |   9 +
+ 2 files changed, 417 insertions(+), 8 deletions(-)
+
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index 90aac0558..4bcdad81d 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -25,6 +25,7 @@ from torch import nn
+ import torch_npu
+ import vllm.envs as envs_vllm
+ from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.logger import logger
+ from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backend import (  # type: ignore
+@@ -409,11 +410,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         
+         self.enable_kivi = (kv_cache_dtype == "kivi_int4")
+         cache_config = getattr(self.vllm_config, "cache_config", None)
+-        kivi_group_size = getattr(cache_config, "kivi_group_size", 32)
+-        kivi_residual_length = getattr(cache_config, "kivi_residual_length", 32)
+-        self.kivi_group_size = kivi_group_size if isinstance(kivi_group_size, int) else 32
++        kivi_group_size = getattr(cache_config, "kivi_group_size", 128)
++        kivi_residual_length = getattr(cache_config, "kivi_residual_length", 128)
++        self.kivi_group_size = kivi_group_size if isinstance(kivi_group_size, int) else 128
+         self.kivi_residual_length = (
+-            kivi_residual_length if isinstance(kivi_residual_length, int) else 32
++            kivi_residual_length if isinstance(kivi_residual_length, int) else 128
+         )
+         if self.enable_kivi and self.kivi_residual_length % self.kivi_group_size != 0:
+             raise ValueError(
+@@ -446,7 +447,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self.sinks = sinks
+         self.layerIndex = 0
+         self.enable_hamming_sparse = is_enable_hamming_sparse()
+-    
++
++        # KIVI diagnostic counters
++        self._kivi_step = 0
++        self._kivi_decode_fast_count = 0
++        self._kivi_dense_attn_count = 0
++        self._kivi_skip_count = 0
++
+     def _bind_kivi_cache(self, kv_cache):
+         if kv_cache is None:
+             return
+@@ -1337,6 +1344,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
+     ) -> torch.Tensor:
+         self._bind_kivi_cache(kv_cache)
+ 
++        self._kivi_step += 1
++        state_names = {
++            AscendAttentionState.PrefillNoCache: "PrefillNoCache",
++            AscendAttentionState.PrefillCacheHit: "PrefillCacheHit",
++            AscendAttentionState.DecodeOnly: "DecodeOnly",
++            AscendAttentionState.ChunkedPrefill: "ChunkedPrefill",
++            AscendAttentionState.SpecDecoding: "SpecDecoding",
++        }
++        if self._kivi_step % 10 == 1:
++            logger.info(
++                "[KIVI] step=%d state=%s reqs=%d "
++                "(sum: decode_fast=%d dense_attn=%d)",
++                self._kivi_step,
++                state_names.get(attn_metadata.attn_state, "UNKNOWN"),
++                len(attn_metadata.seq_lens_list or []),
++                self._kivi_decode_fast_count,
++                self._kivi_dense_attn_count,
++            )
++
+         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+         if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+             actual_seq_qlen = list(range(1, len(attn_metadata.seq_lens_list) + 1))
+@@ -1346,9 +1372,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+             if key is None or value is None:
+                 raise RuntimeError("KIVI PrefillNoCache requires dense key/value.")
+-            dense_key = key[:num_tokens].to(query.dtype)
+-            dense_value = value[:num_tokens].to(query.dtype)
+-            seq_lens = self._cu_seqlens_to_seq_lens(actual_seq_qlen)
++            return self._forward_kivi_prefill_fia(
++                query=query,
++                key=key,
++                value=value,
++                attn_metadata=attn_metadata,
++                output=output,
++            )
+         else:
+             if attn_metadata.req_ids is None:
+                 raise RuntimeError(
+@@ -1375,6 +1405,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 attn_metadata.block_tables,
+                 seq_lens,
+             )
++            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
++                return self._forward_kivi_decode_fast(
++                    query,
++                    attn_metadata.req_ids,
++                    attn_metadata.block_tables,
++                    seq_lens,
++                    output,
++                )
++            if attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill:
++                return self._forward_kivi_chunked_prefill(
++                    query=query,
++                    key=key,
++                    value=value,
++                    attn_metadata=attn_metadata,
++                    output=output,
++                )
+             dense_key, dense_value = self._gather_dequant_kivi_paged_cache(
+                 attn_metadata.req_ids,
+                 attn_metadata.block_tables,
+@@ -2007,6 +2053,359 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         dense_k = torch.cat(dense_k_parts, dim=0)
+         dense_v = torch.cat(dense_v_parts, dim=0)
+         return dense_k.contiguous(), dense_v.contiguous()    
++
++    def _gather_dequant_kivi_paged_cache_vectorized(
++        self,
++        req_ids: list[str],
++        block_table: torch.Tensor,
++        seq_lens: list[int],
++        target_dtype: torch.dtype,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        cache_device = self.k_quant_cache.device
++        block_table = block_table[:len(seq_lens)].to(
++            device=cache_device, dtype=torch.long
++        )
++        _, max_blocks = block_table.shape
++        cache_block_size = self.k_quant_cache.shape[-1] * 8
++        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=cache_device)
++        block_counts = torch.div(
++            seq_lens_t + cache_block_size - 1,
++            cache_block_size,
++            rounding_mode="floor",
++        )
++        block_positions = torch.arange(
++            max_blocks, dtype=torch.long, device=cache_device
++        )
++        valid_block_mask = block_positions.unsqueeze(0) < block_counts.unsqueeze(1)
++        valid_req_idx, valid_block_pos = valid_block_mask.nonzero(as_tuple=True)
++        valid_block_ids = block_table[valid_block_mask]
++        if bool((valid_block_ids < 0).any()):
++            raise RuntimeError("KIVI block_table has invalid block ids for live tokens.")
++
++        if valid_block_ids.numel() == 0:
++            empty = self.k_quant_cache.new_empty(
++                (0, self.num_kv_heads, self.head_size),
++                dtype=target_dtype,
++            )
++            return empty, empty
++
++        num_valid_blocks = int(valid_block_ids.numel())
++        k_quant = self.k_quant_cache[valid_block_ids].view(
++            num_valid_blocks, 1, *self.k_quant_cache.shape[1:]
++        )
++        k_scale = self.k_scale_cache[valid_block_ids].view(
++            num_valid_blocks, 1, *self.k_scale_cache.shape[1:]
++        )
++        k_mn = self.k_mn_cache[valid_block_ids].view(
++            num_valid_blocks, 1, *self.k_mn_cache.shape[1:]
++        )
++        v_quant = self.v_quant_cache[valid_block_ids].view(
++            num_valid_blocks, 1, *self.v_quant_cache.shape[1:]
++        )
++        v_scale = self.v_scale_cache[valid_block_ids].view(
++            num_valid_blocks, 1, *self.v_scale_cache.shape[1:]
++        )
++        v_mn = self.v_mn_cache[valid_block_ids].view(
++            num_valid_blocks, 1, *self.v_mn_cache.shape[1:]
++        )
++
++        k_blocks = self._dequant_kivi_key_blocks(k_quant, k_scale, k_mn, target_dtype)
++        v_blocks = self._dequant_kivi_value_blocks(v_quant, v_scale, v_mn, target_dtype)
++        k_blocks = self._normalize_kivi_block_layout(
++            k_blocks, num_valid_blocks, 1, cache_block_size, "key"
++        )
++        v_blocks = self._normalize_kivi_block_layout(
++            v_blocks, num_valid_blocks, 1, cache_block_size, "value"
++        )
++        k_blocks = k_blocks[:, 0]
++        v_blocks = v_blocks[:, 0]
++
++        valid_tokens_in_block = (
++            seq_lens_t[valid_req_idx] - valid_block_pos * cache_block_size
++        ).clamp(max=cache_block_size)
++        token_positions = torch.arange(
++            cache_block_size, dtype=torch.long, device=cache_device
++        )
++        valid_token_mask = (
++            token_positions.unsqueeze(0) < valid_tokens_in_block.unsqueeze(1)
++        )
++
++        dense_k = k_blocks[valid_token_mask]
++        dense_v = v_blocks[valid_token_mask]
++
++        dense_k_parts: list[torch.Tensor] = []
++        dense_v_parts: list[torch.Tensor] = []
++        kv_start = 0
++        for req_idx, seq_len in enumerate(seq_lens):
++            req_id = req_ids[req_idx]
++            req_len = int(seq_len)
++            req_k = dense_k[kv_start:kv_start + req_len]
++            req_v = dense_v[kv_start:kv_start + req_len]
++            kv_start += req_len
++
++            residual_key_slots = self.kivi_key_residual_slots_by_req.get(req_id, ())
++            residual_value_slots = self.kivi_value_residual_slots_by_req.get(
++                req_id, ()
++            )
++            if residual_key_slots or residual_value_slots:
++                req_slots = self.kivi_last_req_slots.get(req_id)
++                if req_slots is None:
++                    req_slots = self._get_kivi_ordered_slots(
++                        block_table[req_idx:req_idx + 1],
++                        [req_len],
++                    )[0]
++                pos_by_slot = {slot: pos for pos, slot in enumerate(req_slots)}
++                if residual_key_slots:
++                    req_k = self._overlay_kivi_residual_tensors(
++                        req_k,
++                        residual_key_slots,
++                        self.kivi_residual_key_cache,
++                        pos_by_slot,
++                        target_dtype,
++                    )
++                if residual_value_slots:
++                    req_v = self._overlay_kivi_residual_tensors(
++                        req_v,
++                        residual_value_slots,
++                        self.kivi_residual_value_cache,
++                        pos_by_slot,
++                        target_dtype,
++                    )
++
++            dense_k_parts.append(req_k)
++            dense_v_parts.append(req_v)
++
++        if not dense_k_parts:
++            empty = k_blocks.new_empty((0, self.num_kv_heads, self.head_size))
++            return empty, empty
++
++        return (
++            torch.cat(dense_k_parts, dim=0).contiguous(),
++            torch.cat(dense_v_parts, dim=0).contiguous(),
++        )
++
++    def _overlay_kivi_residual_tensors(
++        self,
++        dense: torch.Tensor,
++        residual_slots,
++        residual_cache: dict[int, torch.Tensor],
++        pos_by_slot: dict[int, int],
++        target_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        positions: list[int] = []
++        tensors: list[torch.Tensor] = []
++        dense_len = dense.shape[0]
++        for slot in residual_slots:
++            pos = pos_by_slot.get(slot)
++            tensor = residual_cache.get(slot)
++            if pos is None or tensor is None or pos >= dense_len:
++                continue
++            positions.append(pos)
++            tensors.append(tensor)
++
++        if not positions:
++            return dense
++
++        pos_tensor = torch.tensor(
++            positions,
++            dtype=torch.long,
++            device=dense.device,
++        )
++        value_tensor = torch.stack(
++            [tensor.to(device=dense.device, dtype=target_dtype) for tensor in tensors],
++            dim=0,
++        )
++        dense = dense.clone()
++        dense.index_copy_(0, pos_tensor, value_tensor)
++        return dense
++
++    def _forward_kivi_decode_fast(
++        self,
++        query: torch.Tensor,
++        req_ids: list[str],
++        block_table: torch.Tensor,
++        seq_lens: list[int],
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        batch_size = len(seq_lens)
++        self._kivi_decode_fast_count += 1
++        if self._kivi_step % 10 == 1:
++            logger.info(
++                "[KIVI] step=%d DecodeOnly→FIA_TND reqs=%d "
++                "(decode_fast=%d dense_attn=%d skip=%d)",
++                self._kivi_step,
++                batch_size,
++                self._kivi_decode_fast_count,
++                self._kivi_dense_attn_count,
++                self._kivi_skip_count,
++            )
++        dense_key, dense_value = self._gather_dequant_kivi_paged_cache_vectorized(
++            req_ids,
++            block_table,
++            seq_lens,
++            query.dtype,
++        )
++        actual_seq_lengths_q = list(range(1, batch_size + 1))
++        actual_seq_lengths_kv = torch.tensor(
++            seq_lens,
++            dtype=torch.int32,
++            device="cpu",
++        ).cumsum(dim=0).tolist()
++
++        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
++            query=query[:batch_size],
++            key=dense_key,
++            value=dense_value,
++            block_table=None,
++            input_layout="TND",
++            sparse_mode=0,
++            actual_seq_lengths=actual_seq_lengths_q,
++            actual_seq_lengths_kv=actual_seq_lengths_kv,
++            num_key_value_heads=self.num_kv_heads,
++            num_heads=self.num_heads,
++            scale=self.scale,
++        )
++        output[:batch_size] = attn_output.view(
++            batch_size, self.num_heads, self.head_size
++        )
++        return output
++
++    def _forward_kivi_prefill_fia(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        num_tokens = int(attn_metadata.actual_seq_lengths_q[-1])
++        self._kivi_skip_count += 1
++        if self._kivi_step % 10 == 1:
++            logger.info(
++                "[KIVI] step=%d PrefillNoCache→FIA_TND tokens=%d "
++                "(decode_fast=%d dense_attn=%d skip=%d)",
++                self._kivi_step,
++                num_tokens,
++                self._kivi_decode_fast_count,
++                self._kivi_dense_attn_count,
++                self._kivi_skip_count,
++            )
++
++        query = query[:num_tokens]
++        key = key[:num_tokens]
++        value = value[:num_tokens]
++        sparse_mode = 3 if attn_metadata.causal else 0
++
++        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
++            query=query,
++            key=key,
++            value=value,
++            atten_mask=attn_metadata.attn_mask if attn_metadata.causal else None,
++            block_table=None,
++            input_layout="TND",
++            block_size=128,
++            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
++            actual_seq_lengths_kv=attn_metadata.actual_seq_lengths_q,
++            num_key_value_heads=self.num_kv_heads,
++            num_heads=self.num_heads,
++            scale=self.scale,
++            sparse_mode=sparse_mode,
++        )
++        output[:num_tokens] = attn_output.view(
++            num_tokens, self.num_heads, self.head_size
++        )
++        return output
++
++    def _forward_kivi_chunked_prefill(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor | None,
++        value: torch.Tensor | None,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        num_decode = attn_metadata.num_decode_tokens
++        num_decodes = attn_metadata.num_decodes
++        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
++        num_tokens = int(actual_seq_qlen[-1])
++        block_size = self.k_quant_cache.shape[-1] * 8
++
++        if self._kivi_step % 10 == 1:
++            logger.info(
++                "[KIVI] step=%d ChunkedPrefill→FIA split "
++                "(decode_tokens=%d prefills=%d decodes=%d)",
++                self._kivi_step,
++                num_decode,
++                attn_metadata.num_prefills,
++                num_decodes,
++            )
++
++        if num_decode > 0:
++            self._forward_kivi_decode_fast(
++                query[:num_decode],
++                attn_metadata.req_ids[:num_decodes],
++                attn_metadata.block_tables[:num_decodes],
++                attn_metadata.seq_lens_list[:num_decodes],
++                output,
++            )
++
++        if attn_metadata.num_prefills <= 0:
++            return output
++
++        prefill_q = query[num_decode:num_tokens]
++        prefill_seq_qlen = [
++            actual_seq_qlen[i] - num_decode
++            for i in range(num_decodes, len(actual_seq_qlen))
++        ]
++        prefill_req_ids = attn_metadata.req_ids[num_decodes:]
++        prefill_seq_lens = attn_metadata.seq_lens_list[num_decodes:]
++
++        all_new_prefill = True
++        for i in range(num_decodes, len(attn_metadata.seq_lens_list)):
++            q_start = actual_seq_qlen[i - 1] if i > 0 else 0
++            qlen_i = actual_seq_qlen[i] - q_start
++            if attn_metadata.seq_lens_list[i] > qlen_i:
++                all_new_prefill = False
++                break
++
++        if all_new_prefill and key is not None and value is not None:
++            prefill_k = key[num_decode:num_tokens]
++            prefill_v = value[num_decode:num_tokens]
++            prefill_seq_kvlen = prefill_seq_qlen
++        else:
++            prefill_k, prefill_v = self._gather_dequant_kivi_paged_cache_vectorized(
++                prefill_req_ids,
++                attn_metadata.block_tables[num_decodes:],
++                prefill_seq_lens,
++                query.dtype,
++            )
++            prefill_seq_kvlen = torch.tensor(
++                prefill_seq_lens,
++                dtype=torch.int32,
++                device="cpu",
++            ).cumsum(dim=0).tolist()
++
++        sparse_mode = 3 if attn_metadata.causal else 0
++        attn_out, _ = torch_npu.npu_fused_infer_attention_score(
++            query=prefill_q,
++            key=prefill_k,
++            value=prefill_v,
++            atten_mask=attn_metadata.attn_mask if attn_metadata.causal else None,
++            block_table=None,
++            input_layout="TND",
++            sparse_mode=sparse_mode,
++            block_size=block_size,
++            actual_seq_lengths=prefill_seq_qlen,
++            actual_seq_lengths_kv=prefill_seq_kvlen,
++            num_key_value_heads=self.num_kv_heads,
++            num_heads=self.num_heads,
++            scale=self.scale,
++        )
++        n_prefill = num_tokens - num_decode
++        output[num_decode:num_tokens] = attn_out.view(
++            n_prefill, self.num_heads, self.head_size
++        )[:n_prefill]
++        return output
+     
+     def _forward_kivi_dense_attention(
+         self,
+@@ -2018,6 +2417,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         causal: bool,
+         output: torch.Tensor,
+     ) -> torch.Tensor:
++        self._kivi_dense_attn_count += 1
+         prev_q_end = 0
+         kv_start = 0
+         outputs = []
+diff --git a/vllm_ascend/ops/rotary_embedding.py b/vllm_ascend/ops/rotary_embedding.py
+index 1aa97ca25..ba9debabc 100644
+--- a/vllm_ascend/ops/rotary_embedding.py
++++ b/vllm_ascend/ops/rotary_embedding.py
+@@ -295,6 +295,15 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
+         super().__init__(
+             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, scaling_factor, dtype, **extra_kwargs
+         )
++        # AscendRotaryEmbedding.__init__ is skipped by the MRO (YaRN chain goes
++        # directly to RotaryEmbedding), but forward_oot delegates to
++        # AscendRotaryEmbedding.forward_oot() which needs these two fields.
++        vllm_config = get_current_vllm_config()
++        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
++        self.force_native_qwen2_rope = (
++            "Qwen2ForCausalLM" in getattr(vllm_config.model_config, "architectures", [])
++            and os.environ.get("VLLM_ASCEND_USE_NATIVE_QWEN2_ROPE", "0") != "0"
++        )
+         _record_cos_sin_cache(self.cos_sin_cache)
+ 
+     def forward_oot(
+-- 
+2.53.0.windows.3
+

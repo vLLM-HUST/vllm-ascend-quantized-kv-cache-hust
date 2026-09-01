@@ -1,0 +1,690 @@
+From ea176831e8764a61418eae4c00383139f1452c47 Mon Sep 17 00:00:00 2001
+From: SuccinctPaul <paul@hust.edu.cn>
+Date: Mon, 10 Aug 2026 08:38:28 +0000
+Subject: [PATCH] fix(kv-cache): sync int8/kivi_int4, add cache sizing, fix
+ __post_init__ chain
+
+Address reviewer feedback on PR #181:
+- Sync int8/kivi_int4 into is_quantized_kv_cache and get_kv_quant_mode
+- Integrate INT4/FP4_E2M1 packed cache sizing in AttentionSpec,
+  FullAttentionSpec, MLAAttentionSpec, and SlidingWindowSpec
+- Add backend capability fail-closed validation for head_size constraints
+- Fix __post_init__ chain: FullAttentionSpec, SlidingWindowSpec, and
+  SlidingWindowMLASpec now call super().__post_init__() so validation runs
+- Fix KiVi double-count: AttentionSpec.real_page_size_bytes used 2x
+  multiplier on asymmetric K (int4) + V (int8) head_dim
+- Add test coverage for KiVi cache sizing and FullAttentionSpec fail-closed
+
+Co-authored-by: Claude
+Signed-off-by: SuccinctPaul <paul@hust.edu.cn>
+---
+ tests/test_kv_cache_dtype_ext.py | 337 ++++++++++++++++++++++++++++++-
+ vllm/utils/torch_utils.py        |   3 +-
+ vllm/v1/kv_cache_interface.py    | 139 +++++++++++--
+ 3 files changed, 455 insertions(+), 24 deletions(-)
+
+diff --git a/tests/test_kv_cache_dtype_ext.py b/tests/test_kv_cache_dtype_ext.py
+index b9fc21f53..f231631a4 100644
+--- a/tests/test_kv_cache_dtype_ext.py
++++ b/tests/test_kv_cache_dtype_ext.py
+@@ -20,14 +20,12 @@ from vllm.utils.torch_utils import (
+ )
+ from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
+ 
+-
+ # ---------------------------------------------------------------------------
+ # CacheDType
+ # ---------------------------------------------------------------------------
+ 
+ 
+ class TestCacheDTypeIncludesNewTypes:
+-
+     def test_includes_int4(self):
+         """Verify that CacheDType includes 'int4'."""
+         assert "int4" in typing.get_args(CacheDType)
+@@ -43,7 +41,6 @@ class TestCacheDTypeIncludesNewTypes:
+ 
+ 
+ class TestStrDtypeToTorchDtype:
+-
+     def test_int4_maps_to_uint8(self):
+         assert STR_DTYPE_TO_TORCH_DTYPE["int4"] == torch.uint8
+ 
+@@ -57,7 +54,6 @@ class TestStrDtypeToTorchDtype:
+ 
+ 
+ class TestIsQuantizedKvCache:
+-
+     @pytest.mark.parametrize(
+         "dtype",
+         [
+@@ -88,7 +84,6 @@ class TestIsQuantizedKvCache:
+ 
+ 
+ class TestKVQuantMode:
+-
+     def test_int4_exists(self):
+         assert hasattr(KVQuantMode, "INT4")
+         assert isinstance(KVQuantMode.INT4, KVQuantMode)
+@@ -110,7 +105,6 @@ class TestKVQuantMode:
+ 
+ 
+ class TestGetKvQuantMode:
+-
+     def test_int4_returns_int4_mode(self):
+         assert get_kv_quant_mode("int4") is KVQuantMode.INT4
+ 
+@@ -136,7 +130,6 @@ class TestGetKvQuantMode:
+ 
+ 
+ class TestInt4KvCacheFullDim:
+-
+     def test_head_size_128(self):
+         """INT4 packs 2 values per byte, so 128 elements -> 64 bytes."""
+         assert int4_kv_cache_full_dim(128) == 64
+@@ -149,7 +142,6 @@ class TestInt4KvCacheFullDim:
+ 
+ 
+ class TestFp4E2m1KvCacheFullDim:
+-
+     def test_head_size_128(self):
+         """FP4 data + fp8 block scales (1 per 16 elements).
+ 
+@@ -169,4 +161,331 @@ class TestFp4E2m1KvCacheFullDim:
+         assert fp4_e2m1_kv_cache_full_dim(64) == 36
+ 
+     def test_head_size_256(self):
+-        assert fp4_e2m1_kv_cache_full_dim(256) == 144
+\ No newline at end of file
++        assert fp4_e2m1_kv_cache_full_dim(256) == 144
++
++
++# ---------------------------------------------------------------------------
++# int8 / kivi_int4 consistency (reviewer point: config face internal
++# consistency)
++# ---------------------------------------------------------------------------
++
++
++class TestInt8KiviInt4Consistency:
++    def test_int8_is_quantized(self):
++        assert is_quantized_kv_cache("int8") is True
++
++    def test_kivi_int4_is_quantized(self):
++        assert is_quantized_kv_cache("kivi_int4") is True
++
++    def test_int8_str_dtype_mapping(self):
++        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++
++        assert STR_DTYPE_TO_TORCH_DTYPE["int8"] == torch.int8
++
++    def test_kivi_int4_str_dtype_mapping(self):
++        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++
++        assert STR_DTYPE_TO_TORCH_DTYPE["kivi_int4"] == torch.uint8
++
++    def test_int8_get_kv_quant_mode(self):
++        assert get_kv_quant_mode("int8") is KVQuantMode.INT8_PER_TENSOR
++
++    def test_kivi_int4_get_kv_quant_mode(self):
++        assert get_kv_quant_mode("kivi_int4") is KVQuantMode.KIVI_INT4
++
++    def test_int8_in_cache_dtype(self):
++        assert "int8" in typing.get_args(CacheDType)
++
++    def test_kivi_int4_in_cache_dtype(self):
++        assert "kivi_int4" in typing.get_args(CacheDType)
++
++
++# ---------------------------------------------------------------------------
++# KVQuantMode new properties
++# ---------------------------------------------------------------------------
++
++
++class TestKVQuantModeProperties:
++    def test_is_int4(self):
++        assert KVQuantMode.INT4.is_int4 is True
++        assert KVQuantMode.NONE.is_int4 is False
++
++    def test_is_fp4_e2m1(self):
++        assert KVQuantMode.FP4_E2M1.is_fp4_e2m1 is True
++        assert KVQuantMode.NONE.is_fp4_e2m1 is False
++
++    def test_is_int8_per_tensor(self):
++        assert KVQuantMode.INT8_PER_TENSOR.is_int8_per_tensor is True
++        assert KVQuantMode.NONE.is_int8_per_tensor is False
++
++    def test_is_kivi_int4(self):
++        assert KVQuantMode.KIVI_INT4.is_kivi_int4 is True
++        assert KVQuantMode.NONE.is_kivi_int4 is False
++
++    def test_is_packed_4bit(self):
++        assert KVQuantMode.INT4.is_packed_4bit is True
++        assert KVQuantMode.FP4_E2M1.is_packed_4bit is True
++        assert KVQuantMode.NVFP4.is_packed_4bit is True
++        assert KVQuantMode.NONE.is_packed_4bit is False
++
++    def test_int8_per_tensor_value(self):
++        assert KVQuantMode.INT8_PER_TENSOR.value == 8
++
++    def test_kivi_int4_value(self):
++        assert KVQuantMode.KIVI_INT4.value == 9
++
++
++# ---------------------------------------------------------------------------
++# Cache sizing: real_page_size_bytes for INT4 / FP4_E2M1
++# ---------------------------------------------------------------------------
++
++
++class TestAttentionSpecCacheSizing:
++    """Verify that INT4 and FP4_E2M1 produce correct packed page sizes."""
++
++    @pytest.fixture
++    def base_kwargs(self):
++        return dict(
++            block_size=16,
++            num_kv_heads=8,
++            head_size=128,
++            dtype=torch.uint8,
++        )
++
++    def test_int4_page_size_smaller_than_none(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec_none = AttentionSpec(kv_quant_mode=KVQuantMode.NONE, **base_kwargs)
++        spec_int4 = AttentionSpec(kv_quant_mode=KVQuantMode.INT4, **base_kwargs)
++        assert spec_int4.real_page_size_bytes < spec_none.real_page_size_bytes
++
++    def test_fp4_e2m1_page_size_smaller_than_none(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec_none = AttentionSpec(kv_quant_mode=KVQuantMode.NONE, **base_kwargs)
++        spec_fp4 = AttentionSpec(kv_quant_mode=KVQuantMode.FP4_E2M1, **base_kwargs)
++        assert spec_fp4.real_page_size_bytes < spec_none.real_page_size_bytes
++
++    def test_int4_page_size_exact(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec = AttentionSpec(kv_quant_mode=KVQuantMode.INT4, **base_kwargs)
++        # head_size=128, int4 packs 2/byte -> packed dim = 64
++        # page = 2 * block_size * num_kv_heads * 64 * 1
++        expected = 2 * 16 * 8 * 64 * 1
++        assert spec.real_page_size_bytes == expected
++
++    def test_fp4_e2m1_page_size_exact(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec = AttentionSpec(kv_quant_mode=KVQuantMode.FP4_E2M1, **base_kwargs)
++        # head_size=128, fp4_e2m1 dim = 128//2 + 128//16 = 64+8 = 72
++        # page = 2 * block_size * num_kv_heads * 72 * 1
++        expected = 2 * 16 * 8 * 72 * 1
++        assert spec.real_page_size_bytes == expected
++
++
++class TestFullAttentionSpecCacheSizing:
++    @pytest.fixture
++    def base_kwargs(self):
++        return dict(
++            block_size=16,
++            num_kv_heads=8,
++            head_size=128,
++            head_size_v=128,
++            dtype=torch.uint8,
++        )
++
++    def test_int4_full_attn_page_size(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        spec = FullAttentionSpec(kv_quant_mode=KVQuantMode.INT4, **base_kwargs)
++        # K: int4(128//2=64) + V: int4(128//2=64) = 128
++        expected = 16 * 8 * 128 * 1
++        assert spec.real_page_size_bytes == expected
++
++    def test_fp4_e2m1_full_attn_page_size(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        spec = FullAttentionSpec(kv_quant_mode=KVQuantMode.FP4_E2M1, **base_kwargs)
++        # K: fp4_e2m1(128)=72 + V: fp4_e2m1(128)=72 = 144
++        expected = 16 * 8 * 144 * 1
++        assert spec.real_page_size_bytes == expected
++
++
++# ---------------------------------------------------------------------------
++# Backend capability fail-closed
++# ---------------------------------------------------------------------------
++
++
++class TestBackendCapabilityFailClosed:
++    def test_int4_odd_head_size_raises(self):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        with pytest.raises(ValueError, match="even head_size"):
++            AttentionSpec(
++                block_size=16,
++                num_kv_heads=8,
++                head_size=127,
++                dtype=torch.uint8,
++                kv_quant_mode=KVQuantMode.INT4,
++            )
++
++    def test_fp4_e2m1_non_div16_head_size_raises(self):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        with pytest.raises(ValueError, match="divisible by 16"):
++            AttentionSpec(
++                block_size=16,
++                num_kv_heads=8,
++                head_size=100,
++                dtype=torch.uint8,
++                kv_quant_mode=KVQuantMode.FP4_E2M1,
++            )
++
++    def test_kivi_int4_odd_head_size_raises(self):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        with pytest.raises(ValueError, match="even head_size"):
++            AttentionSpec(
++                block_size=16,
++                num_kv_heads=8,
++                head_size=127,
++                dtype=torch.uint8,
++                kv_quant_mode=KVQuantMode.KIVI_INT4,
++            )
++
++    def test_none_mode_does_not_raise(self):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec = AttentionSpec(
++            block_size=16,
++            num_kv_heads=8,
++            head_size=127,
++            dtype=torch.uint8,
++            kv_quant_mode=KVQuantMode.NONE,
++        )
++        assert spec.real_page_size_bytes > 0
++
++
++# ---------------------------------------------------------------------------
++# KiVi INT4 cache sizing (asymmetric K/V — no 2x double-count)
++# ---------------------------------------------------------------------------
++
++
++class TestAttentionSpecKiViCacheSizing:
++    """Verify KiVi produces correct page sizes without the 2x double-count bug."""
++
++    @pytest.fixture
++    def base_kwargs(self):
++        return dict(
++            block_size=16,
++            num_kv_heads=8,
++            head_size=128,
++            dtype=torch.uint8,
++        )
++
++    def test_kivi_int4_page_size_exact(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec = AttentionSpec(kv_quant_mode=KVQuantMode.KIVI_INT4, **base_kwargs)
++        # K: int4 (128//2=64) + V: int8 (128) = 192 per head, no 2x multiplier
++        expected = 16 * 8 * (64 + 128) * 1
++        assert spec.real_page_size_bytes == expected
++
++    def test_kivi_int4_no_double_count(self, base_kwargs):
++        """KiVi has asymmetric K/V; the 2x K+V multiplier must not apply."""
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec = AttentionSpec(kv_quant_mode=KVQuantMode.KIVI_INT4, **base_kwargs)
++        # Correct: 16 * 8 * 192 = 24576
++        # Buggy (2x): 2 * 16 * 8 * 192 = 49152
++        assert spec.real_page_size_bytes == 24576
++
++    def test_kivi_int4_smaller_than_none(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import AttentionSpec
++
++        spec_none = AttentionSpec(kv_quant_mode=KVQuantMode.NONE, **base_kwargs)
++        spec_kivi = AttentionSpec(kv_quant_mode=KVQuantMode.KIVI_INT4, **base_kwargs)
++        assert spec_kivi.real_page_size_bytes < spec_none.real_page_size_bytes
++
++
++class TestFullAttentionSpecKiViCacheSizing:
++    @pytest.fixture
++    def base_kwargs(self):
++        return dict(
++            block_size=16,
++            num_kv_heads=8,
++            head_size=128,
++            head_size_v=128,
++            dtype=torch.uint8,
++        )
++
++    def test_kivi_int4_full_attn_page_size(self, base_kwargs):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        spec = FullAttentionSpec(kv_quant_mode=KVQuantMode.KIVI_INT4, **base_kwargs)
++        # K: int4(64) + V: int8(128) = 192
++        expected = 16 * 8 * 192 * 1
++        assert spec.real_page_size_bytes == expected
++
++
++# ---------------------------------------------------------------------------
++# FullAttentionSpec fail-closed (verifies __post_init__ chain is not broken)
++# ---------------------------------------------------------------------------
++
++
++class TestFullAttentionSpecFailClosed:
++    """Verify FullAttentionSpec inherits fail-closed validation via super()."""
++
++    def test_int4_odd_head_size_raises(self):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        with pytest.raises(ValueError, match="even head_size"):
++            FullAttentionSpec(
++                block_size=16,
++                num_kv_heads=8,
++                head_size=127,
++                head_size_v=127,
++                dtype=torch.uint8,
++                kv_quant_mode=KVQuantMode.INT4,
++            )
++
++    def test_fp4_e2m1_non_div16_head_size_raises(self):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        with pytest.raises(ValueError, match="divisible by 16"):
++            FullAttentionSpec(
++                block_size=16,
++                num_kv_heads=8,
++                head_size=100,
++                head_size_v=100,
++                dtype=torch.uint8,
++                kv_quant_mode=KVQuantMode.FP4_E2M1,
++            )
++
++    def test_kivi_int4_odd_head_size_raises(self):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        with pytest.raises(ValueError, match="even head_size"):
++            FullAttentionSpec(
++                block_size=16,
++                num_kv_heads=8,
++                head_size=127,
++                head_size_v=127,
++                dtype=torch.uint8,
++                kv_quant_mode=KVQuantMode.KIVI_INT4,
++            )
++
++    def test_none_mode_does_not_raise(self):
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++        spec = FullAttentionSpec(
++            block_size=16,
++            num_kv_heads=8,
++            head_size=127,
++            head_size_v=127,
++            dtype=torch.uint8,
++            kv_quant_mode=KVQuantMode.NONE,
++        )
++        assert spec.real_page_size_bytes > 0
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index dd39beae7..10aa3577e 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -51,6 +51,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
+     "int4": torch.uint8,
+     "nvfp4": torch.uint8,
+     "fp4_e2m1": torch.uint8,
++    "kivi_int4": torch.uint8,
+ }
+ 
+ TORCH_DTYPE_TO_NUMPY_DTYPE = {
+@@ -78,7 +79,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+     return (
+         kv_cache_dtype.startswith("fp8")
+         or kv_cache_dtype.endswith("per_token_head")
+-        or kv_cache_dtype in ("nvfp4", "int4", "fp4_e2m1")
++        or kv_cache_dtype in ("nvfp4", "int4", "fp4_e2m1", "int8", "kivi_int4")
+     )
+ 
+ 
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 4d2b2b93c..5253141d7 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -15,7 +15,12 @@ from typing_extensions import Self
+ 
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv, round_up
+-from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
++from vllm.utils.torch_utils import (
++    fp4_e2m1_kv_cache_full_dim,
++    get_dtype_size,
++    int4_kv_cache_full_dim,
++    nvfp4_kv_cache_full_dim,
++)
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ 
+@@ -45,6 +50,8 @@ class KVQuantMode(IntEnum):
+     NVFP4 = 5  # packed fp4 data + fp8 block scales
+     INT4 = 6  # 4-bit integer quantization, per-token-head dynamic scale
+     FP4_E2M1 = 7  # FP4 E2M1 microscaling format
++    INT8_PER_TENSOR = 8  # per-tensor int8 quantization
++    KIVI_INT4 = 9  # KiVi: int4 K cache + int8 V cache
+ 
+     @property
+     def is_per_token_head(self) -> bool:
+@@ -60,6 +67,31 @@ class KVQuantMode(IntEnum):
+         """True for NVFP4 packed quantization mode."""
+         return self == KVQuantMode.NVFP4
+ 
++    @property
++    def is_int4(self) -> bool:
++        """True for INT4 packed quantization mode."""
++        return self == KVQuantMode.INT4
++
++    @property
++    def is_fp4_e2m1(self) -> bool:
++        """True for FP4 E2M1 microscaling quantization mode."""
++        return self == KVQuantMode.FP4_E2M1
++
++    @property
++    def is_packed_4bit(self) -> bool:
++        """True for any packed 4-bit quantization mode (INT4, FP4_E2M1, NVFP4)."""
++        return self in (KVQuantMode.INT4, KVQuantMode.FP4_E2M1, KVQuantMode.NVFP4)
++
++    @property
++    def is_int8_per_tensor(self) -> bool:
++        """True for per-tensor INT8 quantization mode."""
++        return self == KVQuantMode.INT8_PER_TENSOR
++
++    @property
++    def is_kivi_int4(self) -> bool:
++        """True for KiVi mixed-precision (int4 K + int8 V) mode."""
++        return self == KVQuantMode.KIVI_INT4
++
+ 
+ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
+     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
+@@ -75,6 +107,10 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
+         return KVQuantMode.NVFP4
+     if kv_cache_dtype == "fp4_e2m1":
+         return KVQuantMode.FP4_E2M1
++    if kv_cache_dtype == "int8":
++        return KVQuantMode.INT8_PER_TENSOR
++    if kv_cache_dtype == "kivi_int4":
++        return KVQuantMode.KIVI_INT4
+     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+         return KVQuantMode.FP8_PER_TENSOR
+     return KVQuantMode.NONE
+@@ -175,6 +211,40 @@ class AttentionSpec(KVCacheSpec):
+     page_size_padded: int | None = None
+     indexes_kv_by_block_stride: bool = False
+ 
++    def __post_init__(self):
++        # Fail-closed: validate head_size constraints for packed quant modes.
++        if self.kv_quant_mode.is_int4:
++            if self.head_size % 2 != 0:
++                raise ValueError(
++                    f"INT4 KV cache requires even head_size, got {self.head_size}."
++                )
++            logger.warning(
++                "INT4 KV cache quantization requires the vllm-ascend-hust "
++                "attention backend; correctness is not guaranteed on other "
++                "backends."
++            )
++        if self.kv_quant_mode.is_fp4_e2m1:
++            if self.head_size % 16 != 0:
++                raise ValueError(
++                    f"FP4_E2M1 KV cache requires head_size divisible by 16, "
++                    f"got {self.head_size}."
++                )
++            logger.warning(
++                "FP4_E2M1 KV cache quantization requires the vllm-ascend-hust "
++                "attention backend; correctness is not guaranteed on other "
++                "backends."
++            )
++        if self.kv_quant_mode.is_kivi_int4:
++            if self.head_size % 2 != 0:
++                raise ValueError(
++                    f"KiVi INT4 KV cache requires even head_size, got {self.head_size}."
++                )
++            logger.warning(
++                "KiVi INT4 KV cache quantization requires the vllm-ascend-hust "
++                "attention backend; correctness is not guaranteed on other "
++                "backends."
++            )
++
+     @property
+     def page_size_bytes(self) -> int:
+         real_page_size = self.real_page_size_bytes
+@@ -195,9 +265,25 @@ class AttentionSpec(KVCacheSpec):
+         if self.kv_quant_mode.is_nvfp4:
+             # Packed layout: fp4 data + fp8 block scales per head.
+             head_dim = nvfp4_kv_cache_full_dim(self.head_size)
++        elif self.kv_quant_mode.is_int4:
++            # INT4: 2 values per byte.
++            head_dim = int4_kv_cache_full_dim(self.head_size)
++        elif self.kv_quant_mode.is_fp4_e2m1:
++            # FP4 E2M1: packed fp4 data + fp8 block scales.
++            head_dim = fp4_e2m1_kv_cache_full_dim(self.head_size)
+         elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+             head_dim = self.head_size // 2
++        elif self.kv_quant_mode.is_kivi_int4:
++            # KiVi: K is int4 (head_size//2), V is int8 (head_size).
++            # Asymmetric K/V, so the 2x K+V multiplier does not apply.
++            return (
++                self.block_size
++                * self.num_kv_heads
++                * (self.head_size // 2 + self.head_size)
++                * get_dtype_size(self.dtype)
++            )
+         else:
++            # INT8_PER_TENSOR and NONE: 1 byte per element.
+             head_dim = self.head_size
+         return (
+             2
+@@ -237,6 +323,7 @@ class FullAttentionSpec(AttentionSpec):
+     """
+ 
+     def __post_init__(self):
++        super().__post_init__()
+         if self.head_size_v is None:
+             object.__setattr__(self, "head_size_v", self.head_size)
+ 
+@@ -316,13 +403,22 @@ class FullAttentionSpec(AttentionSpec):
+     def real_page_size_bytes(self) -> int:
+         if self.kv_quant_mode.is_nvfp4:
+             # Packed layout per head: fp4 data + fp8 block scales.
+-            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
+-            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
+             last_dim = nvfp4_kv_cache_full_dim(
+                 self.head_size
+             ) + nvfp4_kv_cache_full_dim(self.head_size_v)
++        elif self.kv_quant_mode.is_int4:
++            last_dim = int4_kv_cache_full_dim(self.head_size) + int4_kv_cache_full_dim(
++                self.head_size_v
++            )
++        elif self.kv_quant_mode.is_fp4_e2m1:
++            last_dim = fp4_e2m1_kv_cache_full_dim(
++                self.head_size
++            ) + fp4_e2m1_kv_cache_full_dim(self.head_size_v)
+         elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+             last_dim = self.head_size // 2 + self.head_size_v // 2
++        elif self.kv_quant_mode.is_kivi_int4:
++            # KiVi: K is int4, V is int8.
++            last_dim = self.head_size // 2 + self.head_size_v
+         else:
+             last_dim = self.head_size + self.head_size_v
+         return (
+@@ -392,8 +488,16 @@ class MLAAttentionSpec(FullAttentionSpec):
+             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
+             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
+             return self.block_size * 656
+-        if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
++        if self.kv_quant_mode.is_nvfp4:
++            head_dim = nvfp4_kv_cache_full_dim(self.head_size)
++        elif self.kv_quant_mode.is_int4:
++            head_dim = int4_kv_cache_full_dim(self.head_size)
++        elif self.kv_quant_mode.is_fp4_e2m1:
++            head_dim = fp4_e2m1_kv_cache_full_dim(self.head_size)
++        elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+             head_dim = self.head_size // 2
++        elif self.kv_quant_mode.is_kivi_int4:
++            head_dim = self.head_size // 2 + self.head_size
+         else:
+             head_dim = self.head_size
+         return (
+@@ -526,27 +630,33 @@ class SlidingWindowSpec(AttentionSpec):
+     head_size_v: int = None  # type: ignore[assignment]
+ 
+     def __post_init__(self):
++        super().__post_init__()
+         if self.head_size_v is None:
+             object.__setattr__(self, "head_size_v", self.head_size)
+ 
+     @property
+     def real_page_size_bytes(self) -> int:
+-        # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
++        # Mirror ``FullAttentionSpec.real_page_size_bytes`` for packed KV cache.
+         if self.kv_quant_mode.is_nvfp4:
+             last_dim = nvfp4_kv_cache_full_dim(
+                 self.head_size
+             ) + nvfp4_kv_cache_full_dim(self.head_size_v)
+-            return (
+-                self.block_size
+-                * self.num_kv_heads
+-                * last_dim
+-                * get_dtype_size(self.dtype)
++        elif self.kv_quant_mode.is_int4:
++            last_dim = int4_kv_cache_full_dim(self.head_size) + int4_kv_cache_full_dim(
++                self.head_size_v
+             )
++        elif self.kv_quant_mode.is_fp4_e2m1:
++            last_dim = fp4_e2m1_kv_cache_full_dim(
++                self.head_size
++            ) + fp4_e2m1_kv_cache_full_dim(self.head_size_v)
++        elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
++            last_dim = self.head_size // 2 + self.head_size_v // 2
++        elif self.kv_quant_mode.is_kivi_int4:
++            last_dim = self.head_size // 2 + self.head_size_v
++        else:
++            last_dim = self.head_size + self.head_size_v
+         return (
+-            self.block_size
+-            * self.num_kv_heads
+-            * (self.head_size + self.head_size_v)
+-            * get_dtype_size(self.dtype)
++            self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
+         )
+ 
+     def max_admission_blocks_per_request(
+@@ -603,6 +713,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
+     model_version: str | None = None
+ 
+     def __post_init__(self):
++        super().__post_init__()
+         _apply_alignment_padding(self)
+ 
+     @property
+-- 
+2.53.0.windows.3
+

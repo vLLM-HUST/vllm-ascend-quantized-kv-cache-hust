@@ -1,0 +1,253 @@
+From f456b62c999f604386f087acc4fd5d070ac5661c Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Tue, 21 Jul 2026 04:01:20 +0000
+Subject: [PATCH] Update kivi int4 trition ascend integration
+
+---
+ .../attention/context_parallel/common_cp.py   |  3 +-
+ vllm_ascend/ops/__init__.py                   |  9 ++-
+ vllm_ascend/ops/fused_moe/moe_runtime_args.py |  2 +-
+ vllm_ascend/patch/platform/__init__.py        |  3 +-
+ vllm_ascend/platform.py                       | 62 +++++++++----------
+ 5 files changed, 39 insertions(+), 40 deletions(-)
+
+diff --git a/vllm_ascend/attention/context_parallel/common_cp.py b/vllm_ascend/attention/context_parallel/common_cp.py
+index 2f909e48a8..63086ab079 100644
+--- a/vllm_ascend/attention/context_parallel/common_cp.py
++++ b/vllm_ascend/attention/context_parallel/common_cp.py
+@@ -3,9 +3,8 @@ from dataclasses import dataclass
+ import torch
+ import torch.distributed as dist
+ import torch_npu
+-from vllm.distributed import get_dcp_group, get_pcp_group
+-
+ from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
++from vllm.distributed import get_dcp_group, get_pcp_group
+ 
+ 
+ @dataclass
+diff --git a/vllm_ascend/ops/__init__.py b/vllm_ascend/ops/__init__.py
+index b03dad27e2..50b5a49a8d 100644
+--- a/vllm_ascend/ops/__init__.py
++++ b/vllm_ascend/ops/__init__.py
+@@ -26,8 +26,13 @@ _device_op_initializing = _device_op_module is not None and not hasattr(_device_
+ if not _device_op_initializing:
+     try:
+         import vllm_ascend.ops.fused_moe.fused_moe  # noqa
+-    except ModuleNotFoundError as exc:
+-        if exc.name != "vllm.model_executor.layers.fused_moe.runner.default_moe_runner":
++    except (ImportError, ModuleNotFoundError) as exc:
++        message = str(exc)
++        compatible_missing = (
++            getattr(exc, "name", None) == "vllm.model_executor.layers.fused_moe.runner.default_moe_runner"
++            or "UnquantizedFusedMoEMethod" in message
++        )
++        if not compatible_missing:
+             raise
+     import vllm_ascend.ops.layernorm  # noqa
+     import vllm_ascend.ops.register_custom_ops  # noqa
+diff --git a/vllm_ascend/ops/fused_moe/moe_runtime_args.py b/vllm_ascend/ops/fused_moe/moe_runtime_args.py
+index 55ac8fcd8a..9ca9ff130d 100644
+--- a/vllm_ascend/ops/fused_moe/moe_runtime_args.py
++++ b/vllm_ascend/ops/fused_moe/moe_runtime_args.py
+@@ -59,7 +59,7 @@ from __future__ import annotations
+ 
+ import torch
+ 
+-import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
++from . import moe_stage_params as _stage_params
+ from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
+     MoEAllGatherCombineMetadata,
+     MoEAllToAllCombineMetadata,
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index 82b7fcd661..d0db13574a 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -29,15 +29,16 @@ else:
+     import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa
+ import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
+ import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
++
+ import vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa
+ import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
+ import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
+ import vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa
+ import vllm_ascend.patch.platform.patch_weight_transfer_engine  # noqa
+ import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
+-import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
+ import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
+ 
++
+ if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
+     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
+ 
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 3bffdcfccf..407f3477fc 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -35,23 +35,17 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+ from vllm_ascend.ascend_config import init_ascend_config
+ 
+-# isort: off
+-from vllm_ascend.utils import (
+-    ASCEND_QUANTIZATION_METHOD,
+-    COMPILATION_PASS_KEY,
+-    COMPRESSED_TENSORS_METHOD,
+-    FP8_METHOD,
+-    AscendDeviceType,
+-    bootstrap_custom_op_env,
+-    check_kv_extra_config,
+-    flashcomm2_enable,
+-    get_ascend_device_type,
+-    is_moe_model,
+-    refresh_block_size,
+-    update_cudagraph_capture_sizes,
+-    is_310p,
+-    enable_sp,
+-)
++COMPILATION_PASS_KEY = "graph_fusion_manager"
++ASCEND_QUANTIZATION_METHOD = "ascend"
++COMPRESSED_TENSORS_METHOD = "compressed-tensors"
++FP8_METHOD = "fp8"
++
++
++def _utils():
++    """Import utils lazily to avoid platform/plugin circular imports."""
++    from vllm_ascend import utils
++
++    return utils
+ 
+ # Since vllm-project/vllm#43746, DeepSeek V4 model classes no longer
+ # carry @support_torch_compile. This makes vLLM auto-enable the breakable
+@@ -160,7 +154,7 @@ def prune_capture_sizes_for_950(vllm_config):
+     indices = [round(i * step) for i in range(MAX_CAPTURE_SIZES_FOR_950)]
+     indices[0], indices[-1] = 0, len(original_sizes) - 1
+     sampled_sizes = [original_sizes[i] for i in indices]
+-    update_cudagraph_capture_sizes(vllm_config, sampled_sizes)
++    _utils().update_cudagraph_capture_sizes(vllm_config, sampled_sizes)
+     logger.warning(
+         "Adjusted ACL graph batch sizes for model: %d → %d sizes due to HDK incompatibility"
+         "and this warning will be cleared soon.",
+@@ -243,7 +237,7 @@ class NPUPlatform(Platform):
+                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
+                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+ 
+-        if not is_310p():
++        if not _utils().is_310p():
+             try:
+                 from vllm_ascend.quantization import (  # noqa: F401
+                     AscendCompressedTensorsConfig,
+@@ -562,7 +556,7 @@ class NPUPlatform(Platform):
+         configure_ascend_logging()
+ 
+         if vllm_config.kv_transfer_config is not None:
+-            check_kv_extra_config(vllm_config)
++            _utils().check_kv_extra_config(vllm_config)
+             if not getattr(vllm_config.kv_transfer_config, "_engine_id_patched", False):
+                 vllm_config.kv_transfer_config.engine_id = f"{vllm_config.kv_transfer_config.engine_id}-{uuid4().hex}"
+                 vllm_config.kv_transfer_config._engine_id_patched = True
+@@ -677,7 +671,7 @@ class NPUPlatform(Platform):
+         if (
+             vllm_config.parallel_config.tensor_parallel_size > 1
+             and not vllm_config.model_config.enforce_eager
+-            and enable_sp(vllm_config)
++            and _utils().enable_sp(vllm_config)
+         ):
+             original_sizes = compilation_config.cudagraph_capture_sizes
+             sp_aclgraph_sizes = vllm_config.update_sizes_for_sequence_parallelism(original_sizes)
+@@ -688,7 +682,7 @@ class NPUPlatform(Platform):
+             )
+             if len(sp_aclgraph_sizes) != len(original_sizes):
+                 compilation_config.cudagraph_capture_sizes = sp_aclgraph_sizes
+-                update_cudagraph_capture_sizes(vllm_config, sp_aclgraph_sizes)
++                _utils().update_cudagraph_capture_sizes(vllm_config, sp_aclgraph_sizes)
+ 
+         # Encoder-decoder models currently only support PIECEWISE mode
+         # TODO(Jian Li): Confirm this behavior and explain why
+@@ -741,7 +735,7 @@ class NPUPlatform(Platform):
+                 ]
+             )
+             # TODO(2026/7/15): Delete the reduced gear after the new driver is released.
+-            if get_ascend_device_type() == AscendDeviceType.A5:
++            if _utils().get_ascend_device_type() == _utils().AscendDeviceType.A5:
+                 prune_capture_sizes_for_950(vllm_config)
+             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+         elif compilation_config.cudagraph_mode.has_full_cudagraphs():
+@@ -778,7 +772,7 @@ class NPUPlatform(Platform):
+             # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.
+             if not vllm_config.compilation_config.pass_config.enable_sp:
+                 parallel_config.all2all_backend = "flashinfer_all2allv"
+-            if is_310p():
++            if _utils().is_310p():
+                 parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
+             elif ascend_config.xlite_graph_config.enabled:
+                 logger.info("openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite")
+@@ -786,10 +780,10 @@ class NPUPlatform(Platform):
+             else:
+                 parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
+ 
+-        refresh_block_size(vllm_config)
++        _utils().refresh_block_size(vllm_config)
+ 
+         # Activate custom ops for v1, except on 310P
+-        if get_ascend_device_type() != AscendDeviceType._310P:
++        if _utils().get_ascend_device_type() != _utils().AscendDeviceType._310P:
+             compilation_config.custom_ops = ["all"]
+ 
+         if ascend_config.enable_balance_scheduling:
+@@ -844,12 +838,12 @@ class NPUPlatform(Platform):
+             )
+             vllm_config.parallel_config.cp_kv_cache_interleave_size = cache_config.block_size
+ 
+-        if enable_sp(vllm_config):
++        if _utils().enable_sp(vllm_config):
+             assert vllm_config.parallel_config.tensor_parallel_size > 1, (
+                 "Flash Comm v1 is only supported when tp_size > 1."
+             )
+ 
+-            assert not is_moe_model(vllm_config) or vllm_config.parallel_config.enable_expert_parallel, (
++            assert not _utils().is_moe_model(vllm_config) or vllm_config.parallel_config.enable_expert_parallel, (
+                 "Flash Comm v1 requires enable_expert_parallel=True for MoE models."
+             )
+ 
+@@ -907,7 +901,7 @@ class NPUPlatform(Platform):
+         global _CUSTOM_OP_REGISTERED
+         if _CUSTOM_OP_REGISTERED:
+             return
+-        bootstrap_custom_op_env()
++        _utils().bootstrap_custom_op_env()
+         _CUSTOM_OP_REGISTERED = True
+ 
+     @classmethod
+@@ -934,7 +928,7 @@ class NPUPlatform(Platform):
+             # (True, True):  "...AscendSFABackend310",
+         }
+ 
+-        if is_310p():
++        if _utils().is_310p():
+             return backend_map_310.get(key, backend_map_310[(False, False)])
+ 
+         return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]
+@@ -1097,14 +1091,14 @@ class NPUPlatform(Platform):
+         # the performance may degrade due to the switching of
+         # communication methods.
+         mmrs_fusion = True
+-        if is_moe_model(vllm_config):
+-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
++        if _utils().is_moe_model(vllm_config):
++            flash_comm_v1_enabled = _utils().enable_sp(vllm_config) and num_tokens is not None
+             mmrs_fusion = False
+         else:
+-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
++            flash_comm_v1_enabled = _utils().enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+ 
+         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
+-        flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
++        flashcomm_v2_enabled = _utils().flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
+         pad_size = 0
+         padded_length = None
+         if flash_comm_v1_enabled or flashcomm_v2_enabled:
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,461 @@
+From db43a1dd95adaf41968a4760891e7812d25d9644 Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Thu, 25 Jun 2026 05:50:57 +0000
+Subject: [PATCH] feat: add KIVI int4 kv cache plumbing
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+---
+ tests/test_config.py                          |  19 ++-
+ tests/v1/engine/test_engine_args.py           |  17 +++
+ vllm/config/cache.py                          |  31 ++++-
+ vllm/engine/arg_utils.py                      |  10 ++
+ vllm/entrypoints/llm.py                       |  11 --
+ vllm/entrypoints/openai/engine/serving.py     |  13 +++
+ .../layers/attention/attention.py             |  12 ++
+ vllm/platforms/interface.py                   |   7 +-
+ vllm/utils/torch_utils.py                     |   9 +-
+ vllm/v1/kv_cache_interface.py                 | 109 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |  10 +-
+ 11 files changed, 227 insertions(+), 21 deletions(-)
+
+diff --git a/tests/test_config.py b/tests/test_config.py
+index c2dfe621d..f3ff26501 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -14,6 +14,7 @@ from pydantic import ValidationError
+ import vllm.config.vllm as vllm_config_module
+ from vllm.compilation.backends import VllmBackend
+ from vllm.config import (
++    CacheConfig,
+     CompilationConfig,
+     KernelConfig,
+     ModelConfig,
+@@ -218,11 +219,27 @@ def test_auto_runner(model_id, expected_runner_type, expected_convert_type):
+ )
+ def test_pooling_runner(model_id, expected_runner_type, expected_convert_type):
+     config = ModelConfig(model_id, runner="pooling")
+-
+     assert config.runner_type == expected_runner_type
+     assert config.convert_type == expected_convert_type
+ 
+ 
++def test_kivi_cache_config_validation():
++    config = CacheConfig(cache_dtype="kivi_int4")
++
++    assert config.cache_dtype == "kivi_int4"
++    assert config.kivi_group_size == 32
++    assert config.kivi_residual_length == 32
++
++
++def test_kivi_cache_config_rejects_invalid_residual_length():
++    with pytest.raises(ValidationError):
++        CacheConfig(
++            cache_dtype="kivi_int4",
++            kivi_group_size=32,
++            kivi_residual_length=48,
++        )
++
++
+ @pytest.mark.parametrize(
+     ("model_id", "expected_runner_type", "expected_convert_type"),
+     [
+diff --git a/tests/v1/engine/test_engine_args.py b/tests/v1/engine/test_engine_args.py
+index 76cf1d98a..32c530924 100644
+--- a/tests/v1/engine/test_engine_args.py
++++ b/tests/v1/engine/test_engine_args.py
+@@ -106,3 +106,20 @@ def test_defaults_with_usage_context():
+     vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
+     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
+     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
++
++
++def test_kivi_cache_args_from_cli():
++    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
++    args = parser.parse_args(
++        [
++            "--model",
++            "facebook/opt-125m",
++            "--kv-cache-dtype",
++            "kivi_int4",
++        ]
++    )
++    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
++
++    assert vllm_config.cache_config.cache_dtype == "kivi_int4"
++    assert vllm_config.cache_config.kivi_group_size == 32
++    assert vllm_config.cache_config.kivi_residual_length == 32
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index dd4d500d9..bc6ead08d 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -31,7 +31,8 @@ CacheDType = Literal[
+     "int8_per_token_head",
+     "fp8_per_token_head",
+     "nvfp4",
+-    "int8",                   # ★ 加这行
++    "int8",
++    "kivi_int4",
+ ]
+ MambaDType = Literal["auto", "float32", "float16"]
+ MambaCacheMode = Literal["all", "align", "none"]
+@@ -80,6 +81,10 @@ class CacheConfig:
+     bfloat16 instead, this is an invalid option for models that do not default
+     to fp8.
+     """
++    kivi_group_size: int = Field(default=32, gt=0)
++    """Group size for KIVI fake quantization when cache_dtype='kivi_int4'."""
++    kivi_residual_length: int = Field(default=32, gt=0)
++    """Number of most-recent full-precision KV tokens kept by KIVI."""
+     is_attention_free: bool = False
+     """Whether the model is attention-free. This is primarily set in
+     `ModelConfig` and that value should be manually duplicated here."""
+@@ -251,6 +256,14 @@ class CacheConfig:
+     @field_validator("cache_dtype", mode="after")
+     @classmethod
+     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
++        if cache_dtype == "kivi_int4":
++            logger.info(
++                "Using %s fake quantization for kv cache. Storage stays in the "
++                "model dtype and only KIVI-style fake-quant/dequant is applied "
++                "during cache updates/reads.",
++                str(cache_dtype),
++            )
++            return cache_dtype
+         if kv_cache_uses_per_token_head_scales(cache_dtype):
+             logger.info(
+                 "Using %s data type to store kv cache. It reduces the GPU "
+@@ -267,3 +280,19 @@ class CacheConfig:
+                 str(cache_dtype),
+             )
+         return cache_dtype
++
++    @model_validator(mode="after")
++    def _validate_kivi_config(self) -> "CacheConfig":
++        if self.cache_dtype != "kivi_int4":
++            return self
++        if self.kivi_residual_length < self.kivi_group_size:
++            raise ValueError(
++                "kivi_residual_length must be >= kivi_group_size when "
++                "cache_dtype='kivi_int4'."
++            )
++        if self.kivi_residual_length % self.kivi_group_size != 0:
++            raise ValueError(
++                "kivi_residual_length must be divisible by kivi_group_size "
++                "when cache_dtype='kivi_int4'."
++            )
++        return self
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 3f3c19d39..79b8515e7 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -425,6 +425,8 @@ class EngineArgs:
+     config_format: str = ModelConfig.config_format
+     dtype: ModelDType = ModelConfig.dtype
+     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
++    kivi_group_size: int = CacheConfig.kivi_group_size
++    kivi_residual_length: int = CacheConfig.kivi_residual_length
+     seed: int = ModelConfig.seed
+     max_model_len: int = ModelConfig.max_model_len
+     cudagraph_capture_sizes: list[int] | None = (
+@@ -1076,6 +1078,12 @@ class EngineArgs:
+             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
+         )
+         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
++        cache_group.add_argument(
++            "--kivi-group-size", **cache_kwargs["kivi_group_size"]
++        )
++        cache_group.add_argument(
++            "--kivi-residual-length", **cache_kwargs["kivi_residual_length"]
++        )
+         cache_group.add_argument(
+             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
+         )
+@@ -1683,6 +1691,8 @@ class EngineArgs:
+             gpu_memory_utilization=self.gpu_memory_utilization,
+             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
+             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
++            kivi_group_size=self.kivi_group_size,
++            kivi_residual_length=self.kivi_residual_length,
+             is_attention_free=model_config.is_attention_free,
+             num_gpu_blocks_override=self.num_gpu_blocks_override,
+             sliding_window=sliding_window,
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index 7bc94084b..246a71851 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -256,17 +256,6 @@ class LLM:
+     ) -> None:
+         """LLM constructor."""
+ 
+-        if "swap_space" in kwargs:
+-            kwargs.pop("swap_space")
+-            import warnings
+-
+-            warnings.warn(
+-                "The 'swap_space' parameter is deprecated and ignored. "
+-                "It will be removed in a future version.",
+-                DeprecationWarning,
+-                stacklevel=2,
+-            )
+-
+         if "disable_log_stats" not in kwargs:
+             kwargs["disable_log_stats"] = True
+ 
+diff --git a/vllm/entrypoints/openai/engine/serving.py b/vllm/entrypoints/openai/engine/serving.py
+index 5e4cc3482..602b09b67 100644
+--- a/vllm/entrypoints/openai/engine/serving.py
++++ b/vllm/entrypoints/openai/engine/serving.py
+@@ -437,6 +437,19 @@ class OpenAIServing:
+             ):
+                 error_response = load_result
+ 
++        logger.warning(
++            "Rejecting request during model validation: request_id=%s, "
++            "request_type=%s, request_model=%r, base_models=%s, loaded_loras=%s, "
++            "runtime_lora_updating=%s, prior_error=%s",
++            getattr(request, "request_id", None),
++            type(request).__name__,
++            request.model,
++            [model.name for model in self.models.base_model_paths],
++            list(self.models.lora_requests.keys()),
++            envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING,
++            error_response.error.message if error_response is not None else None,
++        )
++
+         return error_response or self.create_error_response(
+             message=f"The model `{request.model}` does not exist.",
+             err_type="NotFoundError",
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 31449e22d..9850c331f 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
+     KVCacheSpec,
+     SlidingWindowSpec,
+     get_kv_quant_mode,
++    KIVIInt4FullAttentionSpec,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -576,6 +577,17 @@ class Attention(nn.Module, AttentionLayerBase):
+                 dtype=self.kv_cache_torch_dtype,
+                 tq_slot_size=tq_config.slot_size_aligned,
+             )
++        elif self.kv_cache_dtype == "kivi_int4":
++            cache_cfg = vllm_config.cache_config
++            return KIVIInt4FullAttentionSpec(
++                block_size=block_size,
++                num_kv_heads=self.num_kv_heads,
++                head_size=self.head_size,
++                head_size_v=self.head_size_v,
++                dtype=self.kv_cache_torch_dtype,  # fp16/bf16, 给 scale/min 用
++                kivi_group_size=cache_cfg.kivi_group_size,
++                scale_dtype=self.kv_cache_torch_dtype,
++            )
+         else:
+             return FullAttentionSpec(
+                 block_size=block_size,
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 275332675..c3f1d056c 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -516,7 +516,7 @@ class Platform:
+         from vllm.config.vllm import set_current_vllm_config
+         from vllm.model_executor.models import ModelRegistry
+         from vllm.utils.math_utils import cdiv
+-        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++        from vllm.utils.torch_utils import get_kv_cache_torch_dtype
+         from vllm.v1.attention.backend import MultipleOf
+         from vllm.v1.kv_cache_interface import (
+             FullAttentionSpec,
+@@ -532,7 +532,10 @@ class Platform:
+         if cache_config.cache_dtype == "auto":
+             kv_cache_dtype = model_config.dtype
+         else:
+-            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
++            kv_cache_dtype = get_kv_cache_torch_dtype(
++                cache_config.cache_dtype,
++                model_config.dtype,
++            )
+ 
+         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
+ 
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 1eb9306ed..4bbacb63c 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -265,6 +265,13 @@ def get_kv_cache_torch_dtype(
+                 torch_dtype = model_dtype
+             else:
+                 raise ValueError(f"Invalid model dtype: {model_dtype}")
++        elif cache_dtype == "kivi_int4":
++            if isinstance(model_dtype, str) and model_dtype in STR_DTYPE_TO_TORCH_DTYPE:
++                torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
++            elif isinstance(model_dtype, torch.dtype):
++                torch_dtype = model_dtype
++            else:
++                torch_dtype = torch.half
+         elif cache_dtype in STR_DTYPE_TO_TORCH_DTYPE:
+             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+         else:
+@@ -364,7 +371,7 @@ def resolve_kv_cache_dtype_string(
+ def kv_cache_dtype_str_to_dtype(
+     kv_cache_dtype: str, model_config: ModelConfig
+ ) -> torch.dtype:
+-    if kv_cache_dtype == "auto":
++    if kv_cache_dtype in {"auto", "kivi_int4"}:
+         # Model config may not be specified for unit tests, default to float16
+         return model_config.dtype if model_config else torch.half
+     return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 19438fb1e..f1c6e688c 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -283,7 +283,116 @@ class FullAttentionSpec(AttentionSpec):
+             * get_dtype_size(self.dtype)
+         )
+ 
++@dataclass(frozen=True, kw_only=True)
++class KIVIInt4FullAttentionSpec(FullAttentionSpec):
++    kivi_group_size: int = 32
++    quant_bits: int = 4
++    quant_packed_dtype: torch.dtype = torch.int32
++    scale_dtype: torch.dtype | None = None
++
++    def __post_init__(self):
++        super().__post_init__()
++
++        if self.scale_dtype is None:
++            object.__setattr__(self, "scale_dtype", self.dtype)
++
++        if self.quant_bits != 4:
++            raise ValueError("Current KIVI spec only supports 4-bit history cache.")
++
++        if self.block_size % self.kivi_group_size != 0:
++            raise ValueError(
++                "For the MVP KIVI paged layout, block_size must be divisible by "
++                "kivi_group_size."
++            )
++
++        if self.head_size % self.kivi_group_size != 0:
++            raise ValueError(
++                "For the MVP KIVI paged layout, head_size must be divisible by "
++                "kivi_group_size."
++            )
++
++        if self.head_size_v % self.kivi_group_size != 0:
++            raise ValueError(
++                "For the MVP KIVI paged layout, head_size_v must be divisible by "
++                "kivi_group_size."
++            )
++
++    @property
++    def real_page_size_bytes(self) -> int:
++        group_size = self.kivi_group_size
++        pack_factor = 32 // self.quant_bits
++        q_bytes = get_dtype_size(self.quant_packed_dtype)
++        s_bytes = get_dtype_size(self.scale_dtype)
++
++        # K history page
++        k_quant_bytes = (
++            self.num_kv_heads
++            * self.head_size
++            * (self.block_size // pack_factor)
++            * q_bytes
++        )
++        k_scale_bytes = (
++            self.num_kv_heads
++            * self.head_size
++            * (self.block_size // group_size)
++            * s_bytes
++        )
++        k_mn_bytes = k_scale_bytes
+ 
++        # V history page
++        v_quant_bytes = (
++            self.block_size
++            * self.num_kv_heads
++            * (self.head_size_v // pack_factor)
++            * q_bytes
++        )
++        v_scale_bytes = (
++            self.block_size
++            * self.num_kv_heads
++            * (self.head_size_v // group_size)
++            * s_bytes
++        )
++        v_mn_bytes = v_scale_bytes
++
++        return (
++            k_quant_bytes
++            + k_scale_bytes
++            + k_mn_bytes
++            + v_quant_bytes
++            + v_scale_bytes
++            + v_mn_bytes
++        )
++
++    @classmethod
++    def merge(cls, specs: list[Self]) -> Self:
++        assert len(specs) > 0
++        assert all(isinstance(spec, cls) for spec in specs)
++
++        merged = super().merge(specs)
++
++        assert all(spec.kivi_group_size == specs[0].kivi_group_size for spec in specs), (
++            "All merged KIVI specs must share group size."
++        )
++        assert all(spec.quant_bits == specs[0].quant_bits for spec in specs), (
++            "All merged KIVI specs must share quant bits."
++        )
++        assert all(
++            spec.quant_packed_dtype == specs[0].quant_packed_dtype for spec in specs
++        ), (
++            "All merged KIVI specs must share quant_packed_dtype."
++        )
++        assert all(spec.scale_dtype == specs[0].scale_dtype for spec in specs), (
++            "All merged KIVI specs must share scale dtype."
++        )
++
++        return replace(
++            merged,
++            kivi_group_size=specs[0].kivi_group_size,
++            quant_bits=specs[0].quant_bits,
++            quant_packed_dtype=specs[0].quant_packed_dtype,
++            scale_dtype=specs[0].scale_dtype,
++        )
++        
+ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+     if spec.alignment is None:
+         return
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 98d889cdb..72b1123fe 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -45,7 +45,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+@@ -121,10 +121,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.dtype = self.model_config.dtype
+         self.kv_cache_dtype = self.dtype
+         if self.cache_config.cache_dtype != "auto":
+-            # Quantized KV cache.
+-            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
+-                self.cache_config.cache_dtype
+-            ]
++            self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
++                self.cache_config.cache_dtype,
++                self.model_config,
++            )
+ 
+         self.vocab_size = self.model_config.get_vocab_size()
+         self.max_model_len = self.model_config.max_model_len
+-- 
+2.53.0.windows.3
+

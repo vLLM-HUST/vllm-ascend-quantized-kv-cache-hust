@@ -1,0 +1,871 @@
+From 7abd88a554aef211caf5b43601a9903056ceb989 Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Fri, 3 Jul 2026 09:29:11 +0000
+Subject: [PATCH] add kivi_cache.py
+
+---
+ vllm_ascend/attention/attention_v1.py | 567 +++++++++++++-------------
+ 1 file changed, 286 insertions(+), 281 deletions(-)
+
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index 4bcdad81d..021d990cc 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -15,7 +15,6 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ 
+-import ctypes
+ import math
+ from dataclasses import dataclass
+ from enum import Enum
+@@ -66,6 +65,7 @@ from vllm_ascend.compilation.acl_graph import (
+ )
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
++from vllm_ascend.ops.triton.kivi_cache import kivi_pack_key_cache, kivi_pack_value_cache
+ from vllm_ascend.utils import weak_ref_tensors
+ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+ 
+@@ -429,13 +429,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self.v_quant_cache = None
+         self.v_scale_cache = None
+         self.v_mn_cache = None
+-        # KIVI keeps the most recent residual window in full precision, while
+-        # older tokens are packed into the paged int4 history cache.
+-        self.kivi_residual_key_cache: dict[int, torch.Tensor] = {}
+-        self.kivi_residual_value_cache: dict[int, torch.Tensor] = {}
+-        self.kivi_key_residual_slots_by_req: dict[str, list[int]] = {}
+-        self.kivi_value_residual_slots_by_req: dict[str, list[int]] = {}
+-        self.kivi_last_req_slots: dict[str, list[int]] = {}
++        # KIVI keeps the most recent residual window in full precision on NPU,
++        # while older tokens are packed into the paged int4 history cache.
++        self.kivi_residual_key_cache: torch.Tensor | None = None
++        self.kivi_residual_value_cache: torch.Tensor | None = None
++        self.kivi_residual_key_slot_ids: torch.Tensor | None = None
++        self.kivi_residual_value_slot_ids: torch.Tensor | None = None
+         
+         # 只在首次计算
+         self.is_kv_producer = (
+@@ -476,6 +475,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             self.v_scale_cache,
+             self.v_mn_cache,
+         ) = kv_cache
++        self._ensure_kivi_residual_buffers()
+     
+     def _bind_dense_kv_cache(self, kv_cache) -> None:
+         if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) < 2:
+@@ -1380,10 +1380,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 output=output,
+             )
+         else:
+-            if attn_metadata.req_ids is None:
+-                raise RuntimeError(
+-                    "KIVI cached modes require stable request ids in AscendMetadata."
+-                )
+             if key is not None and value is not None:
+                 num_actual_tokens = min(
+                     getattr(attn_metadata, "num_actual_tokens", key.shape[0]),
+@@ -1394,21 +1390,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                     value[:num_actual_tokens],
+                     attn_metadata.slot_mapping[:num_actual_tokens],
+                 )
+-                self._append_kivi_step_slots(
+-                    attn_metadata.req_ids,
+-                    attn_metadata.slot_mapping[:num_actual_tokens],
+-                    actual_seq_qlen,
+-                )
+             seq_lens = attn_metadata.seq_lens_list
+             self._sync_kivi_residual_windows(
+-                attn_metadata.req_ids,
+                 attn_metadata.block_tables,
+                 seq_lens,
+             )
+             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                 return self._forward_kivi_decode_fast(
+                     query,
+-                    attn_metadata.req_ids,
+                     attn_metadata.block_tables,
+                     seq_lens,
+                     output,
+@@ -1422,7 +1411,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                     output=output,
+                 )
+             dense_key, dense_value = self._gather_dequant_kivi_paged_cache(
+-                attn_metadata.req_ids,
+                 attn_metadata.block_tables,
+                 seq_lens,
+                 query.dtype,
+@@ -1463,19 +1451,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         ).unsqueeze(0)
+     
+     def _unpack_int4(self, packed: torch.Tensor) -> torch.Tensor:
+-        packed_i32 = packed.to(torch.int32)
+-        lanes = [
+-            ((packed_i32 >> (lane * 4)) & 0xF)
+-            for lane in range(8)
+-        ]
+-        return torch.stack(lanes, dim=-1).to(torch.float32)
++        """Vectorized unpack of int32 into 8 int4 lanes (last dim).
+ 
+-    def _pack_int4(self, quant: torch.Tensor) -> torch.Tensor:
+-        quant = quant.to(torch.int32)
+-        packed = torch.zeros_like(quant[..., 0], dtype=torch.int32)
+-        for lane in range(8):
+-            packed = packed | (quant[..., lane] << (lane * 4))
+-        return packed
++        Uses pure tensor ops (no Python list comprehension) for
++        performance on both CUDA and Ascend NPU.
++        """
++        packed_i32 = packed.to(torch.int32)
++        shifts = torch.arange(8, device=packed.device, dtype=torch.int32) * 4
++        unpacked = (packed_i32.unsqueeze(-1) >> shifts) & 0xF
++        return unpacked.to(torch.float32)
+ 
+     def _check_kivi_cache_bound(self) -> None:
+         if (
+@@ -1488,6 +1472,177 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         ):
+             raise RuntimeError("KIVI cache tensors are not bound.")
+ 
++    def _ensure_kivi_residual_buffers(self) -> None:
++        if self.kivi_residual_key_cache is not None:
++            return
++
++        self._check_kivi_cache_bound()
++        num_blocks = self.k_quant_cache.shape[0]
++        residual_slots = self.kivi_residual_length
++        device = self.k_quant_cache.device
++
++        self.kivi_residual_key_cache = torch.empty(
++            (num_blocks, residual_slots, self.num_kv_heads, self.head_size),
++            dtype=self.k_scale_cache.dtype,
++            device=device,
++        )
++        self.kivi_residual_value_cache = torch.empty(
++            (num_blocks, residual_slots, self.num_kv_heads, self.head_size),
++            dtype=self.v_scale_cache.dtype,
++            device=device,
++        )
++        self.kivi_residual_key_slot_ids = torch.full(
++            (num_blocks, residual_slots),
++            -1,
++            dtype=torch.long,
++            device=device,
++        )
++        self.kivi_residual_value_slot_ids = torch.full(
++            (num_blocks, residual_slots),
++            -1,
++            dtype=torch.long,
++            device=device,
++        )
++
++    def _get_kivi_residual_buffers(
++        self,
++        *,
++        is_key: bool,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        self._ensure_kivi_residual_buffers()
++        slot_ids = self.kivi_residual_key_slot_ids if is_key else self.kivi_residual_value_slot_ids
++        cache = self.kivi_residual_key_cache if is_key else self.kivi_residual_value_cache
++        assert slot_ids is not None and cache is not None
++        return slot_ids, cache
++
++    def _get_kivi_block_size(self) -> int:
++        self._check_kivi_cache_bound()
++        return self.k_quant_cache.shape[-1] * 8
++
++    def _store_kivi_residual_entries(
++        self,
++        values: torch.Tensor,
++        slots: torch.Tensor,
++        *,
++        is_key: bool,
++    ) -> None:
++        if values.numel() == 0 or slots.numel() == 0:
++            return
++
++        slot_ids, cache = self._get_kivi_residual_buffers(is_key=is_key)
++        block_size = self._get_kivi_block_size()
++        values = values.to(cache.dtype)
++        block_indices = torch.div(slots, block_size, rounding_mode="floor")
++
++        for idx in range(int(slots.shape[0])):
++            slot = int(slots[idx].item())
++            block_idx = int(block_indices[idx].item())
++            slot_row = slot_ids[block_idx]
++            match = (slot_row == slot).nonzero(as_tuple=False)
++            if match.numel() > 0:
++                lane = int(match[0].item())
++            else:
++                free = (slot_row < 0).nonzero(as_tuple=False)
++                if free.numel() == 0:
++                    cache_name = "key" if is_key else "value"
++                    raise RuntimeError(
++                        "KIVI residual cache row is full before flush: "
++                        f"cache={cache_name}, block_idx={block_idx}, "
++                        f"residual_slots={self.kivi_residual_length}, slot={slot}."
++                    )
++                lane = int(free[0].item())
++                slot_ids[block_idx, lane] = slot
++            cache[block_idx, lane].copy_(values[idx])
++
++    def _lookup_kivi_residual_tensor(
++        self,
++        slot: int,
++        *,
++        is_key: bool,
++        target_dtype: torch.dtype,
++        target_device: torch.device | None = None,
++    ) -> torch.Tensor | None:
++        slot_ids, cache = self._get_kivi_residual_buffers(is_key=is_key)
++        block_idx = slot // self._get_kivi_block_size()
++        slot_row = slot_ids[block_idx]
++        match = (slot_row == slot).nonzero(as_tuple=False)
++        if match.numel() == 0:
++            return None
++
++        lane = int(match[0].item())
++        tensor = cache[block_idx, lane]
++        if target_device is None:
++            target_device = tensor.device
++        return tensor.to(device=target_device, dtype=target_dtype)
++
++    def _gather_kivi_residual_tensors(
++        self,
++        slots: list[int],
++        *,
++        is_key: bool,
++    ) -> torch.Tensor:
++        if not slots:
++            raise RuntimeError("KIVI residual gather expects a non-empty slot list.")
++
++        target_dtype = self.k_scale_cache.dtype if is_key else self.v_scale_cache.dtype
++        tensors = []
++        cache_name = "key" if is_key else "value"
++        for slot in slots:
++            tensor = self._lookup_kivi_residual_tensor(
++                int(slot),
++                is_key=is_key,
++                target_dtype=target_dtype,
++            )
++            if tensor is None:
++                raise RuntimeError(
++                    f"KIVI {cache_name} residual tensor for slot {slot} is missing before flush."
++                )
++            tensors.append(tensor)
++        return torch.stack(tensors, dim=0)
++
++    def _has_kivi_residual_entry(
++        self,
++        slot: int,
++        *,
++        is_key: bool,
++    ) -> bool:
++        slot_ids, _ = self._get_kivi_residual_buffers(is_key=is_key)
++        block_idx = slot // self._get_kivi_block_size()
++        return bool((slot_ids[block_idx] == slot).any().item())
++
++    def _clear_kivi_residual_entries(
++        self,
++        slots: list[int],
++        *,
++        is_key: bool,
++    ) -> None:
++        if not slots:
++            return
++
++        slot_ids, _ = self._get_kivi_residual_buffers(is_key=is_key)
++        block_size = self._get_kivi_block_size()
++        for slot in slots:
++            block_idx = slot // block_size
++            slot_row = slot_ids[block_idx]
++            match = (slot_row == slot).nonzero(as_tuple=False)
++            if match.numel() == 0:
++                continue
++            lane = int(match[0].item())
++            slot_ids[block_idx, lane] = -1
++
++    def _clear_stale_kivi_residual_entries(
++        self,
++        live_slots: set[int],
++        *,
++        is_key: bool,
++    ) -> None:
++        slot_ids, _ = self._get_kivi_residual_buffers(is_key=is_key)
++        active_slots = slot_ids[slot_ids >= 0]
++        if active_slots.numel() == 0:
++            return
++        stale_slots = [int(slot) for slot in active_slots.tolist() if int(slot) not in live_slots]
++        self._clear_kivi_residual_entries(stale_slots, is_key=is_key)
++
+     def _write_kivi_cache(
+         self,
+         key: torch.Tensor,
+@@ -1504,37 +1659,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         key = key[valid]
+         value = value[valid]
+         slots = slot_mapping[valid].to(torch.long)
+-
+-        for idx, slot in enumerate(slots.tolist()):
+-            slot = int(slot)
+-            self.kivi_residual_key_cache[slot] = key[idx].detach().clone()
+-            self.kivi_residual_value_cache[slot] = value[idx].detach().clone()
+-
+-    def _append_kivi_step_slots(
+-        self,
+-        req_ids: list[str],
+-        slot_mapping: torch.Tensor,
+-        actual_seq_qlen: list[int],
+-    ) -> None:
+-        if not req_ids:
+-            return
+-
+-        prev = 0
+-        num_tokens = slot_mapping.shape[0]
+-        for req_idx, req_id in enumerate(req_ids):
+-            if req_idx >= len(actual_seq_qlen):
+-                break
+-            end = min(int(actual_seq_qlen[req_idx]), num_tokens)
+-            end = max(end, prev)
+-            req_slots = slot_mapping[prev:end]
+-            prev = end
+-
+-            valid_slots = [int(slot) for slot in req_slots.tolist() if int(slot) >= 0]
+-            if not valid_slots:
+-                continue
+-
+-            self.kivi_key_residual_slots_by_req.setdefault(req_id, []).extend(valid_slots)
+-            self.kivi_value_residual_slots_by_req.setdefault(req_id, []).extend(valid_slots)
++        self._store_kivi_residual_entries(
++            key.detach(),
++            slots,
++            is_key=True,
++        )
++        self._store_kivi_residual_entries(
++            value.detach(),
++            slots,
++            is_key=False,
++        )
+ 
+     def _get_kivi_ordered_slots(
+         self,
+@@ -1589,41 +1723,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if not slots:
+             return
+ 
+-        keys = []
+-        for slot in slots:
+-            key = self.kivi_residual_key_cache.get(slot)
+-            if key is None:
+-                raise RuntimeError(
+-                    f"KIVI key residual tensor for slot {slot} is missing before flush."
+-                )
+-            keys.append(key)
+-
++        keys = self._gather_kivi_residual_tensors(slots, is_key=True)
+         slot_tensor = torch.tensor(
+-            slots, dtype=torch.long, device=keys[0].device
++            slots, dtype=torch.long, device=keys.device
+         )
+-        self._write_kivi_key_quant_cache(torch.stack(keys, dim=0), slot_tensor)
+-        for slot in slots:
+-            self.kivi_residual_key_cache.pop(slot, None)
++        self._write_kivi_key_quant_cache(keys, slot_tensor)
++        self._clear_kivi_residual_entries(slots, is_key=True)
+ 
+     def _flush_kivi_value_slots(self, slots: list[int]) -> None:
+         if not slots:
+             return
+ 
+-        values = []
+-        for slot in slots:
+-            value = self.kivi_residual_value_cache.get(slot)
+-            if value is None:
+-                raise RuntimeError(
+-                    f"KIVI value residual tensor for slot {slot} is missing before flush."
+-                )
+-            values.append(value)
+-
++        values = self._gather_kivi_residual_tensors(slots, is_key=False)
+         slot_tensor = torch.tensor(
+-            slots, dtype=torch.long, device=values[0].device
++            slots, dtype=torch.long, device=values.device
+         )
+-        self._write_kivi_value_quant_cache(torch.stack(values, dim=0), slot_tensor)
+-        for slot in slots:
+-            self.kivi_residual_value_cache.pop(slot, None)
++        self._write_kivi_value_quant_cache(values, slot_tensor)
++        self._clear_kivi_residual_entries(slots, is_key=False)
+ 
+     def _flush_kivi_key_batches(self, window_slots: list[int]) -> None:
+         while len(window_slots) >= self.kivi_residual_length:
+@@ -1641,78 +1757,30 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self._flush_kivi_value_slots(flush_slots)
+         del window_slots[:-self.kivi_residual_length]
+ 
+-    def _cleanup_dead_kivi_state(self, live_req_ids: set[str]) -> None:
+-        for req_id in list(self.kivi_key_residual_slots_by_req.keys()):
+-            if req_id not in live_req_ids:
+-                self.kivi_key_residual_slots_by_req.pop(req_id, None)
+-
+-        for req_id in list(self.kivi_value_residual_slots_by_req.keys()):
+-            if req_id not in live_req_ids:
+-                self.kivi_value_residual_slots_by_req.pop(req_id, None)
+-
+-        for req_id in list(self.kivi_last_req_slots.keys()):
+-            if req_id not in live_req_ids:
+-                self.kivi_last_req_slots.pop(req_id, None)
+-
+-        managed_key_slots = {
+-            slot
+-            for slots in self.kivi_key_residual_slots_by_req.values()
+-            for slot in slots
+-        }
+-        managed_value_slots = {
+-            slot
+-            for slots in self.kivi_value_residual_slots_by_req.values()
+-            for slot in slots
+-        }
+-
+-        for slot in list(self.kivi_residual_key_cache.keys()):
+-            if slot not in managed_key_slots:
+-                self.kivi_residual_key_cache.pop(slot, None)
+-
+-        for slot in list(self.kivi_residual_value_cache.keys()):
+-            if slot not in managed_value_slots:
+-                self.kivi_residual_value_cache.pop(slot, None)
+-
+-        for req_id in list(self.kivi_key_residual_slots_by_req.keys()):
+-            if not self.kivi_key_residual_slots_by_req[req_id]:
+-                self.kivi_key_residual_slots_by_req.pop(req_id, None)
+-
+-        for req_id in list(self.kivi_value_residual_slots_by_req.keys()):
+-            if not self.kivi_value_residual_slots_by_req[req_id]:
+-                self.kivi_value_residual_slots_by_req.pop(req_id, None)
+-
+     def _sync_kivi_residual_windows(
+         self,
+-        req_ids: list[str],
+         block_table: torch.Tensor,
+         seq_lens: list[int],
+     ) -> None:
+         ordered_slots = self._get_kivi_ordered_slots(block_table, seq_lens)
+-        live_req_ids = set(req_ids)
+-
+-        for req_id, req_slots in zip(req_ids, ordered_slots):
+-            req_slot_set = set(req_slots)
+-            self.kivi_last_req_slots[req_id] = req_slots
+ 
+-            key_window = self.kivi_key_residual_slots_by_req.setdefault(req_id, [])
+-            value_window = self.kivi_value_residual_slots_by_req.setdefault(req_id, [])
++        live_slots = {slot for req_slots in ordered_slots for slot in req_slots}
++        self._clear_stale_kivi_residual_entries(live_slots, is_key=True)
++        self._clear_stale_kivi_residual_entries(live_slots, is_key=False)
+ 
+-            key_window[:] = [
+-                slot
+-                for slot in key_window
+-                if slot in req_slot_set and slot in self.kivi_residual_key_cache
++        for req_slots in ordered_slots:
++            key_window = [
++                slot for slot in req_slots
++                if self._has_kivi_residual_entry(slot, is_key=True)
+             ]
+-            value_window[:] = [
+-                slot
+-                for slot in value_window
+-                if slot in req_slot_set and slot in self.kivi_residual_value_cache
++            value_window = [
++                slot for slot in req_slots
++                if self._has_kivi_residual_entry(slot, is_key=False)
+             ]
+ 
+             self._flush_kivi_key_batches(key_window)
+             self._flush_kivi_value_batches(value_window)
+ 
+-        self._cleanup_dead_kivi_state(live_req_ids)
+-
+     def _write_kivi_key_quant_cache(
+         self,
+         key: torch.Tensor,
+@@ -1726,20 +1794,30 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if not bool(valid.any()):
+             return
+ 
+-        key = key[valid].to(self.k_scale_cache.dtype)
+-        slots = slot_mapping[valid].to(torch.long)
++        key = key[valid].to(self.k_scale_cache.dtype).contiguous()
++        slots = slot_mapping[valid].to(torch.long).contiguous()
+ 
+         if key.shape[-1] != self.head_size:
+             raise RuntimeError(
+                 "KIVI INT4 key head_size must match attention head_size "
+                 f"({self.head_size}), got {key.shape[-1]}."
+             )
++        if key.shape[0] % self.kivi_group_size != 0:
++            raise RuntimeError(
++                "KIVI key flush must contain whole token groups, got "
++                f"{key.shape[0]} tokens for group_size={self.kivi_group_size}."
++            )
+ 
+         if self.head_size % 8 != 0:
+             raise RuntimeError(
+                 f"KIVI INT4 int32 packing requires head_size ({self.head_size}) "
+                 "to be divisible by 8."
+             )
++        if self.kivi_group_size % 8 != 0:
++            raise RuntimeError(
++                "KIVI INT4 key packing requires kivi_group_size "
++                f"({self.kivi_group_size}) to be divisible by 8."
++            )
+ 
+         block_size = self.k_quant_cache.shape[-1] * 8
+         if block_size % self.kivi_group_size != 0:
+@@ -1747,63 +1825,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 f"KIVI INT4 key cache requires block_size ({block_size}) to be "
+                 f"divisible by kivi_group_size ({self.kivi_group_size})."
+             )
++        if not self._is_aligned_kivi_key_window(slots.tolist()):
++            raise RuntimeError("KIVI key flush requires contiguous aligned token groups.")
+ 
+-        # Original KIVI semantics: once the FP residual window is full, quantize
+-        # the flushed window directly from full-precision keys .
+-        group_entries: dict[tuple[int, int], list[tuple[int, torch.Tensor]]] = {}
+-        for idx, slot in enumerate(slots.tolist()):
+-            block_idx = int(slot) // block_size
+-            block_offset = int(slot) % block_size
+-            group_idx = block_offset // self.kivi_group_size
+-            group_entries.setdefault((block_idx, group_idx), []).append(
+-                (block_offset, key[idx])
+-            )
+-
+-        for (block_idx, group_idx), entries in group_entries.items():
+-            if len(entries) != self.kivi_group_size:
+-                raise RuntimeError(
+-                    "KIVI key flush expects a full token group from the FP "
+-                    "residual window, got "
+-                    f"{len(entries)} tokens for block_idx={block_idx}, "
+-                    f"group_idx={group_idx}, group_size={self.kivi_group_size}."
+-                )
+-
+-            entries.sort(key=lambda x: x[0])
+-            group_start = group_idx * self.kivi_group_size
+-            expected_offsets = list(range(group_start, group_start + self.kivi_group_size))
+-            actual_offsets = [offset for offset, _ in entries]
+-            if actual_offsets != expected_offsets:
+-                raise RuntimeError(
+-                    "KIVI key flush requires contiguous full-precision group "
+-                    f"offsets. expected={expected_offsets}, got={actual_offsets} "
+-                    f"for block_idx={block_idx}, group_idx={group_idx}."
+-                )
+-
+-            group_values = torch.stack([group_key for _, group_key in entries], dim=0)
+-
+-            mn = group_values.amin(dim=0)
+-            mx = group_values.amax(dim=0)
+-            scale = (mx - mn).clamp(min=1e-6) / 15.0
+-            quant = torch.clamp(
+-                torch.round((group_values - mn) / scale), 0, 15
+-            ).to(torch.int32)
+-
+-            self.k_scale_cache[block_idx, :, :, group_idx].copy_(scale)
+-            self.k_mn_cache[block_idx, :, :, group_idx].copy_(mn)
+-
+-            for i in range(self.kivi_group_size):
+-                token_offset = group_start + i
+-                pack_idx = token_offset // 8
+-                lane = token_offset % 8
+-                shift = lane * 4
+-                clear_mask = torch.tensor(
+-                    ctypes.c_int32(~(0xF << shift)).value,
+-                    dtype=torch.int32,
+-                    device=quant.device,
+-                )
+-                current = self.k_quant_cache[block_idx, :, :, pack_idx].to(torch.int32)
+-                updated = (current & clear_mask) | (quant[i] << shift)
+-                self.k_quant_cache[block_idx, :, :, pack_idx].copy_(updated)
++        kivi_pack_key_cache(
++            key,
++            slots,
++            self.k_quant_cache,
++            self.k_scale_cache,
++            self.k_mn_cache,
++            self.kivi_group_size,
++        )
+ 
+     def _write_kivi_value_quant_cache(
+         self,
+@@ -1818,8 +1850,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if not bool(valid.any()):
+             return
+ 
+-        value = value[valid].to(self.v_scale_cache.dtype)
+-        slots = slot_mapping[valid].to(torch.long)
++        value = value[valid].to(self.v_scale_cache.dtype).contiguous()
++        slots = slot_mapping[valid].to(torch.long).contiguous()
+         head_size = value.shape[-1]
+ 
+         if head_size != self.head_size:
+@@ -1839,39 +1871,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 f"KIVI INT4 int32 packing requires head_size ({head_size}) "
+                 "to be divisible by 8."
+             )
+-
+-        block_size = self.k_quant_cache.shape[-1] * 8
+-        pad_dim = (8 - head_size % 8) % 8
+-
+-        for idx, slot in enumerate(slots.tolist()):
+-            block_idx = int(slot) // block_size
+-            block_offset = int(slot) % block_size
+-            token_value = value[idx]
+-
+-            grouped = token_value.view(
+-                self.num_kv_heads,
+-                head_size // self.kivi_group_size,
+-                self.kivi_group_size,
++        if self.kivi_group_size % 8 != 0:
++            raise RuntimeError(
++                "KIVI INT4 value packing requires kivi_group_size "
++                f"({self.kivi_group_size}) to be divisible by 8."
+             )
+-            mn = grouped.amin(dim=-1)
+-            mx = grouped.amax(dim=-1)
+-            scale = (mx - mn).clamp(min=1e-6) / 15.0
+-
+-            quant = torch.clamp(
+-                torch.round((grouped - mn.unsqueeze(-1)) / scale.unsqueeze(-1)),
+-                0,
+-                15,
+-            ).to(torch.int32).view(self.num_kv_heads, head_size)
+ 
+-            if pad_dim:
+-                pad = quant.new_zeros(self.num_kv_heads, pad_dim)
+-                quant = torch.cat([quant, pad], dim=-1)
+-
+-            packed = self._pack_int4(quant.view(self.num_kv_heads, -1, 8))
+-
+-            self.v_scale_cache[block_idx, block_offset].copy_(scale)
+-            self.v_mn_cache[block_idx, block_offset].copy_(mn)
+-            self.v_quant_cache[block_idx, block_offset].copy_(packed)
++        kivi_pack_value_cache(
++            value,
++            slots,
++            self.v_quant_cache,
++            self.v_scale_cache,
++            self.v_mn_cache,
++            self.kivi_group_size,
++        )
+ 
+ 
+     def _dequant_kivi_key_blocks(
+@@ -1945,7 +1958,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+ 
+     def _gather_dequant_kivi_paged_cache(
+         self,
+-        req_ids: list[str],
+         block_table: torch.Tensor,
+         seq_lens: list[int],
+         target_dtype: torch.dtype,
+@@ -1991,16 +2003,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         dense_k_parts = []
+         dense_v_parts = []
+         for req_idx, req_slots in enumerate(ordered_slots):
+-            if req_idx >= len(req_ids):
+-                break
+-
+-            req_id = req_ids[req_idx]
+-            key_residual_slots = set(
+-                self.kivi_key_residual_slots_by_req.get(req_id, ())
+-            )
+-            value_residual_slots = set(
+-                self.kivi_value_residual_slots_by_req.get(req_id, ())
+-            )
+             req_block_lookup = {
+                 int(block_id): block_pos
+                 for block_pos, block_id in enumerate(block_table[req_idx].tolist())
+@@ -2010,15 +2012,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             req_dense_k = []
+             req_dense_v = []
+             for slot in req_slots:
+-                key = (
+-                    self.kivi_residual_key_cache.get(slot)
+-                    if slot in key_residual_slots
+-                    else None
++                key = None
++                value = None
++                key = self._lookup_kivi_residual_tensor(
++                    slot,
++                    is_key=True,
++                    target_dtype=target_dtype,
++                    target_device=k_blocks.device,
+                 )
+-                value = (
+-                    self.kivi_residual_value_cache.get(slot)
+-                    if slot in value_residual_slots
+-                    else None
++                value = self._lookup_kivi_residual_tensor(
++                    slot,
++                    is_key=False,
++                    target_dtype=target_dtype,
++                    target_device=v_blocks.device,
+                 )
+                 if key is None:
+                     block_id = slot // cache_block_size
+@@ -2026,7 +2032,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                     block_pos = req_block_lookup.get(block_id)
+                     if block_pos is None:
+                         raise RuntimeError(
+-                            f"KIVI key cache missing block_id={block_id} for req_id={req_id}."
++                            f"KIVI key cache missing block_id={block_id} for req_idx={req_idx}."
+                         )
+                     key = k_blocks[req_idx, block_pos, block_offset]
+                 if value is None:
+@@ -2035,7 +2041,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                     block_pos = req_block_lookup.get(block_id)
+                     if block_pos is None:
+                         raise RuntimeError(
+-                            f"KIVI value cache missing block_id={block_id} for req_id={req_id}."
++                            f"KIVI value cache missing block_id={block_id} for req_idx={req_idx}."
+                         )
+                     value = v_blocks[req_idx, block_pos, block_offset]
+ 
+@@ -2056,7 +2062,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+ 
+     def _gather_dequant_kivi_paged_cache_vectorized(
+         self,
+-        req_ids: list[str],
+         block_table: torch.Tensor,
+         seq_lens: list[int],
+         target_dtype: torch.dtype,
+@@ -2135,41 +2140,40 @@ class AscendAttentionBackendImpl(AttentionImpl):
+ 
+         dense_k_parts: list[torch.Tensor] = []
+         dense_v_parts: list[torch.Tensor] = []
++        ordered_slots = self._get_kivi_ordered_slots(block_table, seq_lens)
+         kv_start = 0
+         for req_idx, seq_len in enumerate(seq_lens):
+-            req_id = req_ids[req_idx]
+             req_len = int(seq_len)
+             req_k = dense_k[kv_start:kv_start + req_len]
+             req_v = dense_v[kv_start:kv_start + req_len]
+             kv_start += req_len
+ 
+-            residual_key_slots = self.kivi_key_residual_slots_by_req.get(req_id, ())
+-            residual_value_slots = self.kivi_value_residual_slots_by_req.get(
+-                req_id, ()
+-            )
++            req_slots = ordered_slots[req_idx]
++            residual_key_slots = [
++                slot for slot in req_slots
++                if self._has_kivi_residual_entry(slot, is_key=True)
++            ]
++            residual_value_slots = [
++                slot for slot in req_slots
++                if self._has_kivi_residual_entry(slot, is_key=False)
++            ]
+             if residual_key_slots or residual_value_slots:
+-                req_slots = self.kivi_last_req_slots.get(req_id)
+-                if req_slots is None:
+-                    req_slots = self._get_kivi_ordered_slots(
+-                        block_table[req_idx:req_idx + 1],
+-                        [req_len],
+-                    )[0]
+                 pos_by_slot = {slot: pos for pos, slot in enumerate(req_slots)}
+                 if residual_key_slots:
+                     req_k = self._overlay_kivi_residual_tensors(
+                         req_k,
+                         residual_key_slots,
+-                        self.kivi_residual_key_cache,
+                         pos_by_slot,
+                         target_dtype,
++                        is_key=True,
+                     )
+                 if residual_value_slots:
+                     req_v = self._overlay_kivi_residual_tensors(
+                         req_v,
+                         residual_value_slots,
+-                        self.kivi_residual_value_cache,
+                         pos_by_slot,
+                         target_dtype,
++                        is_key=False,
+                     )
+ 
+             dense_k_parts.append(req_k)
+@@ -2188,16 +2192,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self,
+         dense: torch.Tensor,
+         residual_slots,
+-        residual_cache: dict[int, torch.Tensor],
+         pos_by_slot: dict[int, int],
+         target_dtype: torch.dtype,
++        *,
++        is_key: bool,
+     ) -> torch.Tensor:
+         positions: list[int] = []
+         tensors: list[torch.Tensor] = []
+         dense_len = dense.shape[0]
+         for slot in residual_slots:
+             pos = pos_by_slot.get(slot)
+-            tensor = residual_cache.get(slot)
++            tensor = self._lookup_kivi_residual_tensor(
++                int(slot),
++                is_key=is_key,
++                target_dtype=target_dtype,
++                target_device=dense.device,
++            )
+             if pos is None or tensor is None or pos >= dense_len:
+                 continue
+             positions.append(pos)
+@@ -2212,7 +2222,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             device=dense.device,
+         )
+         value_tensor = torch.stack(
+-            [tensor.to(device=dense.device, dtype=target_dtype) for tensor in tensors],
++            tensors,
+             dim=0,
+         )
+         dense = dense.clone()
+@@ -2222,7 +2232,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+     def _forward_kivi_decode_fast(
+         self,
+         query: torch.Tensor,
+-        req_ids: list[str],
+         block_table: torch.Tensor,
+         seq_lens: list[int],
+         output: torch.Tensor,
+@@ -2240,7 +2249,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 self._kivi_skip_count,
+             )
+         dense_key, dense_value = self._gather_dequant_kivi_paged_cache_vectorized(
+-            req_ids,
+             block_table,
+             seq_lens,
+             query.dtype,
+@@ -2343,7 +2351,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if num_decode > 0:
+             self._forward_kivi_decode_fast(
+                 query[:num_decode],
+-                attn_metadata.req_ids[:num_decodes],
+                 attn_metadata.block_tables[:num_decodes],
+                 attn_metadata.seq_lens_list[:num_decodes],
+                 output,
+@@ -2357,7 +2364,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             actual_seq_qlen[i] - num_decode
+             for i in range(num_decodes, len(actual_seq_qlen))
+         ]
+-        prefill_req_ids = attn_metadata.req_ids[num_decodes:]
+         prefill_seq_lens = attn_metadata.seq_lens_list[num_decodes:]
+ 
+         all_new_prefill = True
+@@ -2374,7 +2380,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             prefill_seq_kvlen = prefill_seq_qlen
+         else:
+             prefill_k, prefill_v = self._gather_dequant_kivi_paged_cache_vectorized(
+-                prefill_req_ids,
+                 attn_metadata.block_tables[num_decodes:],
+                 prefill_seq_lens,
+                 query.dtype,
+-- 
+2.53.0.windows.3
+

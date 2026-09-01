@@ -1,0 +1,840 @@
+From 7f0557c16b4ee5ad56ad737e7ce037078b1564f6 Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Fri, 24 Jul 2026 02:11:58 +0000
+Subject: [PATCH] feat(quant): add KV cache quantization handlers for
+ int4/nvfp4/fp8_e4m3/fp4_e2m1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add Ascend NPU quantization handlers for new KV cache dtypes, integrating
+with the existing @register_scheme / AscendAttentionScheme framework.
+
+- kv_int4.py: INT4 per-token-head symmetric quantization handler
+- kv_nvfp4.py: NVFP4 packed fp4 data + fp8 block scales handler
+- kv_fp8_e4m3.py: FP8 E4M3 per-tensor quantization handler
+- kv_fp4_e2m1.py: FP4 E2M1 microscaling format handler
+- kv_cache_utils.py: Scheme dispatch and setup utility functions
+- __init__.py: Export all new handler classes
+- model_runner_v1.py: Call setup_kv_cache_quant after model loading
+
+All handlers are no-ops at the apply() level — actual quantization
+is delegated to the attention backend kernels.
+
+Test commands run:
+  python3 -m pytest tests/ut/quantization/test_kv_cache_quant.py -v --noconftest
+All 35 tests passed.
+
+Co-authored-by: Claude
+Signed-off-by: vLLM-HUST <vllm-hust@users.noreply.github.com>
+Signed-off-by: Paul Cheng <chengyuejia@foxmail.com>
+---
+ tests/ut/quantization/test_kv_cache_quant.py  | 334 ++++++++++++++++++
+ vllm_ascend/quantization/kv_cache_utils.py    | 100 ++++++
+ vllm_ascend/quantization/methods/__init__.py  |   8 +
+ .../quantization/methods/kv_fp4_e2m1.py       |  64 ++++
+ .../quantization/methods/kv_fp8_e4m3.py       |  68 ++++
+ vllm_ascend/quantization/methods/kv_int4.py   |  69 ++++
+ vllm_ascend/quantization/methods/kv_nvfp4.py  |  64 ++++
+ vllm_ascend/worker/model_runner_v1.py         |  12 +
+ 8 files changed, 719 insertions(+)
+ create mode 100644 tests/ut/quantization/test_kv_cache_quant.py
+ create mode 100644 vllm_ascend/quantization/kv_cache_utils.py
+ create mode 100644 vllm_ascend/quantization/methods/kv_fp4_e2m1.py
+ create mode 100644 vllm_ascend/quantization/methods/kv_fp8_e4m3.py
+ create mode 100644 vllm_ascend/quantization/methods/kv_int4.py
+ create mode 100644 vllm_ascend/quantization/methods/kv_nvfp4.py
+
+diff --git a/tests/ut/quantization/test_kv_cache_quant.py b/tests/ut/quantization/test_kv_cache_quant.py
+new file mode 100644
+index 0000000000..b37c83ee6e
+--- /dev/null
++++ b/tests/ut/quantization/test_kv_cache_quant.py
+@@ -0,0 +1,334 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""Unit tests for KV cache quantization handlers.
++
++Tests cover the four KV cache quant methods (INT4, NVFP4, FP8_E4M3, FP4_E2M1)
++as well as the utility functions in ``kv_cache_utils``.
++
++These tests do NOT require NPU hardware.
++"""
++
++# ---------------------------------------------------------------------------
++# IMPORTANT: Mock torch_npu BEFORE any vllm/vllm_ascend imports.
++# The parent conftest (tests/ut/conftest.py) imports vllm_ascend which
++# requires torch_npu.  We use --noconftest to skip the parent conftest
++# and set up the mock here instead.
++# ---------------------------------------------------------------------------
++import importlib.machinery
++import os
++import sys
++import types
++from unittest.mock import MagicMock
++
++os.environ.setdefault("VLLM_VERSION", "0.19.1rc1")
++
++
++def _make_mock_module(name, attrs=None):
++    mod = types.ModuleType(name)
++    mod.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=True)
++    if attrs:
++        for k, v in attrs.items():
++            setattr(mod, k, v)
++    return mod
++
++
++_mock_torch_npu = _make_mock_module("torch_npu", attrs={
++    "is_available": MagicMock(return_value=False),
++    "Event": MagicMock(),
++    "Stream": MagicMock(),
++    "current_stream": MagicMock(return_value=MagicMock()),
++    "current_device": MagicMock(return_value=0),
++    "synchronize": MagicMock(),
++    "set_device": MagicMock(),
++    "device_count": MagicMock(return_value=0),
++    "mem_get_info": MagicMock(return_value=(0, 0)),
++    "get_device_name": MagicMock(return_value="MockNPU"),
++    "get_device_properties": MagicMock(),
++    "manual_seed_all": MagicMock(),
++    "reset_peak_memory_stats": MagicMock(),
++    "max_memory_allocated": MagicMock(return_value=0),
++    "empty_cache": MagicMock(),
++    "is_current_stream_capturing": MagicMock(return_value=False),
++    "set_compile_mode": MagicMock(),
++})
++sys.modules["torch_npu"] = _mock_torch_npu
++
++import torch  # noqa: E402
++torch.npu = _mock_torch_npu
++
++# Mock torchaudio to avoid libcudart.so loading errors
++sys.modules["torchaudio"] = _make_mock_module("torchaudio")
++
++import pytest  # noqa: E402
++
++from vllm_ascend.quantization.kv_cache_utils import (
++    get_kv_cache_scheme,
++    setup_kv_cache_quant,
++)
++from vllm_ascend.quantization.methods.kv_int4 import AscendKVCacheInt4Method
++from vllm_ascend.quantization.methods.kv_nvfp4 import AscendKVCacheNVFP4Method
++from vllm_ascend.quantization.methods.kv_fp8_e4m3 import AscendKVCacheFP8E4M3Method
++from vllm_ascend.quantization.methods.kv_fp4_e2m1 import AscendKVCacheFP4E2M1Method
++
++# ---------------------------------------------------------------------------
++# Helper
++# ---------------------------------------------------------------------------
++
++
++def _make_layer():
++    """Return a bare ``nn.Module`` to serve as a dummy attention layer."""
++    return torch.nn.Module()
++
++
++# ===========================================================================
++# AscendKVCacheInt4Method
++# ===========================================================================
++
++
++class TestAscendKVCacheInt4Method:
++
++    def test_create_weights_sets_uint8_dtype(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheInt4Method()
++        scheme.create_weights(layer)
++
++        assert layer.kv_cache_torch_dtype == torch.uint8
++        assert hasattr(layer, "k_cache_scale")
++        assert hasattr(layer, "v_cache_scale")
++        assert isinstance(layer.k_cache_scale, torch.nn.Parameter)
++        assert isinstance(layer.v_cache_scale, torch.nn.Parameter)
++
++    def test_apply_raises_runtime_error(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheInt4Method()
++        dummy = torch.zeros(1)
++
++        with pytest.raises(RuntimeError) as exc_info:
++            scheme.apply(layer, dummy, dummy, dummy, None, None, None, None, None)
++
++        assert "AscendKVCacheInt4Method.apply" in str(exc_info.value)
++        assert "KV_INT4" in str(exc_info.value)
++
++    def test_process_weights_after_loading_flattens_scales(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheInt4Method()
++        scheme.create_weights(layer)
++
++        # Manually reshape scales to 2D to verify flattening
++        layer.k_cache_scale.data = layer.k_cache_scale.data.view(1, 1)
++        layer.v_cache_scale.data = layer.v_cache_scale.data.view(1, 1)
++
++        scheme.process_weights_after_loading(layer)
++
++        assert layer.k_cache_scale.data.dim() == 1
++        assert layer.v_cache_scale.data.dim() == 1
++
++
++# ===========================================================================
++# AscendKVCacheNVFP4Method
++# ===========================================================================
++
++
++class TestAscendKVCacheNVFP4Method:
++
++    def test_create_weights_sets_uint8_dtype(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheNVFP4Method()
++        scheme.create_weights(layer)
++
++        assert layer.kv_cache_torch_dtype == torch.uint8
++
++    def test_create_weights_does_not_add_scales(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheNVFP4Method()
++        scheme.create_weights(layer)
++
++        assert not hasattr(layer, "k_cache_scale")
++        assert not hasattr(layer, "v_cache_scale")
++
++    def test_apply_raises_runtime_error(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheNVFP4Method()
++        dummy = torch.zeros(1)
++
++        with pytest.raises(RuntimeError) as exc_info:
++            scheme.apply(layer, dummy, dummy, dummy, None, None, None, None, None)
++
++        assert "AscendKVCacheNVFP4Method.apply" in str(exc_info.value)
++        assert "KV_NVFP4" in str(exc_info.value)
++
++    def test_process_weights_after_loading_is_noop(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheNVFP4Method()
++        scheme.create_weights(layer)
++
++        # Should not raise
++        scheme.process_weights_after_loading(layer)
++
++
++# ===========================================================================
++# AscendKVCacheFP8E4M3Method
++# ===========================================================================
++
++
++class TestAscendKVCacheFP8E4M3Method:
++
++    def test_create_weights_sets_fp8_dtype(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP8E4M3Method()
++        scheme.create_weights(layer)
++
++        assert layer.kv_cache_torch_dtype == torch.float8_e4m3fn
++        assert hasattr(layer, "k_cache_scale")
++        assert hasattr(layer, "v_cache_scale")
++        assert isinstance(layer.k_cache_scale, torch.nn.Parameter)
++        assert isinstance(layer.v_cache_scale, torch.nn.Parameter)
++
++    def test_apply_raises_runtime_error(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP8E4M3Method()
++        dummy = torch.zeros(1)
++
++        with pytest.raises(RuntimeError) as exc_info:
++            scheme.apply(layer, dummy, dummy, dummy, None, None, None, None, None)
++
++        assert "AscendKVCacheFP8E4M3Method.apply" in str(exc_info.value)
++        assert "KV_FP8_E4M3" in str(exc_info.value)
++
++    def test_process_weights_after_loading_flattens_scales(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP8E4M3Method()
++        scheme.create_weights(layer)
++
++        layer.k_cache_scale.data = layer.k_cache_scale.data.view(1, 1)
++        layer.v_cache_scale.data = layer.v_cache_scale.data.view(1, 1)
++
++        scheme.process_weights_after_loading(layer)
++
++        assert layer.k_cache_scale.data.dim() == 1
++        assert layer.v_cache_scale.data.dim() == 1
++
++
++# ===========================================================================
++# AscendKVCacheFP4E2M1Method
++# ===========================================================================
++
++
++class TestAscendKVCacheFP4E2M1Method:
++
++    def test_create_weights_sets_uint8_dtype(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP4E2M1Method()
++        scheme.create_weights(layer)
++
++        assert layer.kv_cache_torch_dtype == torch.uint8
++
++    def test_create_weights_does_not_add_scales(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP4E2M1Method()
++        scheme.create_weights(layer)
++
++        assert not hasattr(layer, "k_cache_scale")
++        assert not hasattr(layer, "v_cache_scale")
++
++    def test_apply_raises_runtime_error(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP4E2M1Method()
++        dummy = torch.zeros(1)
++
++        with pytest.raises(RuntimeError) as exc_info:
++            scheme.apply(layer, dummy, dummy, dummy, None, None, None, None, None)
++
++        assert "AscendKVCacheFP4E2M1Method.apply" in str(exc_info.value)
++        assert "KV_FP4_E2M1" in str(exc_info.value)
++
++    def test_process_weights_after_loading_is_noop(self):
++        layer = _make_layer()
++        scheme = AscendKVCacheFP4E2M1Method()
++        scheme.create_weights(layer)
++
++        # Should not raise
++        scheme.process_weights_after_loading(layer)
++
++
++# ===========================================================================
++# kv_cache_utils
++# ===========================================================================
++
++
++class TestKVCacheUtils:
++
++    # -- get_kv_cache_scheme -------------------------------------------------
++
++    @pytest.mark.parametrize("dtype,expected_cls", [
++        ("int4", AscendKVCacheInt4Method),
++        ("nvfp4", AscendKVCacheNVFP4Method),
++        ("fp8_e4m3", AscendKVCacheFP8E4M3Method),
++        ("fp4_e2m1", AscendKVCacheFP4E2M1Method),
++    ])
++    def test_get_kv_cache_scheme_returns_correct_type(self, dtype, expected_cls):
++        """For each known dtype string, ``get_kv_cache_scheme`` returns a
++        non-None instance of the correct handler class."""
++        scheme = get_kv_cache_scheme(dtype)
++        assert scheme is not None
++        assert isinstance(scheme, expected_cls)
++
++    @pytest.mark.parametrize("unknown_dtype", ["auto", "float16", "bfloat16", "foo", ""])
++    def test_get_kv_cache_scheme_returns_none_for_unknown(self, unknown_dtype):
++        """Unknown or unquantized dtype strings return ``None``."""
++        assert get_kv_cache_scheme(unknown_dtype) is None
++
++    # -- setup_kv_cache_quant ------------------------------------------------
++
++    @pytest.mark.parametrize("dtype", ["int4", "nvfp4", "fp8_e4m3", "fp4_e2m1"])
++    def test_setup_kv_cache_quant_sets_up_layer(self, dtype):
++        """For quantized dtypes, the layer is set up with ``kv_cache_torch_dtype``."""
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, dtype)
++        assert hasattr(layer, "kv_cache_torch_dtype")
++
++    def test_setup_kv_cache_quant_sets_expected_dtype_for_int4(self):
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, "int4")
++        assert layer.kv_cache_torch_dtype == torch.uint8
++
++    def test_setup_kv_cache_quant_sets_expected_dtype_for_nvfp4(self):
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, "nvfp4")
++        assert layer.kv_cache_torch_dtype == torch.uint8
++
++    def test_setup_kv_cache_quant_sets_expected_dtype_for_fp8_e4m3(self):
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, "fp8_e4m3")
++        assert layer.kv_cache_torch_dtype == torch.float8_e4m3fn
++
++    def test_setup_kv_cache_quant_sets_expected_dtype_for_fp4_e2m1(self):
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, "fp4_e2m1")
++        assert layer.kv_cache_torch_dtype == torch.uint8
++
++    @pytest.mark.parametrize("noop_dtype", ["auto", "float16", "bfloat16"])
++    def test_setup_kv_cache_quant_noop_for_non_quantized(self, noop_dtype):
++        """Non-quantized dtypes should be a no-op — the layer is not modified."""
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, noop_dtype)
++        assert not hasattr(layer, "kv_cache_torch_dtype")
++
++    def test_setup_kv_cache_quant_noop_for_empty_string(self):
++        layer = _make_layer()
++        setup_kv_cache_quant(layer, "")
++        assert not hasattr(layer, "kv_cache_torch_dtype")
+\ No newline at end of file
+diff --git a/vllm_ascend/quantization/kv_cache_utils.py b/vllm_ascend/quantization/kv_cache_utils.py
+new file mode 100644
+index 0000000000..785d46f559
+--- /dev/null
++++ b/vllm_ascend/quantization/kv_cache_utils.py
+@@ -0,0 +1,100 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""KV cache quantization utilities for Ascend NPU.
++
++This module provides a lightweight dispatch mechanism for ``--kv-cache-dtype``
++based KV cache quantization. It is *not* used for model-level quantization
++schemes (e.g. C8/QuaRot), which have their own path through
++:class:`AscendKVCacheMethod` in :mod:`vllm_ascend.quantization.method_adapters`.
++
++Usage::
++
++    from vllm_ascend.quantization.kv_cache_utils import get_kv_cache_scheme
++
++    scheme = get_kv_cache_scheme("int4")
++    if scheme is not None:
++        scheme.create_weights(layer)
++"""
++
++import torch
++from vllm.logger import init_logger
++
++from .methods import get_scheme_class
++
++logger = init_logger(__name__)
++
++#: Mapping from ``cache_dtype`` strings to scheme registration keys.
++#: Each entry ``"<cache_dtype>" → "<KV_<DTYPE>", "attention">`` so that
++#: :func:`get_scheme_class` can look up the corresponding handler.
++_CACHE_DTYPE_TO_SCHEME_KEY: dict[str, str] = {
++    "int4": "KV_INT4",
++    "nvfp4": "KV_NVFP4",
++    "fp8_e4m3": "KV_FP8_E4M3",
++    "fp4_e2m1": "KV_FP4_E2M1",
++}
++
++
++def get_kv_cache_scheme(cache_dtype: str):
++    """Return the registered KV cache scheme for *cache_dtype*, or ``None``.
++
++    Args:
++        cache_dtype: The ``cache_dtype`` string from ``--kv-cache-dtype``
++            (e.g. ``"int4"``, ``"nvfp4"``).
++
++    Returns:
++        An :class:`AscendAttentionScheme` subclass instance, or ``None``
++        if no scheme is registered for the given dtype.
++    """
++    scheme_key = _CACHE_DTYPE_TO_SCHEME_KEY.get(cache_dtype)
++    if scheme_key is None:
++        return None
++    scheme_cls = get_scheme_class(scheme_key, "attention")
++    if scheme_cls is None:
++        logger.warning(
++            "No KV cache scheme registered for '--kv-cache-dtype %s' "
++            "(scheme_key=%s). Falling back to unquantized path.",
++            cache_dtype,
++            scheme_key,
++        )
++        return None
++    return scheme_cls()
++
++
++def setup_kv_cache_quant(layer: torch.nn.Module, cache_dtype: str) -> None:
++    """Set up KV cache quantization on *layer* for the given *cache_dtype*.
++
++    This is called by the model runner after creating attention layers.
++    If *cache_dtype* is not a quantized dtype known to this plugin, the
++    call is a no-op.
++
++    Args:
++        layer: The attention layer (:class:`AttentionLayer` or subclass).
++        cache_dtype: The ``cache_dtype`` string from ``--kv-cache-dtype``.
++    """
++    if not cache_dtype or cache_dtype in ("auto", "float16", "bfloat16"):
++        return
++
++    scheme = get_kv_cache_scheme(cache_dtype)
++    if scheme is None:
++        return
++
++    scheme.create_weights(layer)
++    logger.info(
++        "KV cache quantization enabled: dtype=%s, scheme=%s",
++        cache_dtype,
++        type(scheme).__name__,
++    )
+\ No newline at end of file
+diff --git a/vllm_ascend/quantization/methods/__init__.py b/vllm_ascend/quantization/methods/__init__.py
+index d5f77d2044..e09f53d23c 100644
+--- a/vllm_ascend/quantization/methods/__init__.py
++++ b/vllm_ascend/quantization/methods/__init__.py
+@@ -35,6 +35,10 @@ from .base import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, Qu
+ # Import all scheme classes for external access
+ from .fp8 import AscendW4A8MXFPDSDynamicFusedMoEMethod, AscendW8A8MXFP8DSDynamicLinearMethod
+ from .kv_c8 import AscendFAQuantAttentionMethod
++from .kv_fp4_e2m1 import AscendKVCacheFP4E2M1Method
++from .kv_fp8_e4m3 import AscendKVCacheFP8E4M3Method
++from .kv_int4 import AscendKVCacheInt4Method
++from .kv_nvfp4 import AscendKVCacheNVFP4Method
+ 
+ # Import registry functions
+ from .registry import get_scheme_class, register_scheme
+@@ -93,6 +97,10 @@ __all__ = [
+     "AscendW4A4FlatQuantDynamicLinearMethod",
+     "AscendW4A4LaosDynamicLinearMethod",
+     "AscendFAQuantAttentionMethod",
++    "AscendKVCacheInt4Method",
++    "AscendKVCacheNVFP4Method",
++    "AscendKVCacheFP8E4M3Method",
++    "AscendKVCacheFP4E2M1Method",
+     "AscendW4A4MXFP4DynamicLinearMethod",
+     "AscendW4A4MXFP4DynamicFusedMoEMethod",
+     "AscendW4A4MXFP4FlatQuantDynamicLinearMethod",
+diff --git a/vllm_ascend/quantization/methods/kv_fp4_e2m1.py b/vllm_ascend/quantization/methods/kv_fp4_e2m1.py
+new file mode 100644
+index 0000000000..934b4ef5b6
+--- /dev/null
++++ b/vllm_ascend/quantization/methods/kv_fp4_e2m1.py
+@@ -0,0 +1,64 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""FP4 E2M1 KV cache quantization for dense-attention models."""
++
++import torch
++
++from vllm.logger import init_logger
++
++from .base import AscendAttentionScheme
++from .registry import register_scheme
++
++logger = init_logger(__name__)
++
++
++@register_scheme("KV_FP4_E2M1", "attention")
++class AscendKVCacheFP4E2M1Method(AscendAttentionScheme):
++    """FP4 E2M1 KV cache quantization for dense-attention models.
++
++    Uses block microscaling (MXFP4) format where tensors are divided into
++    blocks of 16 elements, each sharing a single fp8 exponential scaling factor.
++    """
++
++    def __init__(self, quant_description: dict | None = None, prefix: str | None = None):
++        self.quant_description = quant_description or {}
++        self.prefix = prefix or ""
++
++    def create_weights(self, layer: torch.nn.Module) -> None:
++        layer.kv_cache_torch_dtype = torch.uint8
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        pass
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache,
++        attn_metadata,
++        attn_type,
++        scale,
++        output,
++    ) -> torch.Tensor:
++        err_msg = (
++            "[vllm-ascend/KV_FP4_E2M1] AscendKVCacheFP4E2M1Method.apply should "
++            "not be called. FP4 E2M1 KV cache quantization is handled by the "
++            "attention backend."
++        )
++        raise RuntimeError(err_msg)
+\ No newline at end of file
+diff --git a/vllm_ascend/quantization/methods/kv_fp8_e4m3.py b/vllm_ascend/quantization/methods/kv_fp8_e4m3.py
+new file mode 100644
+index 0000000000..d8baad7740
+--- /dev/null
++++ b/vllm_ascend/quantization/methods/kv_fp8_e4m3.py
+@@ -0,0 +1,68 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""FP8 E4M3 KV cache quantization for dense-attention models."""
++
++import torch
++
++from vllm.logger import init_logger
++
++from .base import AscendAttentionScheme
++from .registry import register_scheme
++
++logger = init_logger(__name__)
++
++
++@register_scheme("KV_FP8_E4M3", "attention")
++class AscendKVCacheFP8E4M3Method(AscendAttentionScheme):
++    """FP8 E4M3 KV cache quantization for dense-attention models.
++
++    Uses per-tensor scaling with FP8 E4M3 storage format.
++    Supports both static (checkpoint-loaded) and dynamic (computed) scales.
++    """
++
++    def __init__(self, quant_description: dict | None = None, prefix: str | None = None):
++        self.quant_description = quant_description or {}
++        self.prefix = prefix or ""
++
++    def create_weights(self, layer: torch.nn.Module) -> None:
++        layer.kv_cache_torch_dtype = torch.float8_e4m3fn
++        dtype = torch.get_default_dtype()
++        layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
++        layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        layer.k_cache_scale.data = layer.k_cache_scale.data.flatten()
++        layer.v_cache_scale.data = layer.v_cache_scale.data.flatten()
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache,
++        attn_metadata,
++        attn_type,
++        scale,
++        output,
++    ) -> torch.Tensor:
++        err_msg = (
++            "[vllm-ascend/KV_FP8_E4M3] AscendKVCacheFP8E4M3Method.apply should "
++            "not be called. FP8 E4M3 KV cache quantization is handled by the "
++            "attention backend."
++        )
++        raise RuntimeError(err_msg)
+\ No newline at end of file
+diff --git a/vllm_ascend/quantization/methods/kv_int4.py b/vllm_ascend/quantization/methods/kv_int4.py
+new file mode 100644
+index 0000000000..18917854db
+--- /dev/null
++++ b/vllm_ascend/quantization/methods/kv_int4.py
+@@ -0,0 +1,69 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""INT4 KV cache quantization for dense-attention models."""
++
++import torch
++
++from vllm.logger import init_logger
++
++from .base import AscendAttentionScheme
++from .registry import register_scheme
++
++logger = init_logger(__name__)
++
++
++@register_scheme("KV_INT4", "attention")
++class AscendKVCacheInt4Method(AscendAttentionScheme):
++    """INT4 KV cache quantization for dense-attention models.
++
++    Uses per-token-head dynamic quantization with symmetric scale.
++    Each token-head pair computes its own scale, and the INT4 data
++    is packed as 2×int4 per byte.
++    """
++
++    def __init__(self, quant_description: dict | None = None, prefix: str | None = None):
++        self.quant_description = quant_description or {}
++        self.prefix = prefix or ""
++
++    def create_weights(self, layer: torch.nn.Module) -> None:
++        layer.kv_cache_torch_dtype = torch.uint8
++        dtype = torch.get_default_dtype()
++        layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
++        layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        layer.k_cache_scale.data = layer.k_cache_scale.data.flatten()
++        layer.v_cache_scale.data = layer.v_cache_scale.data.flatten()
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache,
++        attn_metadata,
++        attn_type,
++        scale,
++        output,
++    ) -> torch.Tensor:
++        err_msg = (
++            "[vllm-ascend/KV_INT4] AscendKVCacheInt4Method.apply should "
++            "not be called. INT4 KV cache quantization is handled by the "
++            "attention backend."
++        )
++        raise RuntimeError(err_msg)
+\ No newline at end of file
+diff --git a/vllm_ascend/quantization/methods/kv_nvfp4.py b/vllm_ascend/quantization/methods/kv_nvfp4.py
+new file mode 100644
+index 0000000000..c28ba644ad
+--- /dev/null
++++ b/vllm_ascend/quantization/methods/kv_nvfp4.py
+@@ -0,0 +1,64 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""NVFP4 KV cache quantization for dense-attention models."""
++
++import torch
++
++from vllm.logger import init_logger
++
++from .base import AscendAttentionScheme
++from .registry import register_scheme
++
++logger = init_logger(__name__)
++
++
++@register_scheme("KV_NVFP4", "attention")
++class AscendKVCacheNVFP4Method(AscendAttentionScheme):
++    """NVFP4 KV cache quantization for dense-attention models.
++
++    Uses packed fp4 data + fp8 block scales format.
++    Each block of 16 fp4 elements shares a single fp8 scale factor.
++    """
++
++    def __init__(self, quant_description: dict | None = None, prefix: str | None = None):
++        self.quant_description = quant_description or {}
++        self.prefix = prefix or ""
++
++    def create_weights(self, layer: torch.nn.Module) -> None:
++        layer.kv_cache_torch_dtype = torch.uint8
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        pass
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache,
++        attn_metadata,
++        attn_type,
++        scale,
++        output,
++    ) -> torch.Tensor:
++        err_msg = (
++            "[vllm-ascend/KV_NVFP4] AscendKVCacheNVFP4Method.apply should "
++            "not be called. NVFP4 KV cache quantization is handled by the "
++            "attention backend."
++        )
++        raise RuntimeError(err_msg)
+\ No newline at end of file
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 05141e561e..880589943b 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -3778,6 +3778,18 @@ class NPUModelRunner(GPUModelRunner):
+                 if "sink" in name:
+                     self._has_sinks = True
+                     break
++
++            # Set up KV cache quantization for --kv-cache-dtype based schemes
++            # (int4, nvfp4, fp8_e4m3, fp4_e2m1). This must happen after model
++            # loading so that attention layers exist, but before any inference.
++            from vllm.model_executor.layers.attention import Attention
++            from vllm_ascend.quantization.kv_cache_utils import setup_kv_cache_quant
++
++            cache_dtype = self.vllm_config.cache_config.cache_dtype
++            if cache_dtype in ("int4", "nvfp4", "fp8_e4m3", "fp4_e2m1"):
++                for _name, module in self.model.named_modules():
++                    if isinstance(module, Attention):
++                        setup_kv_cache_quant(module, cache_dtype)
+             if self.drafter:
+                 logger.info("Loading drafter model...")
+                 if self.vllm_config.quant_config is not None:
+-- 
+2.53.0.windows.3
+

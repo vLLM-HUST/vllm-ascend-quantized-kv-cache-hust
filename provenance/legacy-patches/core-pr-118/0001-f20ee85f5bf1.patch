@@ -1,0 +1,25 @@
+From f20ee85f5bf1557740c7c7175b448b1940ec813d Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Mon, 8 Jun 2026 07:21:54 +0000
+Subject: [PATCH] feat: add 'int8' to CacheDType for int8 KV cache without
+ scale padding
+
+---
+ vllm/config/cache.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index ae5023f1e..dd4d500d9 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -31,6 +31,7 @@ CacheDType = Literal[
+     "int8_per_token_head",
+     "fp8_per_token_head",
+     "nvfp4",
++    "int8",                   # ★ 加这行
+ ]
+ MambaDType = Literal["auto", "float32", "float16"]
+ MambaCacheMode = Literal["all", "align", "none"]
+-- 
+2.53.0.windows.3
+

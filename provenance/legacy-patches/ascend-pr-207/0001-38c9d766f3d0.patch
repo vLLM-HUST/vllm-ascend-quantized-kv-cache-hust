@@ -1,0 +1,467 @@
+From 38c9d766f3d09b964f29493622be525e7c07974f Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Tue, 4 Aug 2026 15:28:19 +0000
+Subject: [PATCH] [Feature][Quantization] Align upstream experts_int8 with NPU
+ INT8 cube
+
+Upstream experts_int8 quantization only supports the TRITON MoE backend,
+which does not run on Ascend NPU. Add AscendW8A8OnlineFusedMoEMethod that
+loads fp16/bf16 expert weights and quantizes them per-row to int8 during
+process_weights_after_loading, then reuses the W8A8_DYNAMIC MoE path so
+execution dispatches to the NPU INT8 cube unit
+(npu_grouped_matmul_swiglu_quant). Linear layers are left unquantized,
+matching upstream semantics.
+
+A platform patch overrides ExpertsInt8Config.get_quant_method to route
+FusedMoE layers to the new scheme, so --quantization experts_int8 works
+out of the box on NPU. Unit tests cover scheme registration, weight
+loading dtype, per-row quantization correctness, post-loading weight
+swap, and the patch routing behavior.
+
+Co-authored-by: GLM-5.2
+---
+ .../patch/platform/test_patch_experts_int8.py |  68 +++++++++
+ tests/ut/quantization/test_w8a8_online.py     | 130 ++++++++++++++++++
+ vllm_ascend/patch/platform/__init__.py        |   2 +
+ .../patch/platform/patch_experts_int8.py      |  64 +++++++++
+ vllm_ascend/quantization/methods/__init__.py  |   2 +
+ .../quantization/methods/w8a8_online.py       | 112 +++++++++++++++
+ 6 files changed, 378 insertions(+)
+ create mode 100644 tests/ut/patch/platform/test_patch_experts_int8.py
+ create mode 100644 tests/ut/quantization/test_w8a8_online.py
+ create mode 100644 vllm_ascend/patch/platform/patch_experts_int8.py
+ create mode 100644 vllm_ascend/quantization/methods/w8a8_online.py
+
+diff --git a/tests/ut/patch/platform/test_patch_experts_int8.py b/tests/ut/patch/platform/test_patch_experts_int8.py
+new file mode 100644
+index 0000000000..0a0c2d5ec7
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_experts_int8.py
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++from vllm.model_executor.layers.fused_moe import MoERunner
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
++
++# Importing the patch module applies the monkey-patch on ExpertsInt8Config.
++from vllm_ascend.patch.platform import patch_experts_int8  # noqa: F401
++from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
++from vllm_ascend.quantization.methods.w8a8_online import (
++    AscendW8A8OnlineFusedMoEMethod,
++)
++
++
++@pytest.fixture(autouse=True)
++def _patch_online_scheme_deps():
++    mocks = [
++        patch(
++            "vllm_ascend.quantization.methods.w8a8_dynamic.get_mc2_group",
++            return_value=Mock(device_group=Mock()),
++        ),
++        patch("torch.distributed.get_rank", return_value=0),
++        patch(
++            "vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config",
++            return_value=Mock(
++                multistream_overlap_gate=False,
++                eplb_config=Mock(dynamic_eplb=False),
++                enable_fused_mc2=0,
++            ),
++        ),
++        patch(
++            "vllm_ascend.quantization.methods.w8a8_dynamic.get_current_vllm_config",
++            return_value=Mock(
++                model_config=Mock(dtype=torch.float16, enforce_eager=True),
++                compilation_config=Mock(mode=Mock()),
++            ),
++        ),
++    ]
++    for m in mocks:
++        m.start()
++    yield
++    for m in mocks:
++        m.stop()
++
++
++def test_linear_layer_left_unquantized():
++    layer = Mock(spec=LinearBase)
++    method = ExpertsInt8Config().get_quant_method(layer, prefix="model.layers.0.mlp.gate_proj")
++    assert isinstance(method, UnquantizedLinearMethod)
++
++
++def test_fused_moe_routes_to_ascend_online_int8():
++    layer = Mock(spec=MoERunner)
++    layer.moe_config = Mock()
++    method = ExpertsInt8Config().get_quant_method(layer, prefix="model.layers.0.mlp")
++    assert isinstance(method, AscendFusedMoEMethod)
++    assert isinstance(method.quant_method, AscendW8A8OnlineFusedMoEMethod)
++
++
++def test_unsupported_layer_returns_none():
++    # A plain object is neither LinearBase nor MoERunner.
++    layer = torch.nn.Module()
++    method = ExpertsInt8Config().get_quant_method(layer, prefix="foo")
++    assert method is None
+diff --git a/tests/ut/quantization/test_w8a8_online.py b/tests/ut/quantization/test_w8a8_online.py
+new file mode 100644
+index 0000000000..6a1494255e
+--- /dev/null
++++ b/tests/ut/quantization/test_w8a8_online.py
+@@ -0,0 +1,130 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from unittest.mock import Mock, patch
++
++import torch
++
++from tests.ut.base import TestBase
++from vllm_ascend.quantization.methods.base import AscendMoEScheme, QuantType
++from vllm_ascend.quantization.methods.registry import get_scheme_class
++from vllm_ascend.quantization.methods.w8a8_dynamic import (
++    AscendW8A8DynamicFusedMoEMethod,
++)
++from vllm_ascend.quantization.methods.w8a8_online import (
++    AscendW8A8OnlineFusedMoEMethod,
++)
++
++
++class TestAscendW8A8OnlineFusedMoEMethod(TestBase):
++    num_experts = 4
++    hidden_size = 32
++    intermediate_size = 64
++
++    @patch("torch.distributed.get_rank")
++    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_mc2_group")
++    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config")
++    def setUp(self, mock_get_ascend_config, mock_get_mc2_group, mock_get_rank):
++        with patch(
++            "vllm_ascend.quantization.methods.w8a8_dynamic.get_current_vllm_config"
++        ) as mock_get_current_vllm_config:
++            mock_vllm_config = Mock()
++            mock_vllm_config.model_config.dtype = torch.float16
++            mock_vllm_config.model_config.enforce_eager = True
++            mock_vllm_config.compilation_config.mode = Mock()
++            mock_get_current_vllm_config.return_value = mock_vllm_config
++            mock_ascend_config = Mock()
++            mock_ascend_config.multistream_overlap_gate = False
++            mock_ascend_config.eplb_config = Mock(dynamic_eplb=False)
++            mock_ascend_config.enable_fused_mc2 = 0
++            mock_get_ascend_config.return_value = mock_ascend_config
++            mock_get_mc2_group.return_value = Mock(device_group=Mock())
++            mock_get_rank.return_value = 0
++            self.quant_method = AscendW8A8OnlineFusedMoEMethod()
++
++    def test_is_registered_as_w8a8_online_moe(self):
++        cls = get_scheme_class("W8A8_ONLINE", "moe")
++        self.assertIs(cls, AscendW8A8OnlineFusedMoEMethod)
++
++    def test_subclasses_dynamic_moe(self):
++        self.assertTrue(issubclass(AscendW8A8OnlineFusedMoEMethod, AscendW8A8DynamicFusedMoEMethod))
++        self.assertTrue(issubclass(AscendW8A8OnlineFusedMoEMethod, AscendMoEScheme))
++        self.assertEqual(self.quant_method.quant_type, QuantType.W8A8)
++
++    def test_get_weight_loads_floating_point(self):
++        # Online int8 loads fp16/bf16 weights (not int8) so they can be
++        # quantized during process_weights_after_loading.
++        for dtype in (torch.float16, torch.bfloat16):
++            param_dict = self.quant_method.get_weight(self.num_experts, self.intermediate_size, self.hidden_size, dtype)
++            self.assertEqual(param_dict["w13_weight"].dtype, dtype)
++            self.assertEqual(param_dict["w2_weight"].dtype, dtype)
++            self.assertEqual(
++                param_dict["w13_weight"].shape, (self.num_experts, 2 * self.intermediate_size, self.hidden_size)
++            )
++            self.assertEqual(
++                param_dict["w2_weight"].shape, (self.num_experts, self.hidden_size, self.intermediate_size)
++            )
++
++    def test_quantize_per_row_produces_int8_and_scale(self):
++        torch.manual_seed(0)
++        w = torch.randn(2, 5, 8, dtype=torch.float32)
++        q, scale = AscendW8A8OnlineFusedMoEMethod._quantize_per_row(w)
++        self.assertEqual(q.dtype, torch.int8)
++        self.assertEqual(q.shape, w.shape)
++        self.assertEqual(scale.shape, (2, 5, 1))
++        self.assertTrue(q.abs().max().item() <= 127)
++        # Dequantization error must be small for per-row symmetric quant.
++        deq = q.to(torch.float32) * scale
++        self.assertLess((deq - w).abs().max().item(), 0.5)
++
++    def test_quantize_per_row_zero_row_no_nan(self):
++        w = torch.zeros(1, 3, 4, dtype=torch.float32)
++        q, _ = AscendW8A8OnlineFusedMoEMethod._quantize_per_row(w)
++        self.assertFalse(torch.isnan(q.to(torch.float32)).any())
++
++    def _build_fp16_layer(self):
++        layer = torch.nn.Module()
++        layer.w13_weight = torch.nn.Parameter(
++            torch.randn(self.num_experts, 2 * self.intermediate_size, self.hidden_size, dtype=torch.float16),
++            requires_grad=False,
++        )
++        layer.w2_weight = torch.nn.Parameter(
++            torch.randn(self.num_experts, self.hidden_size, self.intermediate_size, dtype=torch.float16),
++            requires_grad=False,
++        )
++        layer.w13_weight_scale = torch.nn.Parameter(
++            torch.empty(self.num_experts, 2 * self.intermediate_size, 1, dtype=torch.float16), requires_grad=False
++        )
++        layer.w13_weight_offset = torch.nn.Parameter(
++            torch.empty(self.num_experts, 2 * self.intermediate_size, 1, dtype=torch.float16), requires_grad=False
++        )
++        layer.w2_weight_scale = torch.nn.Parameter(
++            torch.empty(self.num_experts, self.hidden_size, 1, dtype=torch.float16), requires_grad=False
++        )
++        layer.w2_weight_offset = torch.nn.Parameter(
++            torch.empty(self.num_experts, self.hidden_size, 1, dtype=torch.float16), requires_grad=False
++        )
++        return layer
++
++    @patch("torch_npu.npu_format_cast")
++    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config")
++    def test_process_weights_quantizes_fp16_to_int8(self, mock_get_ascend_config, mock_npu_format_cast):
++        mock_get_ascend_config.return_value = Mock(enable_fused_mc2=0)
++        mock_npu_format_cast.side_effect = lambda weight, _: weight
++
++        layer = self._build_fp16_layer()
++        w13_fp16 = layer.w13_weight.data.clone()
++        self.quant_method.process_weights_after_loading(layer)
++
++        # Weights must be quantized to int8 after loading.
++        self.assertEqual(layer.w13_weight.data.dtype, torch.int8)
++        self.assertEqual(layer.w2_weight.data.dtype, torch.int8)
++        # Per-channel scales must be populated and flattened.
++        self.assertEqual(layer.w13_weight_scale_fp32.shape, (self.num_experts, 2 * self.intermediate_size))
++        # Symmetric quantization -> offset is zero.
++        self.assertTrue(torch.equal(layer.w13_weight_offset.data, torch.zeros_like(layer.w13_weight_offset.data)))
++        # NZ format cast must have been invoked for W8A8.
++        mock_npu_format_cast.assert_called()
++        # Sanity: dequantized weights approximate the original fp16 weights.
++        deq = layer.w13_weight.data.to(torch.float32) * layer.w13_weight_scale_fp32.data.unsqueeze(1).to(torch.float32)
++        max_err = (deq - w13_fp16.transpose(1, 2).to(torch.float32)).abs().max().item()
++        self.assertLess(max_err, 0.5)
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index 82b7fcd661..98c7c03f8b 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -46,5 +46,7 @@ import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
+ import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
+ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
+ 
++import vllm_ascend.patch.platform.patch_experts_int8  # noqa
++
+ if not vllm_version_is("0.23.0"):
+     import vllm_ascend.patch.platform.patch_fused_moe  # noqa
+diff --git a/vllm_ascend/patch/platform/patch_experts_int8.py b/vllm_ascend/patch/platform/patch_experts_int8.py
+new file mode 100644
+index 0000000000..dfccca9ee3
+--- /dev/null
++++ b/vllm_ascend/patch/platform/patch_experts_int8.py
+@@ -0,0 +1,64 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++# Patch upstream experts_int8 to route MoE experts to the Ascend NPU
++# INT8 cube unit.
++#
++# vLLM's ExpertsInt8Config selects a TRITON-only MoE backend
++# (select_int8_moe_backend) that does not run on Ascend. On NPU we
++# override get_quant_method so that --quantization experts_int8
++# loads fp16/bf16 expert weights and quantizes them online to int8,
++# executing via npu_grouped_matmul_swiglu_quant (the W8A8_DYNAMIC MoE
++# path exposed by AscendW8A8OnlineFusedMoEMethod).
++#
++# Linear layers are left unquantized, matching upstream semantics.
++
++import torch
++from vllm.model_executor.layers.fused_moe import FusedMoE, MoERunner
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
++from vllm.version import __version__ as VLLM_VERSION
++
++from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
++from vllm_ascend.quantization.methods.w8a8_online import (
++    AscendW8A8OnlineFusedMoEMethod,
++)
++
++
++def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
++    # vLLM 0.23.0 exposes FusedMoE as a class; newer versions replace it with
++    # the MoERunner factory function, so isinstance must target MoERunner.
++    if VLLM_VERSION.startswith("0.23.0"):
++        return isinstance(layer, FusedMoE)
++    return isinstance(layer, MoERunner)
++
++
++def get_quant_method(self, layer: torch.nn.Module, prefix: str):
++    """Route experts_int8 layers to Ascend NPU kernels.
++
++    - LinearBase: left unquantized (matches upstream experts_int8).
++    - FusedMoE: online per-row int8 quantization on the NPU INT8 cube.
++    """
++    if isinstance(layer, LinearBase):
++        return UnquantizedLinearMethod()
++    if _is_fused_moe_layer(layer):
++        scheme = AscendW8A8OnlineFusedMoEMethod()
++        return AscendFusedMoEMethod(scheme, layer.moe_config)
++    return None
++
++
++ExpertsInt8Config.get_quant_method = get_quant_method
+diff --git a/vllm_ascend/quantization/methods/__init__.py b/vllm_ascend/quantization/methods/__init__.py
+index d5f77d2044..a6b4178e5d 100644
+--- a/vllm_ascend/quantization/methods/__init__.py
++++ b/vllm_ascend/quantization/methods/__init__.py
+@@ -47,6 +47,7 @@ from .w4a8_mxfp4 import AscendW4A8MXFPDynamicFusedMoEMethod, AscendW4A8MXFPDynam
+ from .w4a16 import AscendW4A16FusedMoEMethod
+ from .w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod, AscendW8A8DynamicLinearMethod
+ from .w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
++from .w8a8_online import AscendW8A8OnlineFusedMoEMethod
+ from .w8a8_pdmix import AscendW8A8PDMixFusedMoeMethod, AscendW8A8PDMixLinearMethod
+ from .w8a8_static import AscendW8A8LinearMethod
+ from .w8a8fp8_dynamic import AscendW8A8FP8DynamicFusedMoEMethod, AscendW8A8FP8DynamicLinearMethod
+@@ -81,6 +82,7 @@ __all__ = [
+     "AscendW8A8LinearMethod",
+     "AscendW8A8DynamicLinearMethod",
+     "AscendW8A8DynamicFusedMoEMethod",
++    "AscendW8A8OnlineFusedMoEMethod",
+     "AscendW8A8FP8DynamicLinearMethod",
+     "AscendW8A8FP8DynamicFusedMoEMethod",
+     "AscendW8A8MXFP8DynamicLinearMethod",
+diff --git a/vllm_ascend/quantization/methods/w8a8_online.py b/vllm_ascend/quantization/methods/w8a8_online.py
+new file mode 100644
+index 0000000000..9c08250c54
+--- /dev/null
++++ b/vllm_ascend/quantization/methods/w8a8_online.py
+@@ -0,0 +1,112 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""W8A8 online int8 quantization for MoE experts on Ascend NPU.
++
++This scheme corresponds to upstream vLLM's experts_int8 quantization:
++expert weights are loaded as fp16/bf16 and quantized per-row to int8 during
++process_weights_after_loading, then executed on the NPU INT8 cube unit
++via npu_grouped_matmul_swiglu_quant (reusing the W8A8_DYNAMIC MoE path).
++Linear layers are left unquantized, matching upstream experts_int8.
++"""
++
++from typing import Any
++
++import torch
++from vllm.model_executor.utils import replace_parameter
++
++from .base import QuantType
++from .registry import register_scheme
++from .w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
++
++
++@register_scheme("W8A8_ONLINE", "moe")
++class AscendW8A8OnlineFusedMoEMethod(AscendW8A8DynamicFusedMoEMethod):
++    """Online per-row INT8 MoE quantization for Ascend NPU.
++
++    Loads fp16/bf16 expert weights and quantizes them per-row to int8 during
++    loading, mirroring upstream experts_int8 semantics. Forward
++    computation reuses the W8A8_DYNAMIC MoE path which dispatches to the NPU
++    INT8 cube unit (npu_grouped_matmul_swiglu_quant).
++    """
++
++    # Reuse the W8A8 INT8 cube path of the dynamic MoE scheme.
++    quant_type: QuantType = QuantType.W8A8
++
++    def get_weight(
++        self,
++        num_experts: int,
++        intermediate_size_per_partition: int,
++        hidden_sizes: int,
++        params_dtype: torch.dtype,
++    ) -> dict[str, Any]:
++        # Load weights in floating point so they can be quantized online.
++        # Upstream experts_int8 loads fp16/bf16 and quantizes per-row.
++        param_dict: dict[str, Any] = {}
++        param_dict["w13_weight"] = torch.empty(
++            num_experts,
++            2 * intermediate_size_per_partition,
++            hidden_sizes,
++            dtype=params_dtype,
++        )
++        param_dict["w2_weight"] = torch.empty(
++            num_experts,
++            hidden_sizes,
++            intermediate_size_per_partition,
++            dtype=params_dtype,
++        )
++        return param_dict
++
++    @staticmethod
++    def _quantize_per_row(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Per-row symmetric int8 quantization over the last dim.
++
++        Args:
++            weight: fp16/bf16 weight of shape [E, out_features, in_features].
++
++        Returns:
++            (int8_weight, weight_scale) where weight_scale has shape
++            [E, out_features, 1] and the same dtype as weight.
++        """
++        vmax = torch.iinfo(torch.int8).max
++        # Per output-channel symmetric scale over the input dim.
++        scales = weight.abs().amax(dim=-1) / vmax
++        # Guard against zero rows to avoid division by zero.
++        scales = torch.where(scales == 0, torch.ones_like(scales), scales)
++        q = weight.div(scales.unsqueeze(-1)).round().clamp(-vmax, vmax).to(torch.int8)
++        return q, scales.unsqueeze(-1).to(weight.dtype)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # Online quantize fp16/bf16 expert weights to int8 per-row (symmetric),
++        # matching upstream experts_int8 semantics.
++        w13_q, w13_scale = self._quantize_per_row(layer.w13_weight.data)
++        w2_q, w2_scale = self._quantize_per_row(layer.w2_weight.data)
++
++        # Swap fp16 params for int8 params (preserves weight_loader attrs).
++        replace_parameter(layer, "w13_weight", w13_q)
++        replace_parameter(layer, "w2_weight", w2_q)
++
++        # Fill the (empty) per-channel scale/offset params created by
++        # get_dynamic_quant_param. Symmetric quantization -> offset = 0.
++        layer.w13_weight_scale.data = w13_scale
++        layer.w2_weight_scale.data = w2_scale
++        layer.w13_weight_offset.data.zero_()
++        layer.w2_weight_offset.data.zero_()
++
++        # Delegate NZ format conversion + scale flattening to the parent
++        # (W8A8_DYNAMIC) implementation, which transposes the int8 weights
++        # to FRACTAL_NZ and prepares weight_scale_fp32 for the NPU kernel.
++        super().process_weights_after_loading(layer)
+-- 
+2.53.0.windows.3
+
