@@ -1,0 +1,25 @@
+name: Extension CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  package:
+    strategy:
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
+      - run: python -m pip install -e ".[test]" build
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+      - run: python -m build
+      - run: vllm-hust-ext extension inspect org.vllm-hust.quantized-kv-cache

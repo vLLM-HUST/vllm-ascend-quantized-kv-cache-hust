@@ -1,0 +1,34 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.quantized-kv-cache",
+  "extension_version": "0.1.0.dev0",
+  "kind": "in_process_plugin",
+  "host": {
+    "provider": "vllm",
+    "name": "vllm",
+    "version_range": ">=0"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {"name": "vllm.kv-cache.quantization.proposed", "version_range": null}
+  ],
+  "implementation": [
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache",
+      "object": "VllmAscendQuantizedKvCacheContractProposal",
+      "status": "import_only"
+    }
+  ],
+  "requires_services": [],
+  "activation": {
+    "entry_points": [],
+    "environment": {},
+    "additional_config": {}
+  }
+}
