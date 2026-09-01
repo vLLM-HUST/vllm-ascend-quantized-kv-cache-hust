@@ -1,0 +1,440 @@
+From b9fd52a5a6d6d497034ee9ebdd616c7559e7ed38 Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Mon, 8 Jun 2026 07:15:03 +0000
+Subject: [PATCH] feat: dynamic per-channel INT8 KV cache for Ascend NPU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add online scale calculation (amax dim=0) on first prefill
+- Add _forward_int8_decode ,_forward_int8_chunked_prefill,_forward_int8_prefill,_dequant_paged_kv_to_dense,_calc_int8_scales,_quantize_kv_to_int8(all in class AscendAttentionBackendImpl)
+- ...
+Verified: 36  PrefillNoCache 360K+ decode steps, 6K+ chunked prefill, 0 errors   ← 测试结果
+
+Co-authored-by: hust-cuiyujia
+---
+ vllm_ascend/attention/attention_v1.py | 341 +++++++++++++++++++++++++-
+ 1 file changed, 332 insertions(+), 9 deletions(-)
+
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index fa2559364..bf8c1f177 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -387,6 +387,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+         self.key_cache = None
+         self.value_cache = None
++        
++        # ★ 新增: INT8 静态 per-channel 量化
++        self.enable_int8 = (kv_cache_dtype == "int8")
++        self._int8_ready = False
++        self._k_inv_scale: torch.Tensor | None = None  # [1, num_kv_heads, head_size]
++        self._v_inv_scale: torch.Tensor | None = None
++        self._k_offset: torch.Tensor | None = None
++        self._v_offset: torch.Tensor | None = None
++        # 反量化参数 (BNSD 格式, 传给 NPU)
++        self._k_aq_scale = None
++        self._k_aq_offset = None
++        self._v_aq_scale = None
++        self._v_aq_offset = None
++        
++        # 只在首次计算
+         self.is_kv_producer = (
+             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
+         )
+@@ -607,6 +622,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         attn_mask = attn_metadata.attn_mask
+         sparse_mode = 3 if attn_metadata.causal else 0
+         extra_args = {}
++        
++        # ★ INT8 反量化
++        if self.enable_int8 and self._int8_ready:
++            extra_args = {
++                "key_antiquant_scale": self._k_aq_scale,
++                "key_antiquant_offset": self._k_aq_offset,
++                "value_antiquant_scale": self._v_aq_scale,
++                "value_antiquant_offset": self._v_aq_offset,
++                "key_antiquant_mode": 0,
++                "value_antiquant_mode": 0,
++            }
++            input_layout = "BNSD"
++            query = query.unsqueeze(2)
++            output = output.unsqueeze(2)
++            attn_mask = None
++            sparse_mode = 0  
++              
+         if self.enable_c8_quant:
+             extra_args = {
+                 "key_antiquant_scale": layer._c8_k_aq_scale,
+@@ -883,6 +915,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
+             key, value, attn_metadata, kv_cache
+         )
++        
++            
+         if self.enable_hamming_sparse and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+             reshape_and_cache_kvcomp(attn_metadata.kvcomp_metadata, self.layerIndex, passed_key)
+         elif self.enable_hamming_sparse:
+@@ -912,11 +946,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 value,
+                 num_query_heads=self.num_heads,
+                 num_key_value_heads=self.num_kv_heads,
+-                input_layout="TND",
++                input_layout= "TND",
+                 pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+                 next_tokens=0,
+-                atten_mask=attn_metadata.attn_mask,
+-                sparse_mode=sparse_mode,
++                atten_mask=attn_metadata.attn_mask ,
++                sparse_mode= sparse_mode,
+                 softmax_scale=self.scale,
+                 block_table=block_table,
+                 block_size=block_size,
+@@ -954,7 +988,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                     num_key_value_heads=self.num_kv_heads,
+                     num_heads=self.num_heads,
+                     scale=self.scale,
+-                    sparse_mode=3,
++                    sparse_mode=3,   
+                 )
+ 
+             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+@@ -1015,7 +1049,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
+ 
+         if self.key_cache is None:
+             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+-
++            
++        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!![TRACE]into do_kv_cache_update ",flush=True)
++        # ★ 量化：key/value fp16 → int8
++        if self.enable_int8:
++            if not self._int8_ready:
++                self._calc_int8_scales(key, value)
++            key = self._quantize_kv_to_int8(key)        # ← 你的量化算法
++            value = self._quantize_kv_to_int8(value)  # ← 你的量化算法
++                
+         DeviceOperator.reshape_and_cache(
+             key=key,
+             value=value,
+@@ -1108,7 +1150,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         num_tokens = query.shape[0]
+         if attn_metadata is None:
+             return output.fill_(0)
+-
++        
++        
+         # Initialize key_cache and value_cache from kv_cache if not already set.
+         # This is needed for DecodeOnly mode where key/value are None but we still
+         # need access to the cache for attention computation.
+@@ -1121,25 +1164,305 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                 and len(kv_cache) >= 2
+             ):
+                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+-
++        
+         output_padded = None
++        # ── 保存 fp16 副本 + 量化写入 cache ──
++        float_key, float_value = None, None
+         if key is not None and value is not None:
+             output_padded = output
++            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
++                float_key, float_value = key, value
++
++            if self.enable_int8:
++                if not self._int8_ready:
++                    self._calc_int8_scales(key, value)
++                key = self._quantize_kv_to_int8(
++                    key, self._k_inv_scale, self._k_offset
++                )
++                value = self._quantize_kv_to_int8(
++                    value, self._v_inv_scale, self._v_offset
++                )
++
+             query, key, value, output_padded = self.reshape_and_cache(
+                 query, key, value, kv_cache, attn_metadata, output
+             )
++        
+         # pooling model branch
+         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
+             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
+             output[:num_tokens] = attn_output[:num_tokens]
+             return output
++         # ── INT8 dispatch ──
++        if self.enable_int8 and self._int8_ready:
++            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
++                output = self._forward_int8_decode(query, attn_metadata, output)
++            elif attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill:
++                output = self._forward_int8_chunked_prefill(
++                    query, float_key, float_value, attn_metadata, output
++                )
++            else:
++                output = self._forward_int8_prefill(
++                    query,
++                    float_key if float_key is not None else key,
++                    float_value if float_value is not None else value,
++                    attn_metadata, output,
++                )
++            return output
++
++
++        # ── 非 INT8 ──
++        #output_padded = output if (key is not None and value is not None) else None
+         if output_padded is not None:
+-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
++            attn_output = self.forward_impl(
++                query, key, value, kv_cache, attn_metadata, output_padded
++            )
+         else:
+-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
++            attn_output = self.forward_impl(
++                query, key, value, kv_cache, attn_metadata, output
++            )
+         output[:num_tokens] = attn_output[:num_tokens]
+         return output
++    
++     # ★ 以下是新增方法
++      # ═══════════════════════════════════════════════════════════════
++    # ★ INT8 独立方法 (镜像 C8)
++    # ═══════════════════════════════════════════════════════════════
++    def _forward_int8_decode(
++        self,
++        query: torch.Tensor,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        """INT8 Decode: BNSD + int8 paged KV cache + antiquant."""
++        print("!!!!!!![trace i am doing int8_decode only]",flush=True)
++        num_block, block_size, _, _ = self.key_cache.shape
++        key = self.key_cache.view(num_block, block_size, -1)
++        value = self.value_cache.view(num_block, block_size, -1)
++        batch_size = len(attn_metadata.seq_lens_list)
++
++        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
++            query[:batch_size].unsqueeze(2),
++            key, value,
++            key_antiquant_scale=self._k_aq_scale,
++            key_antiquant_offset=self._k_aq_offset,
++            value_antiquant_scale=self._v_aq_scale,
++            value_antiquant_offset=self._v_aq_offset,
++            key_antiquant_mode=0, value_antiquant_mode=0,
++            block_table=attn_metadata.block_tables,
++            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
++            num_heads=self.num_heads,
++            num_key_value_heads=self.num_kv_heads,
++            input_layout="BNSD", sparse_mode=0,
++            scale=self.scale, block_size=block_size,
++        )
++        attn_output = attn_output.squeeze(2)
++        output[:batch_size] = attn_output
++        return output
++
++    def _forward_int8_chunked_prefill(
++        self,
++        query: torch.Tensor,
++        float_key: torch.Tensor | None,
++        float_value: torch.Tensor | None,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        """INT8 ChunkedPrefill: decode→BNSD+int8, prefill→TND+fp16."""
++        print("!!!!!!![trace i am doing int8_chunked_prefill]",flush=True)
++        num_decode = attn_metadata.num_decode_tokens
++        num_decodes = attn_metadata.num_decodes
++        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
++        num_tokens = int(actual_seq_qlen[-1])
++
++        # ── ① Decode: BNSD + int8 cache ──
++        if num_decode > 0:
++            num_block, block_size, _, _ = self.key_cache.shape
++            kv_k = self.key_cache.view(num_block, block_size, -1)
++            kv_v = self.value_cache.view(num_block, block_size, -1)
++
++            attn_out, _ = torch_npu.npu_fused_infer_attention_score(
++                query[:num_decode].unsqueeze(2), kv_k, kv_v,
++                key_antiquant_scale=self._k_aq_scale,
++                key_antiquant_offset=self._k_aq_offset,
++                value_antiquant_scale=self._v_aq_scale,
++                value_antiquant_offset=self._v_aq_offset,
++                key_antiquant_mode=0, value_antiquant_mode=0,
++                block_table=attn_metadata.block_tables[:num_decodes],
++                actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_decodes],
++                num_heads=self.num_heads,
++                num_key_value_heads=self.num_kv_heads,
++                input_layout="BNSD", sparse_mode=0,
++                scale=self.scale, block_size=block_size,
++            )
++            output[:num_decode] = attn_out.squeeze(2)
++
++        # ── ② Prefill: TND + fp16 (fresh K/V 或 dequant from int8 cache) ──
++        if attn_metadata.num_prefills > 0:
++            prefill_q = query[num_decode:num_tokens]
++
++            prefill_seq_qlen = [
++                actual_seq_qlen[i] - num_decode
++                for i in range(num_decodes, len(actual_seq_qlen))
++            ]
++
++            # 判断是否所有 prefill 请求都是全新（无历史 KV cache）
++            all_new_prefill = True
++            for i in range(num_decodes, len(attn_metadata.seq_lens_list)):
++                q_start = actual_seq_qlen[i - 1] if i > 0 else 0
++                qlen_i = actual_seq_qlen[i] - q_start
++                if attn_metadata.seq_lens_list[i] > qlen_i:
++                    all_new_prefill = False
++                    break
++
++            if all_new_prefill and float_key is not None and float_value is not None:
++                # 全新 prefill: 直接用 fp16 fresh K/V
++                print("!!!!!!![trace i am doing int8_all_new_prefill]",flush=True)
++                prefill_k = float_key[num_decode:num_tokens]
++                prefill_v = float_value[num_decode:num_tokens]
++                prefill_seq_kvlen = prefill_seq_qlen
++            else:
++                # 承接已有 cache: gather paged int8 KV → dequant → dense fp16
++                print("!!!!!!![trace i am doing int8_prefill_hit cache]",flush=True)
++                num_block, blk_size, _, _ = self.key_cache.shape
++                paged_k = self.key_cache.view(num_block, blk_size, -1)
++                paged_v = self.value_cache.view(num_block, blk_size, -1)
++                prefill_bt = attn_metadata.block_tables[num_decodes:]
++                prefill_sl = attn_metadata.seq_lens_list[num_decodes:]
++                prefill_k, prefill_v = self._dequant_paged_kv_to_dense(
++                    paged_k, paged_v, prefill_bt, prefill_sl, query.dtype
++                )
++                prefill_seq_kvlen = torch.tensor(prefill_sl, dtype=torch.int32).cumsum(dim=0)
++
++            cache_block_size = self.key_cache.shape[1]
++            attn_out, _ = torch_npu.npu_fused_infer_attention_score(
++                query=prefill_q, key=prefill_k, value=prefill_v,
++                atten_mask=attn_metadata.attn_mask,
++                block_table=None,
++                input_layout="TND", sparse_mode=3,
++                block_size=cache_block_size,
++                actual_seq_lengths=prefill_seq_qlen,
++                actual_seq_lengths_kv=prefill_seq_kvlen,
++                num_key_value_heads=self.num_kv_heads,
++                num_heads=self.num_heads, scale=self.scale,
++            )
++            n_prefill = num_tokens - num_decode
++            attn_out = attn_out.view(n_prefill, self.num_heads, self.head_size)
++            output[num_decode:num_tokens] = attn_out[:n_prefill]
++
++        return output
++
++    def _forward_int8_prefill(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        """INT8 Prefill: TND + fp16 (fresh K/V or dequant if from int8 cache)."""
++        print("!!!!!!![trace i am doing int8_forward prefill]",flush=True)
++        key, value, block_size, block_table, actual_seq_lengths_kv = \
++            self._get_fia_params(key, value, attn_metadata)
+ 
++        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
++        num_tokens = int(actual_seq_qlen[-1])
++        query = query[:num_tokens]
++
++        if (
++            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
++            and self.attn_type != AttentionType.ENCODER_DECODER
++        ):
++            print("!!!!!!![trace i am doing int8_all_new_ prefill]",flush=True)
++            key = key[:num_tokens]
++            value = value[:num_tokens]
++
++        # PrefillCacheHit: key 从 cache 读是 int8 → 手动 dequant
++        if key.dtype == torch.int8:
++            if block_table is not None:
++                seq_lens = (
++                    actual_seq_lengths_kv
++                    if isinstance(actual_seq_lengths_kv, list)
++                    else actual_seq_lengths_kv.tolist()
++                )
++                key, value = self._dequant_paged_kv_to_dense(
++                    key, value, block_table, seq_lens, query.dtype
++                )
++                block_table = None
++                block_size = self.key_cache.shape[1]
++                actual_seq_lengths_kv = torch.tensor(
++                    seq_lens, dtype=torch.int32
++                ).cumsum(dim=0)
++            else:
++                key = (key.to(query.dtype) - self._k_offset) * (
++                    1.0 / self._k_inv_scale
++                )
++                value = (value.to(query.dtype) - self._v_offset) * (
++                    1.0 / self._v_inv_scale
++                )
++
++        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
++            query=query, key=key, value=value,
++            atten_mask=attn_metadata.attn_mask,
++            block_table=block_table,
++            input_layout="TND", sparse_mode=3,
++            block_size=block_size,
++            actual_seq_lengths=actual_seq_qlen,
++            actual_seq_lengths_kv=actual_seq_lengths_kv,
++            num_key_value_heads=self.num_kv_heads,
++            num_heads=self.num_heads, scale=self.scale,
++        )
++        attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
++        output[:num_tokens] = attn_output
++        return output
++
++    def _dequant_paged_kv_to_dense(
++        self, key, value, block_table, seq_lens, target_dtype
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Gather paged int8 KV blocks and dequantize to dense fp16."""
++        batch_size = block_table.shape[0]
++        block_size = key.shape[1]
++        H = key.shape[2]
++        max_blocks_per_seq = block_table.shape[1]
++        max_tokens_padded = max_blocks_per_seq * block_size
++
++        flat_ids = block_table.reshape(-1)
++        gathered_k = key[flat_ids].view(batch_size, max_tokens_padded, H)
++        gathered_v = value[flat_ids].view(batch_size, max_tokens_padded, H)
++
++        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=key.device)
++        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key.device)
++        valid_mask = (positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)).view(-1)
++
++        dense_k = gathered_k.view(-1, H)[valid_mask]
++        dense_v = gathered_v.view(-1, H)[valid_mask]
++        dense_k = dense_k.view(-1, self.num_kv_heads, self.head_size)
++        dense_v = dense_v.view(-1, self.num_kv_heads, self.head_size)
++        dense_k = (dense_k.to(target_dtype) - self._k_offset) * (
++            1.0 / self._k_inv_scale
++        )
++        dense_v = (dense_v.to(target_dtype) - self._v_offset) * (
++            1.0 / self._v_inv_scale
++        )
++        return dense_k, dense_v
++    
++    def _calc_int8_scales(self, key, value):
++        k_max = key.abs().amax(dim=0, keepdim=True).clamp(min=1e-12)
++        v_max = value.abs().amax(dim=0, keepdim=True).clamp(min=1e-12)
++        self._k_inv_scale = 127.0 / k_max
++        self._k_offset = torch.zeros_like(self._k_inv_scale)
++        self._v_inv_scale = 127.0 / v_max
++        self._v_offset = torch.zeros_like(self._v_inv_scale)
++        bnsd = (1, self.num_kv_heads, 1, self.head_size)
++        self._k_aq_scale = (1.0 / self._k_inv_scale).view(bnsd).contiguous()
++        self._k_aq_offset = self._k_offset.view(bnsd).contiguous()
++        self._v_aq_scale = (1.0 / self._v_inv_scale).view(bnsd).contiguous()
++        self._v_aq_offset = self._v_offset.view(bnsd).contiguous()
++        self._int8_ready = True
++    
++    @staticmethod
++    def _quantize_kv_to_int8(x, inv_scale, offset):
++            """ Quantize K/V from float to INT8 using static per-channel  scales."""
++            return torch.clamp(torch.round(x * inv_scale + offset), -128, 127).to(torch.int8)
+ 
+ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
+     """Attention backend implementation for INT8 KV cache (C8/QuaRot) models.
+-- 
+2.53.0.windows.3
+

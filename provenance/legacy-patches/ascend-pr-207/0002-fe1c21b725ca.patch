@@ -1,0 +1,409 @@
+From b0613602f502ffeb163ac5c4a6343f432880e38e Mon Sep 17 00:00:00 2001
+From: Jingyuan Tian <49518565+CubeLander@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 18:05:00 +0800
+Subject: [PATCH] [Feature][MoE] Support BF16 dispatch_ffn_combine on Ascend
+ 910B/910B2 (#226)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+### What this PR does / why we need it?
+
+现有 BF16 `dispatch_ffn_combine` 算子只在 `ascend910_93` 目标下构建。Ascend
+910B/910B2 使用的 HCCL context 布局与 910_93 不同：A3 路径通过 `HcclOpResParamCustom`
+获取 rank 信息和通信窗口，而 A2 提供的是 `HcclA2CombineOpParam`，本地及对端窗口位于其
+`windowsIn[]` 数组中。因此，不能直接沿用 A3 的 context 解释方式。
+
+这个 PR 只补齐上述兼容性边界：
+
+- 为 `ascend910b` 构建并注册现有 `dispatch_ffn_combine_bf16` 算子；
+- 通过构建期 SoC 开关选择 HCCL context：
+- 910B/910B2 从 `HcclA2CombineOpParam` 读取 `rankId`、`rankNum`、`winSize` 和
+`windowsIn[]`；
+  - 910_93 保留原有 `HcclOpResParamCustom` rank 信息及本地/远端窗口访问路径；
+- 增加一个确定性的双卡 910B2 E2E 测试，校验跨 rank 路由后的输出和每个 expert 的 token 数量。
+
+这是一个很薄的算子兼容性补丁：除测试外，build/kernel 改动为 53 行新增、3 行删除；核心计算
+kernel、tiling、workspace、schema/meta 和 vLLM 调用路径均未改变。
+
+本 PR **不包含**：
+
+- vLLM MoE 通信算子选择或默认启用逻辑；
+- scheduler、graph、capacity 或 EPLB 行为变更；
+- count-publication 协议优化或性能结论；
+- W8A8、draft/MTP 等其他功能；
+- 对现有 FP16 变体的正确性声明（本 PR 只验证 BF16）。
+
+本提交从当前 `main` 重新整理。#199 保留为早期完整探索记录，本 PR 不复用其历史测试结果作为验收证据。
+
+### Does this PR introduce _any_ user-facing change?
+
+不会改变 vLLM 的默认运行行为或算子选择。变化仅是底层 BF16 自定义算子现在可以在 Ascend 910B/910B2
+上构建并直接调用。
+
+### How was this patch tested?
+
+所有结果均绑定到 PR 当前精确 head `df54a6b48d19f10ee059626c07bfa02c5a405e12`：
+
+- `ruff check`、`ruff format --check`、Python 语法编译及 `git diff --check` 通过；
+- 环境：CANN 9.0.0、Bisheng 15.0.5，镜像
+`quay.io/ascend/vllm-ascend:v0.21.0rc1-openeuler`；
+- 910B/910B2 精确构建：
+- `BUILD_JOBS=36 bash build.sh --pkg --ops=dispatch_ffn_combine_bf16
+--soc=ascend910b -j36 -O3` 通过；
+- package
+SHA256：`8baf77f8abaccf0f7f24382fd8d497475648b5ade309ae28cffce8e7b71437bd`；
+  - 实际编译命令确认选择 `DISPATCH_FFN_COMBINE_BF16_A2=1`；
+- 双卡 910B2 E2E：
+- `pytest -sv
+tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py::test_dispatch_ffn_combine_bf16_two_ranks`；
+  - `1 passed in 35.19s`；
+- 同一 communicator/window 连续执行三组均衡、变化和偏斜路由，输出与独立 BF16 oracle 一致，expert
+token counts 精确一致；
+  - 每轮 poison 输出和 count buffer，并验证 `x`、`expert_idx` 不被修改；
+- 两个 rank 均加载本次精确构建安装的库，installed/build `libcust_opapi.so` SHA256 均为
+`f5ae16e524f47d488055520fae3bbb6aae837a9c155f1e1ea1b68dd169f346e5`；
+- 910_93 精确构建：
+- `BUILD_JOBS=36 bash build.sh --pkg --ops=dispatch_ffn_combine_bf16
+--soc=ascend910_93 -j36 -O3` 通过；
+- package
+SHA256：`fad872a001bf8a03b8ea4c7276987d990d9a2bc15ab292260a0058eebe49309a`；
+- 实际编译命令及预处理结果确认选择 `DISPATCH_FFN_COMBINE_BF16_A2=0`，并保留原有 A3 rank/window
+路径。
+
+A3 真机运行未在本地执行，仍作为 #224 中明确记录的外部验收项；本 PR 不将 A3 编译验证表述为运行验证。
+
+Refs #219
+
+Refs #224
+
+- vLLM version: v0.23.0
+- vLLM main:
+https://github.com/vllm-project/vllm/commit/a30addc7548a9a8b9b3323a7bc3eb7d7c4895d1c
+
+---------
+
+Signed-off-by: Fletcher Tian <jingyuan_tian@qq.com>
+---
+ csrc/build_aclnn.sh                           |   1 +
+ .../op_host/CMakeLists.txt                    |  14 ++
+ .../op_host/dispatch_ffn_combine_bf16_def.cpp |   4 +-
+ .../op_kernel/dispatch_ffn_combine_bf16.h     |   8 +
+ .../op_kernel/utils/hccl_shmem.hpp            |  29 +++-
+ .../test_dispatch_ffn_combine_bf16.py         | 143 ++++++++++++++++++
+ 6 files changed, 196 insertions(+), 3 deletions(-)
+ create mode 100644 tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py
+
+diff --git a/csrc/build_aclnn.sh b/csrc/build_aclnn.sh
+index 70f6afd40d..e5655378a2 100755
+--- a/csrc/build_aclnn.sh
++++ b/csrc/build_aclnn.sh
+@@ -126,6 +126,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+         "dequant_swiglu_quant"
+         "grouped_matmul_swiglu_quant"
+         "grouped_matmul_swiglu_quant_v2"
++        "dispatch_ffn_combine_bf16"
+         "hamming_dist_top_k"
+         "reshape_and_cache_bnsd"
+         "recurrent_gated_delta_rule"
+diff --git a/csrc/mc2/dispatch_ffn_combine_bf16/op_host/CMakeLists.txt b/csrc/mc2/dispatch_ffn_combine_bf16/op_host/CMakeLists.txt
+index 3bad653de5..4e7b89094e 100644
+--- a/csrc/mc2/dispatch_ffn_combine_bf16/op_host/CMakeLists.txt
++++ b/csrc/mc2/dispatch_ffn_combine_bf16/op_host/CMakeLists.txt
+@@ -29,6 +29,20 @@ add_ops_compile_options(
+         ${_DISPATCH_FFN_INC_OPTS}
+ )
+ 
++# Ascend 910B/910B2 and 910_93 share the V220 architecture macros, but use
++# different full HCCL context layouts. Keep the existing 910_93 window path
++# unchanged and select the A2 context layout explicitly for 910B builds.
++add_ops_compile_options(
++    OP_NAME DispatchFFNCombineBF16
++    COMPUTE_UNIT Ascend910B1
++    OPTIONS -DDISPATCH_FFN_COMBINE_BF16_A2=1
++)
++add_ops_compile_options(
++    OP_NAME DispatchFFNCombineBF16
++    COMPUTE_UNIT Ascend910_9391
++    OPTIONS -DDISPATCH_FFN_COMBINE_BF16_A2=0
++)
++
+ if (NOT BUILD_OPS_RTY_KERNEL)
+     add_modules_sources(OPTYPE dispatch_ffn_combine_bf16 ACLNNTYPE aclnn_inner)
+     target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
+diff --git a/csrc/mc2/dispatch_ffn_combine_bf16/op_host/dispatch_ffn_combine_bf16_def.cpp b/csrc/mc2/dispatch_ffn_combine_bf16/op_host/dispatch_ffn_combine_bf16_def.cpp
+index 036823e9a5..ab1be21b7d 100644
+--- a/csrc/mc2/dispatch_ffn_combine_bf16/op_host/dispatch_ffn_combine_bf16_def.cpp
++++ b/csrc/mc2/dispatch_ffn_combine_bf16/op_host/dispatch_ffn_combine_bf16_def.cpp
+@@ -84,10 +84,10 @@ class DispatchFFNCombineBF16 : public OpDef {
+         .ExtendCfgInfo("jitCompile.flag", "static_false")
+         .ExtendCfgInfo("multiKernelSupportDynamicGraph.value", "multi_kernel");
+     this->AICore().AddConfig("ascend910_93", aicore_config);
+-    // this->AICore().AddConfig("ascend910b", aicore_config);
++    this->AICore().AddConfig("ascend910b", aicore_config);
+     this->MC2().HcclGroup("group");
+   }
+ };
+ 
+ OP_ADD(DispatchFFNCombineBF16);
+-}  // namespace ops
+\ No newline at end of file
++}  // namespace ops
+diff --git a/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16.h b/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16.h
+index 14945effdb..64eabcc412 100644
+--- a/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16.h
++++ b/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16.h
+@@ -159,11 +159,19 @@ __aicore__ inline void DispatchFFNCombineBF16<TemplateMMA2ACFunc>::Init(GM_ADDR
+     initRoutingQuantTilingKey = tilingData.cocTiling.initRoutingQuantTilingKey;
+ 
+     auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
++    #if DISPATCH_FFN_COMBINE_BF16_A2
++    __gm__ HcclA2CombineOpParam *WinContext_{nullptr};
++    WinContext_ = (__gm__ HcclA2CombineOpParam *)contextGM0;
++
++    rank = WinContext_->rankId;
++    rankSize = WinContext_->rankNum;
++    #else
+     __gm__ HcclOpResParamCustom *WinContext_{nullptr};
+     WinContext_ = (__gm__ HcclOpResParamCustom *)contextGM0;
+ 
+     rank = WinContext_->localUsrRankId;
+     rankSize = WinContext_->rankSize;
++    #endif
+ }
+ 
+ template <TemplateMMA2AClass>
+diff --git a/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/utils/hccl_shmem.hpp b/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/utils/hccl_shmem.hpp
+index 93d4c9e7d4..7d88135500 100644
+--- a/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/utils/hccl_shmem.hpp
++++ b/csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/utils/hccl_shmem.hpp
+@@ -23,6 +23,12 @@ constexpr uint16_t RECV_SYNC_EVENT_ID = 10;
+ constexpr uint32_t SELF_STATE_OFFSET = 256 * 1024;
+ constexpr uint32_t STATE_OFFSET = 512;
+ 
++#ifdef HCCL_COMM
++#ifndef DISPATCH_FFN_COMBINE_BF16_A2
++#error "DISPATCH_FFN_COMBINE_BF16_A2 must be set by the target build"
++#endif
++#endif
++
+ FORCE_INLINE_AICORE void AicSyncAll() {
+     AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(8);
+     AscendC::CrossCoreWaitFlag<0x0>(8);
+@@ -84,16 +90,25 @@ FORCE_INLINE_AICORE void gm_signal_wait_until_ne(__gm__ int32_t *sig_addr, int32
+ class HcclShmem {
+ public:
+     #ifdef HCCL_COMM    // HCCL needs to initialize the HCCL context
++        #if DISPATCH_FFN_COMBINE_BF16_A2
++        __gm__ HcclA2CombineOpParam *WinContext_{nullptr};
++        #else
+         __gm__ HcclOpResParamCustom *WinContext_{nullptr};
++        #endif
+         Hccl<HCCL_SERVER_TYPE_AICPU> hccl_;
+         AscendC::LocalTensor<int32_t> ub;
+         FORCE_INLINE_AICORE
+         HcclShmem(){
+             auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
++            #if DISPATCH_FFN_COMBINE_BF16_A2
++            WinContext_ = (__gm__ HcclA2CombineOpParam *)contextGM0;
++            m_rank = WinContext_->rankId;
++            m_rankSize = WinContext_->rankNum;
++            #else
+             WinContext_ = (__gm__ HcclOpResParamCustom *)contextGM0;
+-
+             m_rank = WinContext_->localUsrRankId;
+             m_rankSize = WinContext_->rankSize;
++            #endif
+             m_segmentSize = WinContext_->winSize;
+         }
+     #else
+@@ -112,7 +127,11 @@ public:
+     FORCE_INLINE_AICORE
+     GM_ADDR operator() () const {   // No parameters: return pointer to local peermem
+         #ifdef HCCL_COMM
++            #if DISPATCH_FFN_COMBINE_BF16_A2
++            return (GM_ADDR)WinContext_->windowsIn[m_rank];
++            #else
+             return (GM_ADDR)(WinContext_->localWindowsIn);
++            #endif
+         #else
+             return reinterpret_cast<GM_ADDR>(shmem_ptr(symmetricPtr, m_rank));
+         #endif
+@@ -121,8 +140,12 @@ public:
+     FORCE_INLINE_AICORE
+     GM_ADDR operator() (int32_t index) const {  // With index parameter: return pointer to the base address of remote peermem
+         #ifdef HCCL_COMM
++            #if DISPATCH_FFN_COMBINE_BF16_A2
++            return (GM_ADDR)WinContext_->windowsIn[index];
++            #else
+             return (GM_ADDR)((index == m_rank) ? WinContext_->localWindowsIn :
+                                     ((HcclRankRelationResV2Custom *)(WinContext_->remoteRes[index].nextDevicePtr))->windowsIn);
++            #endif
+         #else
+             return reinterpret_cast<GM_ADDR>(shmem_ptr(symmetricPtr, index));
+         #endif
+@@ -137,8 +160,12 @@ public:
+             if (rankId < 0 || rankId >= m_rankSize) {
+                 return nullptr;
+             }
++            #if DISPATCH_FFN_COMBINE_BF16_A2
++            return (GM_ADDR)WinContext_->windowsIn[rankId] + offset;
++            #else
+             return (GM_ADDR)((rankId == m_rank) ? WinContext_->localWindowsIn :
+                                     ((HcclRankRelationResV2Custom *)(WinContext_->remoteRes[rankId].nextDevicePtr))->windowsIn) + offset;
++            #endif
+         #else
+             return reinterpret_cast<GM_ADDR>(shmem_ptr((symmetricPtr + offset), rankId));
+         #endif
+diff --git a/tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py b/tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py
+new file mode 100644
+index 0000000000..0909ec27e0
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py
+@@ -0,0 +1,143 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import random
++
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++import torch.nn.functional as F
++import torch_npu
++from torch.distributed.distributed_c10d import _get_default_group
++
++from vllm_ascend.utils import enable_custom_op
++
++enable_custom_op()
++
++
++def _get_hcomm_name(rank: int) -> str:
++    default_group = _get_default_group()
++    backend = default_group._get_backend(torch.device("npu"))
++    # TORCH_DISTRIBUTED_DEBUG may wrap the device backend in a
++    # _ProcessGroupWrapper.  The communicator belongs to the wrapped HCCL
++    # process group rather than to the debug wrapper.
++    while hasattr(backend, "wrapped_pg"):
++        backend = backend.wrapped_pg
++    return backend.get_hccl_comm_name(rank)
++
++
++def _make_expert_idx(
++    tokens: int,
++    top_k: int,
++    global_experts: int,
++    source_rank: int,
++    generation: int,
++) -> torch.Tensor:
++    flat_idx = torch.arange(tokens * top_k, dtype=torch.int32)
++    if generation == 0:
++        expert_idx = (flat_idx + source_rank * top_k) % global_experts
++    elif generation == 1:
++        expert_idx = (flat_idx * 3 + source_rank * 5) % (global_experts - 3)
++    else:
++        # Leave most experts empty to exercise changing and skewed count rows.
++        expert_idx = (flat_idx * 5 + source_rank * 3) % 7
++    return expert_idx.reshape(tokens, top_k)
++
++
++def _run_rank(rank: int, world_size: int, port: int) -> None:
++    torch_npu.npu.set_device(rank)
++    dist.init_process_group(
++        backend="hccl",
++        rank=rank,
++        world_size=world_size,
++        init_method=f"tcp://127.0.0.1:{port}",
++    )
++
++    try:
++        local_experts = 8
++        tokens = 64
++        top_k = 4
++        hidden_size = 256
++        ffn_size = 256
++        gate_up_size = 2 * ffn_size
++
++        torch_npu.npu.config.allow_internal_format = True
++
++        x = torch.zeros((tokens, hidden_size), dtype=torch.bfloat16)
++        x[:, 0] = 1
++
++        # Every expert receives the same one-hot gate/up input. GMM2 then
++        # encodes the global expert id in output column zero, which makes
++        # cross-rank dispatch and combine errors directly observable.
++        weight1 = torch.zeros((local_experts, hidden_size, gate_up_size), dtype=torch.bfloat16)
++        weight1[:, 0, 0] = 1
++        weight1[:, 0, ffn_size] = 1
++        weight2 = torch.zeros((local_experts, ffn_size, hidden_size), dtype=torch.bfloat16)
++        for local_expert in range(local_experts):
++            global_expert = rank * local_experts + local_expert
++            weight2[local_expert, 0, 0] = global_expert + 1
++
++        global_experts = world_size * local_experts
++        probs_cpu = torch.arange(1, top_k + 1, dtype=torch.float32).repeat(tokens, 1)
++        probs_cpu /= probs_cpu.sum(dim=-1, keepdim=True)
++        silu_one = F.silu(torch.tensor(1, dtype=torch.bfloat16))
++
++        x = x.npu()
++        probs = probs_cpu.npu()
++        weight1_nz = [torch_npu.npu_format_cast(weight1.npu(), 29)]
++        weight2_nz = [torch_npu.npu_format_cast(weight2.npu(), 29)]
++        scale1 = [torch.empty(0, dtype=torch.int64, device="npu")]
++        scale2 = [torch.empty(0, dtype=torch.int64, device="npu")]
++        empty_bias = [torch.empty(0, dtype=torch.float32, device="npu")]
++
++        out = torch.empty_like(x)
++        expert_token_nums = torch.zeros(local_experts, dtype=torch.int32).npu()
++        x_before = x.clone()
++        for generation in range(3):
++            expert_idx_cpu = _make_expert_idx(tokens, top_k, global_experts, rank, generation)
++            expected = torch.zeros((tokens, hidden_size), dtype=torch.bfloat16)
++            expected[:, 0] = ((expert_idx_cpu + 1) * probs_cpu).sum(dim=-1).to(torch.bfloat16) * silu_one
++
++            all_routes = torch.cat(
++                [
++                    _make_expert_idx(tokens, top_k, global_experts, source_rank, generation).reshape(-1)
++                    for source_rank in range(world_size)
++                ]
++            )
++            global_counts = torch.bincount(all_routes.to(torch.int64), minlength=global_experts).to(torch.int32)
++            expected_tokens_per_local_expert = global_counts[rank * local_experts : (rank + 1) * local_experts]
++
++            expert_idx = expert_idx_cpu.npu()
++            expert_idx_before = expert_idx.clone()
++            out.fill_(torch.nan)
++            expert_token_nums.fill_(-1)
++            torch.ops._C_ascend.dispatch_ffn_combine(
++                x=x,
++                weight1=weight1_nz,
++                weight2=weight2_nz,
++                expert_idx=expert_idx,
++                scale1=scale1,
++                scale2=scale2,
++                bias1=empty_bias,
++                bias2=empty_bias,
++                probs=probs,
++                group=_get_hcomm_name(rank),
++                max_output_size=512,
++                out=out,
++                expert_token_nums=expert_token_nums,
++            )
++            torch_npu.npu.synchronize()
++
++            torch.testing.assert_close(out.cpu(), expected, rtol=0.02, atol=0.02)
++            torch.testing.assert_close(expert_token_nums.cpu(), expected_tokens_per_local_expert)
++            torch.testing.assert_close(expert_idx, expert_idx_before, rtol=0, atol=0)
++            torch.testing.assert_close(x, x_before, rtol=0, atol=0)
++    finally:
++        dist.destroy_process_group()
++
++
++@torch.inference_mode()
++def test_dispatch_ffn_combine_bf16_two_ranks():
++    world_size = 2
++    port = 29501 + random.randint(0, 10000)
++    mp.spawn(_run_rank, args=(world_size, port), nprocs=world_size, join=True)
+-- 
+2.53.0.windows.3
+

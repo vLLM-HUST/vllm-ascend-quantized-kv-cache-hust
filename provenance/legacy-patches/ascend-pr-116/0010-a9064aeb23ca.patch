@@ -1,0 +1,27 @@
+From e2f271b192717b73f6fb2dc37fdc599d25c80863 Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Fri, 10 Jul 2026 16:04:46 +0800
+Subject: [PATCH] feat: upgrade the pytorch version
+
+---
+ .github/workflows/ascend-benchmark-leaderboard.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/ascend-benchmark-leaderboard.yml b/.github/workflows/ascend-benchmark-leaderboard.yml
+index 8844f5dc3d..c5bbe9022e 100644
+--- a/.github/workflows/ascend-benchmark-leaderboard.yml
++++ b/.github/workflows/ascend-benchmark-leaderboard.yml
+@@ -656,8 +656,8 @@ jobs:
+           fi
+           export PYTHONPATH="$VLLM_HUST_REPO:$VLLM_HUST_BENCHMARK_REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+           echo "PYTHONPATH=$PYTHONPATH" >> "$GITHUB_ENV"
+-	  hust_run_pip install "torch==2.10.0" "torch-npu==2.10.0"
+-	  hust_run_pip install "numpy<2.0.0" scipy attrs decorator psutil
++          hust_run_pip install "torch==2.10.0" "torch-npu==2.10.0"
++          hust_run_pip install "numpy<2.0.0" scipy attrs decorator psutil
+           hust_run_pip install -r "$VLLM_HUST_REPO/requirements/common.txt"
+           PYTHON_BIN="$(hust_resolve_python_bin)"
+           echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
+-- 
+2.53.0.windows.3
+

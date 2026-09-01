@@ -1,0 +1,386 @@
+From 631102de3251589fc8282df5d85e9e2c761c2ade Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Sun, 16 Aug 2026 05:24:20 +0000
+Subject: [PATCH] fix(kv-cache): wire INT4 backend for allocation and cache
+ decode KV tokens
+
+- Wire AscendInt4AttentionBackend in kv_int4 create_weights so the model
+  runner sizes KV blocks with the packed head_size//2+4 layout instead of
+  the full head_size, matching the core INT4 page budget.
+- Write newly decoded K/V tokens in the DecodeOnly path so later decode
+  steps attend to up-to-date cache contents.
+- Add NPU tests asserting the shape contract, packed write/read roundtrip,
+  and decode-append cache mutation with prefill data preserved.
+
+Co-authored-by: Claude
+Signed-off-by: SuccinctPaul <SuccinctPaul@users.noreply.github.com>
+---
+ .../test_kv_cache_int4_backend.py             | 256 ++++++++++++++++++
+ vllm_ascend/attention/attention_v1.py         |  36 ++-
+ vllm_ascend/quantization/methods/kv_int4.py   |   6 +-
+ vllm_ascend/worker/model_runner_v1.py         |   9 +-
+ 4 files changed, 303 insertions(+), 4 deletions(-)
+ create mode 100644 tests/ut/quantization/test_kv_cache_int4_backend.py
+
+diff --git a/tests/ut/quantization/test_kv_cache_int4_backend.py b/tests/ut/quantization/test_kv_cache_int4_backend.py
+new file mode 100644
+index 0000000000..5730b040f4
+--- /dev/null
++++ b/tests/ut/quantization/test_kv_cache_int4_backend.py
+@@ -0,0 +1,256 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# SPDX-FileCopyrightText: 2025 Huawei Technologies Co., Ltd.
++# SPDX-License-Identifier: Apache-2.0
++"""NPU tests for the INT4 KV cache attention backend execution contract.
++
++These tests exercise the real ``AscendInt4AttentionBackendImpl`` data path on
++NPU hardware and assert the exact paired-head contract requested by review:
++
++  * kv-cache shape is ``head_size // 2 + 4`` (packed 2x int4/byte + inline
++    per-token-head fp32 scale) and stays fp32-aligned;
++  * prefill write -> packed-cache read roundtrip reconstructs K/V within INT4
++    error and dense-FIA attention matches a bf16 reference;
++  * decode append writes new K/V tokens, mutating the cache without corrupting
++    previously cached prefill data, and the resulting decode attention matches
++    a bf16 reference over the extended sequence.
++
++Tests are skipped when no NPU is available.
++"""
++
++import itertools
++
++import pytest
++import torch
++
++torch_npu = pytest.importorskip("torch_npu")
++
++from vllm_ascend.attention.attention_v1 import (  # noqa: E402
++    AscendInt4AttentionBackendImpl,
++)
++
++_NUM_BLOCKS = 128
++_BLOCK_SIZE = 16
++_NUM_KV_HEADS = 4
++_NUM_HEADS = 8
++_HEAD_SIZE = 128
++_SCALE = 1.0 / (_HEAD_SIZE**0.5)
++_DTYPE = torch.bfloat16
++
++
++@pytest.fixture(scope="module")
++def device():
++    if not torch_npu.npu.is_available() or torch_npu.npu.device_count() == 0:
++        pytest.skip("NPU is not available")
++    torch_npu.npu.set_device(0)
++    return "npu"
++
++
++class _Harness:
++    def __init__(
++        self,
++        slot_mapping,
++        num_actual_tokens,
++        block_tables,
++        seq_lens_list,
++        attn_mask,
++        attn_state,
++        actual_seq_lengths_q=None,
++        model_runner_type="generate",
++    ):
++        self.slot_mapping = slot_mapping
++        self.num_actual_tokens = num_actual_tokens
++        self.block_tables = block_tables
++        self.seq_lens_list = seq_lens_list
++        self.attn_mask = attn_mask
++        self.attn_state = attn_state
++        self.actual_seq_lengths_q = actual_seq_lengths_q
++        self.model_runner_type = model_runner_type
++
++
++def _make_backend(device):
++    b = object.__new__(AscendInt4AttentionBackendImpl)
++    b.head_size = _HEAD_SIZE
++    b.num_heads = _NUM_HEADS
++    b.num_kv_heads = _NUM_KV_HEADS
++    b.scale = _SCALE
++    alloc = AscendInt4AttentionBackendImpl.get_kv_cache_shape(
++        _NUM_BLOCKS, _BLOCK_SIZE, _NUM_KV_HEADS, _HEAD_SIZE, "int4"
++    )
++    pair = torch.zeros(*alloc, dtype=torch.uint8, device=device)
++    b.key_cache = pair[0]
++    b.value_cache = pair[1]
++    return b
++
++
++def _make_mask(device):
++    return torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(device)
++
++
++def _fia_dense(query, key, value, mask, cu_q, cu_kv, device):
++    out, _ = torch_npu.npu_fused_infer_attention_score(
++        query=query,
++        key=key,
++        value=value,
++        atten_mask=mask,
++        block_table=None,
++        input_layout="TND",
++        block_size=_BLOCK_SIZE,
++        actual_seq_lengths=cu_q,
++        actual_seq_lengths_kv=cu_kv,
++        num_key_value_heads=_NUM_KV_HEADS,
++        num_heads=_NUM_HEADS,
++        scale=_SCALE,
++        sparse_mode=3,
++    )
++    return out.view(query.shape[0], _NUM_HEADS, _HEAD_SIZE)
++
++
++def _prefill_layout(seq_lens, total_tokens, device):
++    """vLLM-style block-aligned slot mapping and padded block table."""
++    slot_mapping = torch.empty(total_tokens, dtype=torch.int64, device=device)
++    block_tables = []
++    phys_start = 0
++    tok_off = 0
++    for sl in seq_lens:
++        nblk = (sl + _BLOCK_SIZE - 1) // _BLOCK_SIZE
++        block_tables.append(torch.arange(nblk, device=device) + phys_start)
++        slot_mapping[tok_off : tok_off + sl] = phys_start * _BLOCK_SIZE + torch.arange(sl, device=device)
++        tok_off += sl
++        phys_start += nblk
++    max_blocks = max(bt.numel() for bt in block_tables)
++    block_table_pad = torch.stack(
++        [torch.cat([bt, torch.zeros(max_blocks - bt.numel(), dtype=bt.dtype, device=device)]) for bt in block_tables]
++    )
++    return slot_mapping, block_table_pad
++
++
++def _cosine(a, b):
++    return torch.nn.functional.cosine_similarity(a.float().reshape(-1), b.float().reshape(-1), dim=0).item()
++
++
++def test_int4_kv_cache_shape_contract(device):
++    """Packed INT4 head == head_size//2 + 4 (inline fp32 scale), fp32-aligned."""
++    shape = AscendInt4AttentionBackendImpl.get_kv_cache_shape(
++        _NUM_BLOCKS, _BLOCK_SIZE, _NUM_KV_HEADS, _HEAD_SIZE, "int4"
++    )
++    assert shape == (2, _NUM_BLOCKS, _BLOCK_SIZE, _NUM_KV_HEADS, _HEAD_SIZE // 2 + 4), shape
++    assert shape[-1] % 4 == 0, f"padded head must stay fp32-aligned: {shape[-1]}"
++
++
++def test_prefill_write_read_roundtrip(device):
++    """Prefill write -> packed read reconstructs K/V within INT4 error."""
++    backend = _make_backend(device)
++    mask = _make_mask(device)
++    seq_lens = [37, 23, 51]
++    total_tokens = sum(seq_lens)
++
++    key = (torch.randn(total_tokens, _NUM_KV_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++    value = (torch.randn(total_tokens, _NUM_KV_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++    query = (torch.randn(total_tokens, _NUM_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++
++    slot_mapping, block_table_pad = _prefill_layout(seq_lens, total_tokens, device)
++
++    k_packed, v_packed, k_scale, v_scale = backend._quantize_kv_to_int4(key, value, total_tokens)
++    harness = _Harness(
++        slot_mapping=slot_mapping,
++        num_actual_tokens=total_tokens,
++        block_tables=block_table_pad,
++        seq_lens_list=seq_lens,
++        attn_mask=mask,
++        attn_state=None,
++    )
++    backend._reshape_and_cache_int4(k_packed, v_packed, k_scale, v_scale, harness)
++
++    dk, dv = backend._dequant_paged_int4_to_dense(block_table_pad, seq_lens, _DTYPE)
++    assert dk.shape[0] == total_tokens, f"dequant tokens {dk.shape[0]} != {total_tokens}"
++    k_cos = _cosine(dk, key)
++    v_cos = _cosine(dv, value)
++    assert k_cos > 0.99, f"INT4 K reconstruction cosine too low: {k_cos:.4f}"
++    assert v_cos > 0.99, f"INT4 V reconstruction cosine too low: {v_cos:.4f}"
++
++    cu = torch.tensor(list(itertools.accumulate(seq_lens)), dtype=torch.int32, device=device)
++    ref = _fia_dense(query, key, value, mask, cu, cu, device)
++    out = _fia_dense(query, dk.to(_DTYPE), dv.to(_DTYPE), mask, cu, cu, device)
++    cos = _cosine(out, ref)
++    assert cos > 0.99, f"read-path attention cosine too low: {cos:.4f}"
++
++
++def test_decode_append_mutates_cache_and_keeps_prefill(device):
++    """Decode writes new K/V tokens; prefill data is not corrupted."""
++    backend = _make_backend(device)
++    mask = _make_mask(device)
++    seq_lens = [37, 23, 51]
++    total_tokens = sum(seq_lens)
++    bsz = len(seq_lens)
++
++    key = (torch.randn(total_tokens, _NUM_KV_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++    value = (torch.randn(total_tokens, _NUM_KV_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++
++    slot_mapping, block_table_pad = _prefill_layout(seq_lens, total_tokens, device)
++    k_packed, v_packed, k_scale, v_scale = backend._quantize_kv_to_int4(key, value, total_tokens)
++    harness = _Harness(
++        slot_mapping=slot_mapping,
++        num_actual_tokens=total_tokens,
++        block_tables=block_table_pad,
++        seq_lens_list=seq_lens,
++        attn_mask=mask,
++        attn_state=None,
++    )
++    backend._reshape_and_cache_int4(k_packed, v_packed, k_scale, v_scale, harness)
++    dk_before, _ = backend._dequant_paged_int4_to_dense(block_table_pad, seq_lens, _DTYPE)
++    prefill_err = (dk_before.float() - key.float()).abs().amax().item()
++
++    # One decoded token per sequence, appended at the next free slot.
++    k_dec = (torch.randn(bsz, _NUM_KV_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++    v_dec = (torch.randn(bsz, _NUM_KV_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++    seq_lens_dec = [s + 1 for s in seq_lens]
++    slot_mapping_dec = torch.empty(bsz, dtype=torch.int64, device=device)
++    phys_start = 0
++    for i, sl in enumerate(seq_lens):
++        nblk = (sl + _BLOCK_SIZE - 1) // _BLOCK_SIZE
++        slot_mapping_dec[i] = phys_start * _BLOCK_SIZE + sl
++        phys_start += nblk
++
++    kp, vp, ks, vs = backend._quantize_kv_to_int4(k_dec, v_dec, bsz)
++    harness_dec = _Harness(
++        slot_mapping=slot_mapping_dec,
++        num_actual_tokens=bsz,
++        block_tables=block_table_pad,
++        seq_lens_list=seq_lens_dec,
++        attn_mask=mask,
++        attn_state=None,
++    )
++    backend._reshape_and_cache_int4(kp, vp, ks, vs, harness_dec)
++
++    # Prefill region must be unchanged by the decode write.
++    dk_probe, _ = backend._dequant_paged_int4_to_dense(block_table_pad, seq_lens, _DTYPE)
++    probe_err = (dk_probe.float() - key.float()).abs().amax().item()
++    assert probe_err == prefill_err, "Prefill KV cache corrupted by decode write"
++
++    # Decode attention over the extended sequence matches the bf16 reference.
++    dk2, dv2 = backend._dequant_paged_int4_to_dense(block_table_pad, seq_lens_dec, _DTYPE)
++    total2 = sum(seq_lens_dec)
++    assert dk2.shape[0] == total2, dk2.shape
++    key2 = torch.cat([key, k_dec], dim=0)
++    value2 = torch.cat([value, v_dec], dim=0)
++    q_dec = (torch.randn(bsz, _NUM_HEADS, _HEAD_SIZE, device=device) * 0.5).to(_DTYPE)
++    cu2 = torch.tensor(list(itertools.accumulate(seq_lens_dec)), dtype=torch.int32, device=device)
++    q_cu = torch.arange(1, bsz + 1, dtype=torch.int32, device=device)
++    ref2 = _fia_dense(q_dec, key2, value2, mask, q_cu, cu2, device)
++    out2 = _fia_dense(q_dec, dk2.to(_DTYPE), dv2.to(_DTYPE), mask, q_cu, cu2, device)
++    cos2 = _cosine(out2, ref2)
++    assert cos2 > 0.9, f"decode-path attention cosine too low: {cos2:.4f}"
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index 46a104b598..3cdbb81099 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -2392,8 +2392,10 @@ class AscendInt4AttentionBackendImpl(AscendAttentionBackendImpl):
+         if self.key_cache is None:
+             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+ 
+-        # Write path: quantize + pack + inline-scale store for non-decode states.
+-        if key is not None and value is not None and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
++        # Write path: quantize + pack + inline-scale store for all states, including
++        # DecodeOnly (newly decoded K/V tokens must be cached so later decode steps
++        # attend up-to-date cache contents).
++        if key is not None and value is not None:
+             k_packed, v_packed, k_scale, v_scale = self._quantize_kv_to_int4(
+                 key, value, attn_metadata.num_actual_tokens
+             )
+@@ -2413,3 +2415,33 @@ class AscendInt4AttentionBackendImpl(AscendAttentionBackendImpl):
+         ):
+             return self._forward_int4_prefill(query, key, value, attn_metadata, output)
+         raise NotImplementedError(f"INT4 KV cache unsupported attention state: {state}")
++
++
++class AscendInt4AttentionBackend(AscendAttentionBackend):
++    """Attention backend for INT4 KV cache (packed 2x int4/byte + inline scale).
++
++    Mirrors :class:`AscendInt4AttentionBackendImpl` on the meta-backend surface
++    used by the model runner to size KV cache blocks: each head is
++    ``head_size // 2`` INT4 bytes plus an inline fp32 per-token-head scale
++    (4 uint8 slots), matching the core ``INT4_PER_TOKEN_HEAD`` page budget.
++    """
++
++    @staticmethod
++    def get_impl_cls() -> type["AscendInt4AttentionBackendImpl"]:
++        return AscendInt4AttentionBackendImpl
++
++    @staticmethod
++    def get_kv_cache_shape(
++        num_blocks: int,
++        block_size: int,
++        num_kv_heads: int,
++        head_size: int,
++        cache_dtype_str: str = "",
++    ) -> tuple[int, ...]:
++        return (
++            2,
++            num_blocks,
++            block_size,
++            num_kv_heads,
++            head_size // 2 + AscendInt4AttentionBackendImpl._INT4_SCALE_PAD,
++        )
+diff --git a/vllm_ascend/quantization/methods/kv_int4.py b/vllm_ascend/quantization/methods/kv_int4.py
+index b420c19f9c..59753024f4 100644
+--- a/vllm_ascend/quantization/methods/kv_int4.py
++++ b/vllm_ascend/quantization/methods/kv_int4.py
+@@ -43,9 +43,13 @@ class AscendKVCacheInt4Method(AscendAttentionScheme):
+         # Upgrade impl to the INT4-specific subclass so the packed KBV write /
+         # gather-unpack-dequant read path is always used.
+         if hasattr(layer, "impl"):
+-            from vllm_ascend.attention.attention_v1 import AscendInt4AttentionBackendImpl
++            from vllm_ascend.attention.attention_v1 import (
++                AscendInt4AttentionBackend,
++                AscendInt4AttentionBackendImpl,
++            )
+ 
+             layer.impl.__class__ = AscendInt4AttentionBackendImpl
++            layer.attn_backend = AscendInt4AttentionBackend
+         dtype = torch.get_default_dtype()
+         layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
+         layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=dtype), requires_grad=False)
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 880589943b..2536fec373 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -3783,6 +3783,7 @@ class NPUModelRunner(GPUModelRunner):
+             # (int4, nvfp4, fp8_e4m3, fp4_e2m1). This must happen after model
+             # loading so that attention layers exist, but before any inference.
+             from vllm.model_executor.layers.attention import Attention
++
+             from vllm_ascend.quantization.kv_cache_utils import setup_kv_cache_quant
+ 
+             cache_dtype = self.vllm_config.cache_config.cache_dtype
+@@ -4574,7 +4575,13 @@ class NPUModelRunner(GPUModelRunner):
+                     if not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
+                         k_shape = kv_cache_shape[1:]
+                         if hasattr(current_kv_cache_spec, "head_size_v"):
+-                            v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
++                            # Packed KV quant (INT4) stores both K and V in the same
++                            # packed per-head slots, so V uses the packed head dim from
++                            # kv_cache_shape rather than the raw v-head size.
++                            if self.vllm_config.cache_config.cache_dtype == "int4":
++                                v_shape = kv_cache_shape[1:]
++                            else:
++                                v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
+                         else:
+                             v_shape = k_shape
+                     else:
+-- 
+2.53.0.windows.3
+

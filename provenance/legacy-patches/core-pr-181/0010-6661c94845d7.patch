@@ -1,0 +1,185 @@
+From 43341b177dbaa8c7f04662f71e885ee7dfe22704 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Sun, 16 Aug 2026 01:15:16 +0800
+Subject: [PATCH] fix(warmup): gate Qwen Triton imports by model family (#251)
+
+## Summary
+- move Qwen warmup family detection into a dependency-free helper
+- avoid importing Qwen Triton kernels for non-Qwen workers before an
+active device target exists
+- add focused family-detection regression coverage
+
+## Validation
+- deployed GLM-4-32B-0414 on Ascend TP8 with graph mode enabled
+(`enforce_eager=False`)
+- engine `/health`, `/v1/models`, direct chat, and public Sage workflow
+inference passed
+- `ruff check` and `ruff format --check` passed
+- focused pytest collection is unavailable in the production image
+because optional test dependency `tblib` is not installed; equivalent
+helper assertions passed in-container
+---
+ .../test_qwen_triton_warmup_config.py         | 28 +++++++++++++++++++
+ vllm/model_executor/warmup/kernel_warmup.py   | 14 ++++++++--
+ .../warmup/qwen_triton_warmup.py              | 25 ++++-------------
+ .../warmup/qwen_triton_warmup_config.py       | 28 +++++++++++++++++++
+ 4 files changed, 73 insertions(+), 22 deletions(-)
+ create mode 100644 tests/model_executor/test_qwen_triton_warmup_config.py
+ create mode 100644 vllm/model_executor/warmup/qwen_triton_warmup_config.py
+
+diff --git a/tests/model_executor/test_qwen_triton_warmup_config.py b/tests/model_executor/test_qwen_triton_warmup_config.py
+new file mode 100644
+index 000000000..23f68f7f2
+--- /dev/null
++++ b/tests/model_executor/test_qwen_triton_warmup_config.py
+@@ -0,0 +1,28 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++from vllm.model_executor.warmup.qwen_triton_warmup_config import (
++    needs_qwen_triton_warmup,
++)
++
++
++def _model_config(*, text_model_type=None, model_type=None):
++    return SimpleNamespace(
++        hf_text_config=SimpleNamespace(model_type=text_model_type),
++        hf_config=SimpleNamespace(model_type=model_type),
++    )
++
++
++def test_qwen_triton_warmup_family_detection() -> None:
++    assert needs_qwen_triton_warmup(_model_config(model_type="qwen3_5"))
++    assert needs_qwen_triton_warmup(
++        _model_config(text_model_type="qwen3_5_moe", model_type="other")
++    )
++
++
++def test_non_qwen_models_skip_triton_warmup_import_path() -> None:
++    assert not needs_qwen_triton_warmup(_model_config(model_type="deepseek_v2"))
++    assert not needs_qwen_triton_warmup(_model_config(model_type="glm4"))
++    assert not needs_qwen_triton_warmup(SimpleNamespace())
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index e31a14db6..18872076b 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -25,7 +25,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+     deepseek_v4_sparse_mla_attention_warmup,
+     flashinfer_sparse_mla_decode_autotune_warmup,
+ )
+-from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
++from vllm.model_executor.warmup.qwen_triton_warmup_config import (
++    needs_qwen_triton_warmup,
++)
+ from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
+     sparse_mla_triton_warmup_if_needed,
+ )
+@@ -54,7 +56,15 @@ def kernel_warmup(worker: "Worker"):
+             getattr(worker.model_runner, "device", torch.device("cuda")),
+             worker.scheduler_config.max_num_batched_tokens,
+         )
+-    qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
++    # Qwen's Triton warmup imports kernels that query the active device target.
++    # Check the model family through a dependency-free helper before importing
++    # those kernels so non-Qwen workers never touch the Triton driver here.
++    if needs_qwen_triton_warmup(worker.vllm_config.model_config):
++        from vllm.model_executor.warmup.qwen_triton_warmup import (
++            qwen_triton_warmup,
++        )
++
++        qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+ 
+     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+     # layer per token; warm them across token sizes first so the first real
+diff --git a/vllm/model_executor/warmup/qwen_triton_warmup.py b/vllm/model_executor/warmup/qwen_triton_warmup.py
+index 62e94f93c..b6520958a 100644
+--- a/vllm/model_executor/warmup/qwen_triton_warmup.py
++++ b/vllm/model_executor/warmup/qwen_triton_warmup.py
+@@ -18,6 +18,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+     causal_conv1d_fn,
+ )
++from vllm.model_executor.warmup.qwen_triton_warmup_config import (
++    needs_qwen_triton_warmup,
++)
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+ from vllm.v1.worker.block_table import BlockTable
+ from vllm.v1.worker.utils import _zero_kv_blocks_kernel
+@@ -27,16 +30,6 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
+-_QWEN_MODEL_TYPES = frozenset(
+-    {
+-        "qwen3_next",
+-        "qwen3_5",
+-        "qwen3_5_text",
+-        "qwen3_5_moe",
+-        "qwen3_5_moe_text",
+-    }
+-)
+-
+ _ZERO_KV_N_BLOCKS = (1, 2)
+ 
+ _SLOT_MAPPING_KV_BLOCK_SIZE = 16
+@@ -349,19 +342,11 @@ def qwen_triton_warmup(
+     if runner.is_pooling_model:
+         return
+ 
+-    hf_text_config = getattr(model_config, "hf_text_config", None)
+-    hf_config = getattr(model_config, "hf_config", None)
+-    model_type = None
+-    for config in (hf_text_config, hf_config):
+-        model_type = getattr(config, "model_type", None)
+-        if model_type is not None:
+-            model_type = str(model_type)
+-            break
+-    if model_type not in _QWEN_MODEL_TYPES:
++    if not needs_qwen_triton_warmup(model_config):
+         return
+ 
+     device = getattr(runner, "device", torch.device("cuda"))
+-    logger.info("Warming up Qwen Triton kernels for model_type=%s.", model_type)
++    logger.info("Warming up Qwen Triton kernels.")
+ 
+     zero_config = _zero_kv_warmup_config(runner)
+     if _warm_zero_kv_blocks_with_runner_zeroer(runner):
+diff --git a/vllm/model_executor/warmup/qwen_triton_warmup_config.py b/vllm/model_executor/warmup/qwen_triton_warmup_config.py
+new file mode 100644
+index 000000000..5456db385
+--- /dev/null
++++ b/vllm/model_executor/warmup/qwen_triton_warmup_config.py
+@@ -0,0 +1,28 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Lightweight model-family checks for Qwen Triton kernel warmup."""
++
++_QWEN_MODEL_TYPES = frozenset(
++    {
++        "qwen3_next",
++        "qwen3_5",
++        "qwen3_5_text",
++        "qwen3_5_moe",
++        "qwen3_5_moe_text",
++    }
++)
++
++
++def needs_qwen_triton_warmup(model_config: object) -> bool:
++    """Return whether ``model_config`` uses Qwen's Triton warmup kernels.
++
++    This helper intentionally has no Torch or Triton imports so worker modules
++    can call it before a device context exists on non-CUDA backends.
++    """
++    hf_text_config = getattr(model_config, "hf_text_config", None)
++    hf_config = getattr(model_config, "hf_config", None)
++    for config in (hf_text_config, hf_config):
++        model_type = getattr(config, "model_type", None)
++        if model_type is not None:
++            return str(model_type) in _QWEN_MODEL_TYPES
++    return False
+-- 
+2.53.0.windows.3
+

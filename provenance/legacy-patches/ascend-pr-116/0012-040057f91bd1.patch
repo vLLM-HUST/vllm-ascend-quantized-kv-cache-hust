@@ -1,0 +1,24 @@
+From b3afe0fcea65f92144daf768376e2be1050893a5 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Mon, 20 Jul 2026 21:34:42 +0800
+Subject: [PATCH] test(sampler): require requested logprobs width
+
+Signed-off-by: Shuhao Zhang (Tony) <shuhao_zhang@hust.edu.cn>
+---
+ tests/e2e/pull_request/one_card/test_mixed_logprobs.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/e2e/pull_request/one_card/test_mixed_logprobs.py b/tests/e2e/pull_request/one_card/test_mixed_logprobs.py
+index 4685d64203..85bc36a626 100644
+--- a/tests/e2e/pull_request/one_card/test_mixed_logprobs.py
++++ b/tests/e2e/pull_request/one_card/test_mixed_logprobs.py
+@@ -44,5 +44,5 @@ def test_qwen3_mixed_logprobs_widths(vllm_runner) -> None:
+         positions = output.outputs[0].logprobs
+         assert positions
+         for position in positions:
+-            assert len(position) <= num_logprobs + 1
++            assert num_logprobs <= len(position) <= num_logprobs + 1
+             assert all(math.isfinite(item.logprob) for item in position.values())
+-- 
+2.53.0.windows.3
+

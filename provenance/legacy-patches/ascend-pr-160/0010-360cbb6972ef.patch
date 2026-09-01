@@ -1,0 +1,100 @@
+From 8322907452ae440a97b1357a39cf4b8a90c21bf6 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Fri, 28 Aug 2026 17:36:53 +0800
+Subject: [PATCH] ci: fix hosted SmartUT regressions
+
+---
+ tests/ut/test_layered_prefill.py              | 29 ++++++-------------
+ .../test_smart_ut_runtime_workflow_static.py  |  4 +--
+ 2 files changed, 11 insertions(+), 22 deletions(-)
+
+diff --git a/tests/ut/test_layered_prefill.py b/tests/ut/test_layered_prefill.py
+index 8437fdb1ca..8ca9428fe1 100644
+--- a/tests/ut/test_layered_prefill.py
++++ b/tests/ut/test_layered_prefill.py
+@@ -22,8 +22,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.core.sched.scheduler import Scheduler
+ 
+ from vllm_ascend.core.layered_prefill_scheduler import (
+-    _ActiveChunk,
+     LayeredPrefillScheduler,
++    _ActiveChunk,
+ )
+ from vllm_ascend.layered_prefill import (
+     LAYERED_PREFILL_MODEL_ADAPTERS,
+@@ -43,17 +43,11 @@ def test_layer_stage_ranges_cover_model_once(
+     num_layers: int,
+     num_stages: int,
+ ) -> None:
+-    ranges = [
+-        get_layer_stage_range(num_layers, num_stages, stage)
+-        for stage in range(num_stages)
+-    ]
++    ranges = [get_layer_stage_range(num_layers, num_stages, stage) for stage in range(num_stages)]
+ 
+     assert ranges[0][0] == 0
+     assert ranges[-1][1] == num_layers
+-    assert all(
+-        left[1] == right[0]
+-        for left, right in zip(ranges, ranges[1:])
+-    )
++    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+     sizes = [stop - start for start, stop in ranges]
+     assert max(sizes) - min(sizes) <= 1
+ 
+@@ -108,14 +102,8 @@ def test_layered_prefill_registers_standard_moe_architectures() -> None:
+     }
+ 
+     assert expected_moe_architectures <= LAYERED_PREFILL_MODEL_ADAPTERS.keys()
+-    assert all(
+-        LAYERED_PREFILL_MODEL_ADAPTERS[architecture].is_moe
+-        for architecture in expected_moe_architectures
+-    )
+-    assert (
+-        LAYERED_PREFILL_MODEL_ADAPTERS["GptOssForCausalLM"].layer_call_order
+-        == "hidden_first"
+-    )
++    assert all(LAYERED_PREFILL_MODEL_ADAPTERS[architecture].is_moe for architecture in expected_moe_architectures)
++    assert LAYERED_PREFILL_MODEL_ADAPTERS["GptOssForCausalLM"].layer_call_order == "hidden_first"
+ 
+ 
+ def test_runner_restores_precomputed_moe_cursor(monkeypatch) -> None:
+@@ -216,9 +204,7 @@ def test_later_stage_caps_and_restores_the_original_chunk() -> None:
+     request = Request()
+     original_token_ids = request._all_token_ids
+     scheduler = object.__new__(LayeredPrefillScheduler)
+-    scheduler._active_chunks = {
+-        request.request_id: _ActiveChunk(start_token=8, num_tokens=4)
+-    }
++    scheduler._active_chunks = {request.request_id: _ActiveChunk(start_token=8, num_tokens=4)}
+     scheduler._active_token_lists = {}
+     scheduler.requests = {request.request_id: request}
+ 
+@@ -241,6 +227,9 @@ def test_platform_mounts_isolated_scheduler_and_eager_runner(
+     monkeypatch,
+     architecture: str,
+ ) -> None:
++    # Keep the test independent from earlier tests that exercise the
++    # process-global sequence-parallel feature cache.
++    monkeypatch.setattr("vllm_ascend.utils._ENABLE_SP", False)
+     model_config = SimpleNamespace(
+         architecture=architecture,
+         model_impl="auto",
+diff --git a/tests/ut/test_smart_ut_runtime_workflow_static.py b/tests/ut/test_smart_ut_runtime_workflow_static.py
+index 85866f7eba..469efccfb7 100644
+--- a/tests/ut/test_smart_ut_runtime_workflow_static.py
++++ b/tests/ut/test_smart_ut_runtime_workflow_static.py
+@@ -54,8 +54,8 @@ def test_npu_preflight_is_fail_closed_and_runs_before_package_install() -> None:
+ def test_container_checkout_uses_runner_compatible_node_runtime() -> None:
+     workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+ 
+-    assert workflow.count("uses: actions/checkout@v6.0.1") == 2
+-    assert "uses: actions/checkout@v7" not in workflow
++    assert workflow.count("uses: actions/checkout@v7") == 2
++    assert "uses: actions/checkout@v6.0.1" not in workflow
+ 
+ 
+ def test_hosted_cpu_checkout_installs_git_before_disabling_submodules() -> None:
+-- 
+2.53.0.windows.3
+

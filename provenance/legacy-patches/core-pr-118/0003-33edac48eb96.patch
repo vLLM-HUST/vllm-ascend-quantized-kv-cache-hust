@@ -1,0 +1,70 @@
+From 33edac48eb965058b278ebc3ec9267dc04702e37 Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Sun, 28 Jun 2026 12:32:21 +0000
+Subject: [PATCH] fix: register KIVI INT4 spec in cache manager and fix
+ cache_dtype log
+
+- Fix misleading 'fake quantization' log message for kivi_int4 cache_dtype
+- Register KIVIInt4FullAttentionSpec in spec_manager_map
+- Add head_size != head_size_v validation guard
+---
+ vllm/config/cache.py                         | 5 ++---
+ vllm/v1/core/single_type_kv_cache_manager.py | 2 ++
+ vllm/v1/kv_cache_interface.py                | 5 +++++
+ 3 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index bc6ead08d..dc8be5956 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -258,9 +258,8 @@ class CacheConfig:
+     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+         if cache_dtype == "kivi_int4":
+             logger.info(
+-                "Using %s fake quantization for kv cache. Storage stays in the "
+-                "model dtype and only KIVI-style fake-quant/dequant is applied "
+-                "during cache updates/reads.",
++                "Using %s kv cache. The concrete storage layout and "
++                "quant/dequant execution are backend-specific.",
+                 str(cache_dtype),
+             )
+             return cache_dtype
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index e8d3a6f75..87927aff7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
+     ChunkedLocalAttentionSpec,
+     CrossAttentionSpec,
+     FullAttentionSpec,
++    KIVIInt4FullAttentionSpec,
+     KVCacheSpec,
+     MambaSpec,
+     MLAAttentionSpec,
+@@ -1143,6 +1144,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
+     FullAttentionSpec: FullAttentionManager,
+     TQFullAttentionSpec: FullAttentionManager,
+     MLAAttentionSpec: FullAttentionManager,
++    KIVIInt4FullAttentionSpec: FullAttentionManager,
+     SlidingWindowSpec: SlidingWindowManager,
+     SlidingWindowMLASpec: SlidingWindowManager,
+     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index f1c6e688c..279c72510 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -299,6 +299,11 @@ class KIVIInt4FullAttentionSpec(FullAttentionSpec):
+         if self.quant_bits != 4:
+             raise ValueError("Current KIVI spec only supports 4-bit history cache.")
+ 
++        if self.head_size != self.head_size_v:
++            raise ValueError(
++                "KIVI INT4 does not support head_size != head_size_v yet."
++            )
++
+         if self.block_size % self.kivi_group_size != 0:
+             raise ValueError(
+                 "For the MVP KIVI paged layout, block_size must be divisible by "
+-- 
+2.53.0.windows.3
+

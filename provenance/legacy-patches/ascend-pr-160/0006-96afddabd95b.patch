@@ -1,0 +1,124 @@
+From 96afddabd95bfc5f79a1b3f325573824ed004adb Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Sun, 16 Aug 2026 07:48:42 +0000
+Subject: [PATCH] test(kv-cache): add multi-step decode cache-append NPU test
+
+Add a multi-step decode test asserting every newly decoded K/V token is
+cached and later decode steps attend to the full extended sequence
+(prefill + all prior decode tokens), covering the DecodeOnly write path
+that previously dropped new tokens.
+
+Co-authored-by: Claude
+Signed-off-by: SuccinctPaul <SuccinctPaul@users.noreply.github.com>
+---
+ .../test_kv_cache_int4_backend.py             | 97 +++++++++++++++++++
+ 1 file changed, 97 insertions(+)
+
+diff --git a/tests/ut/quantization/test_kv_cache_int4_backend.py b/tests/ut/quantization/test_kv_cache_int4_backend.py
+index 5730b040f4..e9ebdff82f 100644
+--- a/tests/ut/quantization/test_kv_cache_int4_backend.py
++++ b/tests/ut/quantization/test_kv_cache_int4_backend.py
+@@ -254,3 +254,100 @@ def test_decode_append_mutates_cache_and_keeps_prefill(device):
+     out2 = _fia_dense(q_dec, dk2.to(_DTYPE), dv2.to(_DTYPE), mask, q_cu, cu2, device)
+     cos2 = _cosine(out2, ref2)
+     assert cos2 > 0.9, f"decode-path attention cosine too low: {cos2:.4f}"
++
++
++def test_multi_step_decode_caches_each_new_token(device):
++    """Multi-step decode: every newly decoded K/V token is cached and later
++    decode steps attend to the full extended sequence (prefill + all prior
++    decode tokens).  This is the exact paired-head contract that was broken
++    when ``forward`` skipped the write path for ``DecodeOnly``."""
++    backend = _make_backend(device)
++    mask = _make_mask(device)
++    seq_lens = [37, 23, 51]
++    total_tokens = sum(seq_lens)
++    bsz = len(seq_lens)
++
++    rng = torch.Generator(device=device).manual_seed(20260816)
++    # Per-sequence prefill K/V, kept in block-major (per-sequence) order so the
++    # expected dense stack matches the dequantized cache layout exactly.
++    seq_k = []
++    seq_v = []
++    key_all = []
++    value_all = []
++    tok_off = 0
++    for sl in seq_lens:
++        kk = (torch.randn(sl, _NUM_KV_HEADS, _HEAD_SIZE, generator=rng, device=device) * 0.5).to(_DTYPE)
++        vv = (torch.randn(sl, _NUM_KV_HEADS, _HEAD_SIZE, generator=rng, device=device) * 0.5).to(_DTYPE)
++        seq_k.append(kk)
++        seq_v.append(vv)
++        key_all.append(kk)
++        value_all.append(vv)
++        tok_off += sl
++    key = torch.cat(seq_k, dim=0)
++    value = torch.cat(seq_v, dim=0)
++    assert key.shape[0] == total_tokens
++
++    slot_mapping, block_table_pad = _prefill_layout(seq_lens, total_tokens, device)
++    k_packed, v_packed, k_scale, v_scale = backend._quantize_kv_to_int4(key, value, total_tokens)
++    harness = _Harness(
++        slot_mapping=slot_mapping,
++        num_actual_tokens=total_tokens,
++        block_tables=block_table_pad,
++        seq_lens_list=seq_lens,
++        attn_mask=mask,
++        attn_state=None,
++    )
++    backend._reshape_and_cache_int4(k_packed, v_packed, k_scale, v_scale, harness)
++
++    def _next_slots(cur_lens):
++        slots = torch.empty(bsz, dtype=torch.int64, device=device)
++        phys_start = 0
++        for i, sl in enumerate(cur_lens):
++            nblk = (sl + _BLOCK_SIZE - 1) // _BLOCK_SIZE
++            slots[i] = phys_start * _BLOCK_SIZE + sl
++            phys_start += nblk
++        return slots
++
++    N_STEPS = 3
++    for step in range(N_STEPS):
++        cur_lens = [s + step for s in seq_lens]
++        k_dec = (torch.randn(bsz, _NUM_KV_HEADS, _HEAD_SIZE, generator=rng, device=device) * 0.5).to(_DTYPE)
++        v_dec = (torch.randn(bsz, _NUM_KV_HEADS, _HEAD_SIZE, generator=rng, device=device) * 0.5).to(_DTYPE)
++
++        # Append one decode token to each per-sequence list (block-major order).
++        for i in range(bsz):
++            key_all[i] = torch.cat([key_all[i], k_dec[i : i + 1]], dim=0)
++            value_all[i] = torch.cat([value_all[i], v_dec[i : i + 1]], dim=0)
++
++        kp, vp, ks, vs = backend._quantize_kv_to_int4(k_dec, v_dec, bsz)
++        harness_step = _Harness(
++            slot_mapping=_next_slots(cur_lens),
++            num_actual_tokens=bsz,
++            block_tables=block_table_pad,
++            seq_lens_list=[s + step + 1 for s in seq_lens],
++            attn_mask=mask,
++            attn_state=None,
++        )
++        backend._reshape_and_cache_int4(kp, vp, ks, vs, harness_step)
++
++        # Dequantize the full extended sequence and compare to the ideal dense
++        # stack in the same per-sequence (block-major) order.
++        seq_lens_full = [s + step + 1 for s in seq_lens]
++        dk, dv = backend._dequant_paged_int4_to_dense(block_table_pad, seq_lens_full, _DTYPE)
++        total_full = sum(seq_lens_full)
++        assert dk.shape[0] == total_full, f"step {step}: dequant {dk.shape[0]} != {total_full}"
++        key_full = torch.cat(key_all, dim=0)
++        value_full = torch.cat(value_all, dim=0)
++        k_cos = _cosine(dk, key_full)
++        v_cos = _cosine(dv, value_full)
++        assert k_cos > 0.99, f"step {step}: K reconstruction cosine too low: {k_cos:.4f}"
++        assert v_cos > 0.99, f"step {step}: V reconstruction cosine too low: {v_cos:.4f}"
++
++        # Decode attention over the extended sequence matches the bf16 reference.
++        q_dec = (torch.randn(bsz, _NUM_HEADS, _HEAD_SIZE, generator=rng, device=device) * 0.5).to(_DTYPE)
++        cu2 = torch.tensor(list(itertools.accumulate(seq_lens_full)), dtype=torch.int32, device=device)
++        q_cu = torch.arange(1, bsz + 1, dtype=torch.int32, device=device)
++        ref2 = _fia_dense(q_dec, key_full, value_full, mask, q_cu, cu2, device)
++        out2 = _fia_dense(q_dec, dk.to(_DTYPE), dv.to(_DTYPE), mask, q_cu, cu2, device)
++        cos2 = _cosine(out2, ref2)
++        assert cos2 > 0.9, f"step {step}: decode-path attention cosine too low: {cos2:.4f}"
+-- 
+2.53.0.windows.3
+

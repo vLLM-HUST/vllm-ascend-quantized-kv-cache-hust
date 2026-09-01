@@ -1,0 +1,116 @@
+From d7a4ceee4ced6411751d36d3adae29872f4753cf Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Sat, 15 Aug 2026 14:46:21 +0800
+Subject: [PATCH] fix(spec-decode): align graph sizes with LCM (#247)
+
+## Summary
+- align full-decode graph capture sizes to the least common multiple of
+speculative query width and sequence-parallel TP width
+- preserve existing behavior when one width divides the other
+- cover DSpark k=5 + TP8 and other non-divisible combinations
+
+## Why
+The previous `max()` implementation rejected valid graph shapes whenever
+neither width divided the other. DeepSeek-V4 DSpark with five draft
+tokens uses query width 6; TP8 sequence parallelism has valid capture
+widths 24, 48, ... but startup incorrectly failed.
+
+## Validation
+- `ruff check vllm/config/compilation.py tests/test_config.py`
+- `ruff format --check vllm/config/compilation.py tests/test_config.py`
+- isolated runtime assertions: `(6,8)->[24,48]`,
+`(4,8)->[8,16,24,32,40,48]`, `(3,4)->[12,24,36,48]`
+- Ascend NPU0-7 TP8 DeepSeek-V4 DSpark graph-mode startup validation in
+progress; no eager fallback
+
+Signed-off-by: Shuhao Zhang (Tony) <shuhao_zhang@hust.edu.cn>
+---
+ tests/test_config.py       | 26 +++++++++++++++++++++++++-
+ vllm/config/compilation.py | 20 +++++++-------------
+ 2 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/tests/test_config.py b/tests/test_config.py
+index e7cbb4a49..fc4bb5177 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -25,7 +25,7 @@ from vllm.config import (
+     VllmConfig,
+     update_config,
+ )
+-from vllm.config.compilation import CompilationMode, CUDAGraphMode
++from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
+ from vllm.config.kernel import IrOpPriorityConfig
+ from vllm.config.load import LoadConfig
+ from vllm.config.utils import get_field
+@@ -1401,6 +1401,30 @@ def test_vllm_config_uses_hardware_aware_cudagraph_ceiling(monkeypatch):
+     assert config.compilation_config.cudagraph_capture_sizes[-1] == 256
+ 
+ 
++@pytest.mark.parametrize(
++    ("uniform_decode_query_len", "tensor_parallel_size", "expected_sizes"),
++    [
++        (6, 8, [24, 48]),
++        (4, 8, [8, 16, 24, 32, 40, 48]),
++        (3, 4, [12, 24, 36, 48]),
++    ],
++)
++def test_spec_decode_sequence_parallel_cudagraph_sizes_use_lcm(
++    uniform_decode_query_len, tensor_parallel_size, expected_sizes
++):
++    config = CompilationConfig(
++        cudagraph_capture_sizes=[8, 16, 24, 32, 40, 48],
++        max_cudagraph_capture_size=48,
++        pass_config=PassConfig(enable_sp=True),
++    )
++
++    config.adjust_cudagraph_sizes_for_spec_decode(
++        uniform_decode_query_len, tensor_parallel_size
++    )
++
++    assert config.cudagraph_capture_sizes == expected_sizes
++
++
+ def test_fusion_pass_op_priority():
+     """This test checks that custom op enablement & IR op priority
+     correctly control default fusions"""
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index 59c56b4a8..fa08b9687 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import enum
++import math
+ from collections import Counter
+ from collections.abc import Callable
+ from dataclasses import field, fields
+@@ -1468,19 +1469,12 @@ class CompilationConfig:
+     ):
+         multiple_of = uniform_decode_query_len
+         if tensor_parallel_size > 1 and self.pass_config.enable_sp:
+-            multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
+-            if (
+-                multiple_of % uniform_decode_query_len != 0
+-                or multiple_of % tensor_parallel_size != 0
+-            ):
+-                raise ValueError(
+-                    f"Can't determine cudagraph shapes that are both a "
+-                    f"multiple of {uniform_decode_query_len} "
+-                    f"(num_speculative_tokens + 1) required by spec-decode "
+-                    f"and {tensor_parallel_size} (tensor_parallel_size) "
+-                    f"required by sequence parallelism please adjust "
+-                    f"num_speculative_tokens or disable sequence parallelism"
+-                )
++            # Full-decode graphs must satisfy both the speculative decode
++            # query width and the sequence-parallel TP width.  Taking max()
++            # only works when one width divides the other (for example 4 and
++            # 8); LCM also handles valid co-prime/non-divisible combinations
++            # such as DSpark k=5 (width 6) with TP=8 (width 24).
++            multiple_of = math.lcm(uniform_decode_query_len, tensor_parallel_size)
+ 
+         if not self.cudagraph_capture_sizes or multiple_of <= 1:
+             return
+-- 
+2.53.0.windows.3
+

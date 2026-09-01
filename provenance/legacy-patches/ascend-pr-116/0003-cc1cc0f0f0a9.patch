@@ -1,0 +1,1190 @@
+From cc1cc0f0f0a992ba8fe56c7f04ebf0d8bd41d255 Mon Sep 17 00:00:00 2001
+From: hustcui <1457310073@qq.com>
+Date: Thu, 25 Jun 2026 06:11:50 +0000
+Subject: [PATCH] feat: add KIVI int4 support on Ascend
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+---
+ ascend_test_ppl.py                            | 468 ++++++++++++++++++
+ csrc/third_party/catlass                      |   2 +-
+ vllm_ascend/attention/attention_v1.py         | 354 ++++++++++++-
+ .../cpu_offload/cpu_offload_connector.py      |   7 +-
+ .../patch/platform/patch_mamba_config.py      |   8 +-
+ .../patch/platform/patch_mamba_config_310.py  |  10 +-
+ vllm_ascend/worker/model_runner_v1.py         | 106 +++-
+ vllm_ascend/worker/worker.py                  |   7 +-
+ 8 files changed, 925 insertions(+), 37 deletions(-)
+ create mode 100644 ascend_test_ppl.py
+
+diff --git a/ascend_test_ppl.py b/ascend_test_ppl.py
+new file mode 100644
+index 000000000..25c4f3000
+--- /dev/null
++++ b/ascend_test_ppl.py
+@@ -0,0 +1,468 @@
++import argparse
++import gc
++import json
++import math
++import os
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import pandas as pd
++import torch
++from transformers import AutoTokenizer
++
++os.environ.setdefault("VLLM_TARGET_DEVICE", "npu")
++os.environ.setdefault("VLLM_PLUGINS", "ascend")
++
++from vllm import LLM, SamplingParams
++
++
++DEFAULT_DATASET = (
++    "/root/vllm-ascend-quant-hust/"
++    "test-00000-of-00001.parquet"
++)
++
++
++@dataclass
++class Sample:
++    index: int
++    text: str
++    token_ids: list[int]
++    original_token_count: int
++    bucket: str
++    was_truncated: bool
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Offline PPL comparison for Qwen3 on Ascend vLLM."
++    )
++    parser.add_argument("--model-path", type=str, required=True)
++    parser.add_argument("--dataset-parquet", type=str, default=DEFAULT_DATASET)
++    parser.add_argument("--text-column", type=str, default=None)
++    parser.add_argument("--max-samples", type=int, default=200)
++    parser.add_argument("--max-model-len", type=int, default=1024)
++    parser.add_argument("--min-tokens", type=int, default=8)
++    parser.add_argument("--batch-size", type=int, default=8)
++    parser.add_argument(
++        "--truncate-mode",
++        choices=("skip", "truncate"),
++        default="skip",
++        help="How to handle samples whose tokenized length exceeds max-model-len.",
++    )
++    parser.add_argument(
++        "--bucket-boundaries",
++        type=str,
++        default="256,512,1024",
++        help="Comma-separated token length bucket upper bounds.",
++    )
++    parser.add_argument(
++        "--kv-cache-dtypes",
++        type=str,
++        default="auto,kivi_int4",
++        help="Comma-separated kv_cache_dtype values to compare.",
++    )
++    parser.add_argument(
++        "--kivi-group-size",
++        type=int,
++        default=32,
++        help="KIVI fake-quant group size when kv_cache_dtype=kivi_int4.",
++    )
++    parser.add_argument(
++        "--kivi-residual-length",
++        type=int,
++        default=32,
++        help="Number of recent full-precision KV tokens kept by KIVI.",
++    )
++    parser.add_argument("--dtype", type=str, default="bfloat16")
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument(
++        "--no-trust-remote-code",
++        action="store_true",
++        help="Disable trust_remote_code when loading tokenizer/model.",
++    )
++    parser.add_argument(
++        "--no-enforce-eager",
++        action="store_true",
++        help="Disable eager mode. Not recommended for PPL comparison.",
++    )
++    parser.add_argument("--disable-sliding-window", action="store_true")
++    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
++    parser.add_argument("--output-json", type=str, default=None)
++    return parser.parse_args()
++
++
++def parse_boundaries(raw: str) -> list[int]:
++    boundaries = []
++    for part in raw.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        value = int(part)
++        if value <= 0:
++            raise ValueError(f"Bucket boundary must be positive, got {value}.")
++        boundaries.append(value)
++    if not boundaries:
++        raise ValueError("At least one bucket boundary is required.")
++    return sorted(set(boundaries))
++
++
++def bucket_name(token_count: int, boundaries: list[int]) -> str:
++    lower = 1
++    for upper in boundaries:
++        if token_count <= upper:
++            return f"{lower}-{upper}"
++        lower = upper + 1
++    return f">{boundaries[-1]}"
++
++
++def load_texts(parquet_path: str, text_column: str | None, max_samples: int) -> list[str]:
++    df = pd.read_parquet(parquet_path)
++    if text_column is None:
++        text_column = next(
++            (col for col in ("text", "content", "page") if col in df.columns),
++            df.columns[0],
++        )
++    texts: list[str] = []
++    for value in df[text_column].tolist():
++        if not isinstance(value, str):
++            continue
++        text = value.strip()
++        if len(text) <= 5 or text.startswith("="):
++            continue
++        texts.append(text)
++        if max_samples > 0 and len(texts) >= max_samples:
++            break
++    return texts
++
++
++def prepare_samples(
++    texts: list[str],
++    tokenizer: AutoTokenizer,
++    max_model_len: int,
++    min_tokens: int,
++    truncate_mode: str,
++    boundaries: list[int],
++) -> tuple[list[Sample], dict[str, int]]:
++    samples: list[Sample] = []
++    stats = {
++        "raw_texts": len(texts),
++        "accepted": 0,
++        "skipped_too_short": 0,
++        "skipped_too_long": 0,
++        "truncated": 0,
++    }
++    for idx, text in enumerate(texts):
++        token_ids = tokenizer.encode(text, add_special_tokens=False)
++        original_len = len(token_ids)
++        if original_len < max(min_tokens, 2):
++            stats["skipped_too_short"] += 1
++            continue
++        was_truncated = False
++        if original_len > max_model_len:
++            if truncate_mode == "skip":
++                stats["skipped_too_long"] += 1
++                continue
++            token_ids = token_ids[:max_model_len]
++            was_truncated = True
++            stats["truncated"] += 1
++            if len(token_ids) < max(min_tokens, 2):
++                stats["skipped_too_short"] += 1
++                continue
++        sample = Sample(
++            index=idx,
++            text=text,
++            token_ids=token_ids,
++            original_token_count=original_len,
++            bucket=bucket_name(len(token_ids), boundaries),
++            was_truncated=was_truncated,
++        )
++        samples.append(sample)
++    stats["accepted"] = len(samples)
++    return samples, stats
++
++
++def make_bucket_stats(boundaries: list[int]) -> dict[str, dict[str, Any]]:
++    names = []
++    lower = 1
++    for upper in boundaries:
++        names.append(f"{lower}-{upper}")
++        lower = upper + 1
++    names.append(f">{boundaries[-1]}")
++    return {
++        name: {
++            "samples": 0,
++            "tokens": 0,
++            "nll_sum": 0.0,
++            "ppl": None,
++        }
++        for name in names
++    }
++
++
++def build_sampling_params() -> SamplingParams:
++    return SamplingParams(
++        temperature=0.0,
++        top_p=1.0,
++        max_tokens=1,
++        prompt_logprobs=1,
++    )
++
++
++def release_device_cache() -> None:
++    try:
++        if hasattr(torch, "accelerator"):
++            torch.accelerator.empty_cache()
++        elif hasattr(torch, "npu") and torch.npu.is_available():
++            torch.npu.empty_cache()
++    except Exception as exc:
++        print(f"[WARN] Failed to empty device cache cleanly: {exc}")
++
++    try:
++        if hasattr(torch, "npu") and torch.npu.is_available():
++            torch.npu.synchronize()
++    except Exception as exc:
++        print(f"[WARN] Failed to synchronize NPU after cache clear: {exc}")
++
++
++def extract_sample_nll(sample: Sample, prompt_logprobs: Any) -> tuple[float, int]:
++    if prompt_logprobs is None:
++        raise ValueError("prompt_logprobs is missing.")
++    if len(prompt_logprobs) != len(sample.token_ids):
++        raise ValueError(
++            f"prompt_logprobs length mismatch: got {len(prompt_logprobs)}, "
++            f"expected {len(sample.token_ids)}."
++        )
++
++    nll_sum = 0.0
++    valid_tokens = 0
++    for pos in range(1, len(sample.token_ids)):
++        chosen_token = sample.token_ids[pos]
++        token_logprobs = prompt_logprobs[pos]
++        if not token_logprobs:
++            raise ValueError(f"Missing prompt logprob at position {pos}.")
++        selected = token_logprobs.get(chosen_token)
++        if selected is None:
++            raise ValueError(
++                f"Chosen token id {chosen_token} missing from prompt_logprobs at "
++                f"position {pos}."
++            )
++        nll_sum += -float(selected.logprob)
++        valid_tokens += 1
++    return nll_sum, valid_tokens
++
++
++def evaluate_configuration(
++    *,
++    model_path: str,
++    kv_cache_dtype: str,
++    samples: list[Sample],
++    batch_size: int,
++    dtype: str,
++    max_model_len: int,
++    kivi_group_size: int,
++    kivi_residual_length: int,
++    trust_remote_code: bool,
++    enforce_eager: bool,
++    disable_sliding_window: bool,
++    gpu_memory_utilization: float,
++    boundaries: list[int],
++) -> dict[str, Any]:
++    print(f"\n[RUN] kv_cache_dtype={kv_cache_dtype}")
++    llm = LLM(
++        model=model_path,
++        trust_remote_code=trust_remote_code,
++        tensor_parallel_size=1,
++        dtype=dtype,
++        max_model_len=max_model_len,
++        enforce_eager=enforce_eager,
++        kv_cache_dtype=kv_cache_dtype,
++        kivi_group_size=kivi_group_size,
++        kivi_residual_length=kivi_residual_length,
++        disable_sliding_window=disable_sliding_window,
++        gpu_memory_utilization=gpu_memory_utilization,
++    )
++
++    sampling_params = build_sampling_params()
++    bucket_stats = make_bucket_stats(boundaries)
++    failures: list[dict[str, Any]] = []
++    total_nll_sum = 0.0
++    total_tokens = 0
++    total_samples = 0
++
++    try:
++        for start in range(0, len(samples), batch_size):
++            batch = samples[start : start + batch_size]
++            batch_prompts = [sample.token_ids for sample in batch]
++            try:
++                outputs = llm.generate(batch_prompts, sampling_params)
++            except Exception as exc:
++                for sample in batch:
++                    failures.append(
++                        {
++                            "index": sample.index,
++                            "bucket": sample.bucket,
++                            "reason": f"batch_generate_failed: {exc}",
++                        }
++                    )
++                print(
++                    f"  batch {start // batch_size}: failed for {len(batch)} "
++                    f"samples: {exc}"
++                )
++                continue
++
++            for sample, output in zip(batch, outputs):
++                try:
++                    nll_sum, valid_tokens = extract_sample_nll(
++                        sample, output.prompt_logprobs
++                    )
++                except Exception as exc:
++                    failures.append(
++                        {
++                            "index": sample.index,
++                            "bucket": sample.bucket,
++                            "reason": str(exc),
++                        }
++                    )
++                    continue
++
++                total_nll_sum += nll_sum
++                total_tokens += valid_tokens
++                total_samples += 1
++
++                bucket_entry = bucket_stats[sample.bucket]
++                bucket_entry["samples"] += 1
++                bucket_entry["tokens"] += valid_tokens
++                bucket_entry["nll_sum"] += nll_sum
++
++            end = min(start + batch_size, len(samples))
++            print(
++                f"  processed {end}/{len(samples)} samples "
++                f"(success={total_samples}, failed={len(failures)})"
++            )
++    finally:
++        del llm
++        gc.collect()
++        release_device_cache()
++
++    overall_ppl = math.exp(total_nll_sum / total_tokens) if total_tokens else None
++    for entry in bucket_stats.values():
++        if entry["tokens"] > 0:
++            entry["ppl"] = math.exp(entry["nll_sum"] / entry["tokens"])
++        del entry["nll_sum"]
++
++    return {
++        "kv_cache_dtype": kv_cache_dtype,
++        "successful_samples": total_samples,
++        "failed_samples": len(failures),
++        "tokens": total_tokens,
++        "avg_nll": (total_nll_sum / total_tokens) if total_tokens else None,
++        "ppl": overall_ppl,
++        "bucket_stats": bucket_stats,
++        "failures": failures,
++    }
++
++
++def print_summary(prep_stats: dict[str, int], results: list[dict[str, Any]]) -> None:
++    print("\n=== Dataset Preparation ===")
++    for key, value in prep_stats.items():
++        print(f"{key:>20}: {value}")
++
++    print("\n=== PPL Summary ===")
++    for result in results:
++        print(
++            f"{result['kv_cache_dtype']:>12} | "
++            f"samples={result['successful_samples']:<4} "
++            f"failed={result['failed_samples']:<4} "
++            f"tokens={result['tokens']:<7} "
++            f"avg_nll={result['avg_nll']:.6f} "
++            f"ppl={result['ppl']:.6f}"
++            if result["ppl"] is not None and result["avg_nll"] is not None
++            else (
++                f"{result['kv_cache_dtype']:>12} | samples=0 failed="
++                f"{result['failed_samples']}"
++            )
++        )
++
++        for bucket_name, bucket_entry in result["bucket_stats"].items():
++            if bucket_entry["tokens"] == 0:
++                continue
++            print(
++                f"    bucket {bucket_name:>10}: "
++                f"samples={bucket_entry['samples']:<4} "
++                f"tokens={bucket_entry['tokens']:<7} "
++                f"ppl={bucket_entry['ppl']:.6f}"
++            )
++
++
++def main() -> None:
++    args = parse_args()
++    np.random.seed(args.seed)
++
++    boundaries = parse_boundaries(args.bucket_boundaries)
++    kv_cache_dtypes = [item.strip() for item in args.kv_cache_dtypes.split(",") if item.strip()]
++    if not kv_cache_dtypes:
++        raise ValueError("At least one kv_cache_dtype must be provided.")
++
++    print("[INFO] Loading tokenizer...")
++    tokenizer = AutoTokenizer.from_pretrained(
++        args.model_path,
++        trust_remote_code=not args.no_trust_remote_code,
++    )
++
++    print(f"[INFO] Loading texts from {args.dataset_parquet}")
++    texts = load_texts(args.dataset_parquet, args.text_column, args.max_samples)
++    print(f"[INFO] Loaded {len(texts)} raw texts.")
++
++    samples, prep_stats = prepare_samples(
++        texts=texts,
++        tokenizer=tokenizer,
++        max_model_len=args.max_model_len,
++        min_tokens=args.min_tokens,
++        truncate_mode=args.truncate_mode,
++        boundaries=boundaries,
++    )
++    if not samples:
++        raise RuntimeError("No valid samples remain after tokenization/filtering.")
++
++    results = []
++    for kv_cache_dtype in kv_cache_dtypes:
++        result = evaluate_configuration(
++            model_path=args.model_path,
++            kv_cache_dtype=kv_cache_dtype,
++            samples=samples,
++            batch_size=args.batch_size,
++            dtype=args.dtype,
++            max_model_len=args.max_model_len,
++            kivi_group_size=args.kivi_group_size,
++            kivi_residual_length=args.kivi_residual_length,
++            trust_remote_code=not args.no_trust_remote_code,
++            enforce_eager=not args.no_enforce_eager,
++            disable_sliding_window=args.disable_sliding_window,
++            gpu_memory_utilization=args.gpu_memory_utilization,
++            boundaries=boundaries,
++        )
++        results.append(result)
++
++    print_summary(prep_stats, results)
++
++    if args.output_json:
++        payload = {
++            "model_path": args.model_path,
++            "dataset_parquet": args.dataset_parquet,
++            "max_model_len": args.max_model_len,
++            "truncate_mode": args.truncate_mode,
++            "prep_stats": prep_stats,
++            "results": results,
++        }
++        output_path = Path(args.output_json)
++        output_path.write_text(
++            json.dumps(payload, indent=2, ensure_ascii=False),
++            encoding="utf-8",
++        )
++        print(f"\n[INFO] Wrote JSON summary to {output_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/csrc/third_party/catlass b/csrc/third_party/catlass
+index b50cad688..716fd7baa 160000
+--- a/csrc/third_party/catlass
++++ b/csrc/third_party/catlass
+@@ -1 +1 @@
+-Subproject commit b50cad688e03281c9281e421edd01369b6dd2144
++Subproject commit 716fd7baa7fb7f6cac0488bb628fd1dd0e875641
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index bf8c1f177..c39187714 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -15,10 +15,12 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ 
++import math
+ from dataclasses import dataclass
+ from enum import Enum
+ 
+ import torch
++from torch import nn
+ import torch_npu
+ import vllm.envs as envs_vllm
+ from vllm.config import VllmConfig, get_current_vllm_config
+@@ -401,6 +403,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self._v_aq_scale = None
+         self._v_aq_offset = None
+         
++        self.enable_kivi = (kv_cache_dtype == "kivi_int4")
++        cache_config = getattr(self.vllm_config, "cache_config", None)
++        kivi_group_size = getattr(cache_config, "kivi_group_size", 32)
++        kivi_residual_length = getattr(cache_config, "kivi_residual_length", 32)
++        self.kivi_group_size = kivi_group_size if isinstance(kivi_group_size, int) else 32
++        self.kivi_residual_length = (
++            kivi_residual_length if isinstance(kivi_residual_length, int) else 32
++        )
++        self.kivi_bits = 4
++        self.k_quant_cache = None
++        self.k_scale_cache = None
++        self.k_mn_cache = None
++        self.v_quant_cache = None
++        self.v_scale_cache = None
++        self.v_mn_cache = None
++        
+         # 只在首次计算
+         self.is_kv_producer = (
+             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
+@@ -411,7 +429,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         self.sinks = sinks
+         self.layerIndex = 0
+         self.enable_hamming_sparse = is_enable_hamming_sparse()
+-
++    
++    def _bind_kivi_cache(self, kv_cache):
++        if kv_cache is None:
++            return
++        assert isinstance(kv_cache, (list, tuple)) and len(kv_cache) == 6
++        (
++            self.k_quant_cache,
++            self.k_scale_cache,
++            self.k_mn_cache,
++            self.v_quant_cache,
++            self.v_scale_cache,
++            self.v_mn_cache,
++        ) = kv_cache
++    
++    def _bind_dense_kv_cache(self, kv_cache) -> None:
++        if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) < 2:
++            raise RuntimeError(f"Dense kv_cache must have at least 2 tensors, got {type(kv_cache)}")
++        self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
++    
+     @staticmethod
+     def update_graph_params(
+         update_stream,
+@@ -803,20 +839,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         # Only initialize/require cache for modes that actually use it
+         if attn_metadata.attn_state != AscendAttentionState.PrefillNoCache:
+             # Initialize cache from kv_cache if not already set (for DecodeOnly mode)
+-            if self.key_cache is None and kv_cache is not None:
+-                if (
+-                    isinstance(kv_cache, torch.Tensor)
+-                    and kv_cache.dim() > 0
+-                    and kv_cache.shape[0] == 2
+-                    or isinstance(kv_cache, (list, tuple))
+-                    and len(kv_cache) >= 2
+-                ):
+-                    self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
++            if kv_cache is not None:
++                if self.enable_kivi:
++                    if self.k_quant_cache is None:
++                        self._bind_kivi_cache(kv_cache)
++                else:
++                    if self.key_cache is None:
++                        self._bind_dense_kv_cache(kv_cache)
+ 
+-            if self.key_cache is None:
+-                raise RuntimeError(
+-                    f"key_cache is None in _get_fia_params for mode {attn_metadata.attn_state}. kv_cache={kv_cache}"
+-                )
++            if self.enable_kivi:
++                if self.k_quant_cache is None:
++                    raise RuntimeError(
++                        f"KIVI cache is None in _get_fia_params for mode {attn_metadata.attn_state}. kv_cache={kv_cache}"
++                    )
++            else:
++                if self.key_cache is None:
++                    raise RuntimeError(
++                        f"key_cache is None in _get_fia_params for mode {attn_metadata.attn_state}. kv_cache={kv_cache}"
++                    )
+ 
+         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+             block_size = 128
+@@ -1050,7 +1090,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if self.key_cache is None:
+             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+             
+-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!![TRACE]into do_kv_cache_update ",flush=True)
+         # ★ 量化：key/value fp16 → int8
+         if self.enable_int8:
+             if not self._int8_ready:
+@@ -1151,7 +1190,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         if attn_metadata is None:
+             return output.fill_(0)
+         
+-        
++         # KIVI INT4 uses a 6-tensor cache layout, not ordinary (k_cache, v_cache).
++        # It must bypass the dense KV cache binding and reshape_and_cache path.
++        if self.enable_kivi:
++            self._bind_kivi_cache(kv_cache)
++            return self._forward_kivi_attention(
++                query,
++                key,
++                value,
++                attn_metadata,
++                output,
++                kv_cache,
++            )
+         # Initialize key_cache and value_cache from kv_cache if not already set.
+         # This is needed for DecodeOnly mode where key/value are None but we still
+         # need access to the cache for attention computation.
+@@ -1225,6 +1275,266 @@ class AscendAttentionBackendImpl(AttentionImpl):
+     
+      # ★ 以下是新增方法
+       # ═══════════════════════════════════════════════════════════════
++    # ★ KIVI INT4 量化: 按原始 KIVI 的“量化历史区 + 全精度 residual 区”计算 attention
++    def _forward_kivi_attention(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor | None,
++        value: torch.Tensor | None,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++        kv_cache=None,
++    ) -> torch.Tensor:
++        self._bind_kivi_cache(kv_cache)
++
++        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
++        num_tokens = int(actual_seq_qlen[-1])
++        query = query[:num_tokens]
++
++        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
++            dense_key = key[:num_tokens].to(query.dtype)
++            dense_value = value[:num_tokens].to(query.dtype)
++            seq_lens = self._cu_seqlens_to_seq_lens(actual_seq_qlen)
++        else:
++            seq_lens = attn_metadata.seq_lens_list
++            dense_key, dense_value = self._gather_dequant_kivi_paged_cache(
++                attn_metadata.block_tables,
++                seq_lens,
++                query.dtype,
++            )
++
++        return self._forward_kivi_dense_attention(
++            query=query,
++            key=dense_key,
++            value=dense_value,
++            seq_lens=seq_lens,
++            actual_seq_qlen=actual_seq_qlen,
++            causal=attn_metadata.causal,
++            output=output,
++        )
++    
++    def _unpack_int4(self, packed: torch.Tensor) -> torch.Tensor:
++        shifts = torch.arange(8, device=packed.device, dtype=torch.int32) * 4
++        return ((packed.to(torch.int32).unsqueeze(-1) >> shifts) & 0xF).to(torch.float32)
++
++
++    def _dequant_kivi_key_blocks(
++        self,
++        k_quant: torch.Tensor,
++        k_scale: torch.Tensor,
++        k_mn: torch.Tensor,
++        target_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        # k_quant: [B, blocks, kv_heads, head_size, block_size / 8]
++        q = self._unpack_int4(k_quant).flatten(-2)
++        block_size = q.shape[-1]
++
++        scale = k_scale.repeat_interleave(self.kivi_group_size, dim=-1)[..., :block_size]
++        mn = k_mn.repeat_interleave(self.kivi_group_size, dim=-1)[..., :block_size]
++
++        deq = q.to(scale.dtype) * scale + mn
++        # -> [B, blocks, block_size, kv_heads, head_size]
++        return deq.permute(0, 1, 4, 2, 3).contiguous().to(target_dtype)
++
++
++    def _dequant_kivi_value_blocks(
++        self,
++        v_quant: torch.Tensor,
++        v_scale: torch.Tensor,
++        v_mn: torch.Tensor,
++        target_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        # v_quant: [B, blocks, block_size, kv_heads, head_size / 8]
++        q = self._unpack_int4(v_quant).flatten(-2)
++        head_size = q.shape[-1]
++
++        scale = v_scale.repeat_interleave(self.kivi_group_size, dim=-1)[..., :head_size]
++        mn = v_mn.repeat_interleave(self.kivi_group_size, dim=-1)[..., :head_size]
++
++        deq = q.to(scale.dtype) * scale + mn
++        # -> [B, blocks, block_size, kv_heads, head_size]
++        return deq.contiguous().to(target_dtype)
++
++
++    def _gather_dequant_kivi_paged_cache(
++        self,
++        block_table: torch.Tensor,
++        seq_lens: list[int],
++        target_dtype: torch.dtype,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        block_table = block_table.to(torch.long)
++        batch_size, max_blocks = block_table.shape
++        flat_ids = block_table.reshape(-1).clamp_min(0)
++
++        k_quant = self.k_quant_cache[flat_ids].view(
++            batch_size, max_blocks, *self.k_quant_cache.shape[1:]
++        )
++        k_scale = self.k_scale_cache[flat_ids].view(
++            batch_size, max_blocks, *self.k_scale_cache.shape[1:]
++        )
++        k_mn = self.k_mn_cache[flat_ids].view(
++            batch_size, max_blocks, *self.k_mn_cache.shape[1:]
++        )
++
++        v_quant = self.v_quant_cache[flat_ids].view(
++            batch_size, max_blocks, *self.v_quant_cache.shape[1:]
++        )
++        v_scale = self.v_scale_cache[flat_ids].view(
++            batch_size, max_blocks, *self.v_scale_cache.shape[1:]
++        )
++        v_mn = self.v_mn_cache[flat_ids].view(
++            batch_size, max_blocks, *self.v_mn_cache.shape[1:]
++        )
++
++        k_blocks = self._dequant_kivi_key_blocks(k_quant, k_scale, k_mn, target_dtype)
++        v_blocks = self._dequant_kivi_value_blocks(v_quant, v_scale, v_mn, target_dtype)
++
++        block_size = k_blocks.shape[2]
++        max_tokens = max_blocks * block_size
++
++        k_flat = k_blocks.view(batch_size, max_tokens, self.num_kv_heads, self.head_size)
++        v_flat = v_blocks.view(batch_size, max_tokens, self.num_kv_heads, self.head_size)
++
++        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=block_table.device)
++        pos = torch.arange(max_tokens, dtype=torch.long, device=block_table.device)
++        valid = (pos.unsqueeze(0) < seq_lens_t.unsqueeze(1)).view(-1)
++
++        dense_k = k_flat.view(-1, self.num_kv_heads, self.head_size)[valid]
++        dense_v = v_flat.view(-1, self.num_kv_heads, self.head_size)[valid]
++        return dense_k.contiguous(), dense_v.contiguous()    
++    
++    def _forward_kivi_dense_attention(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        seq_lens: list[int],
++        actual_seq_qlen,
++        causal: bool,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        prev_q_end = 0
++        kv_start = 0
++        outputs = []
++
++        if isinstance(actual_seq_qlen, torch.Tensor):
++            actual_seq_qlen = actual_seq_qlen.tolist()
++
++        for req_idx, kv_len in enumerate(seq_lens):
++            q_end = int(actual_seq_qlen[req_idx])
++            q_seq = query[prev_q_end:q_end]
++            k_seq = key[kv_start:kv_start + int(kv_len)]
++            v_seq = value[kv_start:kv_start + int(kv_len)]
++
++            q_len = q_seq.shape[0]
++            if q_len > 0:
++                k_seq = self._repeat_kv(k_seq)
++                v_seq = self._repeat_kv(v_seq)
++
++                q_states = q_seq.transpose(0, 1)
++                attn = torch.matmul(q_states, k_seq.permute(1, 2, 0)) * self.scale
++
++                if causal:
++                    attn = attn + self._build_kivi_causal_mask(
++                        q_len=q_len,
++                        kv_seq_len=int(kv_len),
++                        dtype=attn.dtype,
++                        device=attn.device,
++                    )
++
++                attn = torch.softmax(attn, dim=-1, dtype=torch.float32).to(query.dtype)
++                out = torch.matmul(attn, v_seq.transpose(0, 1))
++                outputs.append(out.transpose(0, 1).contiguous())
++
++            prev_q_end = q_end
++            kv_start += int(kv_len)
++
++        if outputs:
++            attn_output = torch.cat(outputs, dim=0)
++            output[:attn_output.shape[0]] = attn_output
++
++        return output
++   
++    
++    
++
++  
++    def _fake_quant_kivi_key(self, key: torch.Tensor) -> torch.Tensor:
++        if key.numel() == 0:
++            return key
++        group_size = self.kivi_group_size
++        num_tokens = key.shape[0]
++        pad_tokens = (group_size - num_tokens % group_size) % group_size
++        work = key.to(torch.float32)
++        if pad_tokens:
++            pad = work[-1:].expand(pad_tokens, -1, -1)
++            work = torch.cat([work, pad], dim=0)
++        grouped = work.view(-1, group_size, self.num_kv_heads, self.head_size)
++        mn = grouped.amin(dim=1, keepdim=True)
++        mx = grouped.amax(dim=1, keepdim=True)
++        scale = (mx - mn).clamp(min=1e-6) / (2**self.kivi_bits - 1)
++        quant = torch.clamp(torch.round((grouped - mn) / scale), 0, 2**self.kivi_bits - 1)
++        dequant = (quant * scale + mn).view(-1, self.num_kv_heads, self.head_size)
++        return dequant[:num_tokens].to(key.dtype)
++
++    def _fake_quant_kivi_value(self, value: torch.Tensor) -> torch.Tensor:
++        if value.numel() == 0:
++            return value
++        group_size = self.kivi_group_size
++        head_size = value.shape[-1]
++        pad_dim = (group_size - head_size % group_size) % group_size
++        work = value.to(torch.float32)
++        if pad_dim:
++            pad = work[..., -1:].expand(*work.shape[:-1], pad_dim)
++            work = torch.cat([work, pad], dim=-1)
++        grouped = work.view(*work.shape[:-1], -1, group_size)
++        mn = grouped.amin(dim=-1, keepdim=True)
++        mx = grouped.amax(dim=-1, keepdim=True)
++        scale = (mx - mn).clamp(min=1e-6) / (2**self.kivi_bits - 1)
++        quant = torch.clamp(torch.round((grouped - mn) / scale), 0, 2**self.kivi_bits - 1)
++        dequant = (quant * scale + mn).view(*work.shape)
++        return dequant[..., :head_size].to(value.dtype)
++
++    def _gather_paged_kv_to_dense(
++        self,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        block_table: torch.Tensor,
++        seq_lens: list[int],
++        target_dtype: torch.dtype,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        batch_size = block_table.shape[0]
++        block_size = key.shape[1]
++        hidden_size = key.shape[2]
++        max_blocks_per_seq = block_table.shape[1]
++        max_tokens_padded = max_blocks_per_seq * block_size
++
++        flat_ids = block_table.reshape(-1)
++        gathered_k = key[flat_ids].view(batch_size, max_tokens_padded, hidden_size)
++        gathered_v = value[flat_ids].view(batch_size, max_tokens_padded, hidden_size)
++
++        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=key.device)
++        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key.device)
++        valid_mask = (positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)).view(-1)
++
++        dense_k = gathered_k.view(-1, hidden_size)[valid_mask]
++        dense_v = gathered_v.view(-1, hidden_size)[valid_mask]
++        dense_k = dense_k.view(-1, self.num_kv_heads, self.head_size).to(target_dtype)
++        dense_v = dense_v.view(-1, self.num_kv_heads, self.head_size).to(target_dtype)
++        return dense_k, dense_v
++
++    @staticmethod
++    def _cu_seqlens_to_seq_lens(cu_seqlens) -> list[int]:
++        if isinstance(cu_seqlens, torch.Tensor):
++            cu_seqlens = cu_seqlens.tolist()
++        prev = 0
++        seq_lens = []
++        for end in cu_seqlens:
++            seq_lens.append(int(end) - prev)
++            prev = int(end)
++        return seq_lens
++
++
+     # ★ INT8 独立方法 (镜像 C8)
+     # ═══════════════════════════════════════════════════════════════
+     def _forward_int8_decode(
+@@ -1234,7 +1544,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         """INT8 Decode: BNSD + int8 paged KV cache + antiquant."""
+-        print("!!!!!!![trace i am doing int8_decode only]",flush=True)
++
+         num_block, block_size, _, _ = self.key_cache.shape
+         key = self.key_cache.view(num_block, block_size, -1)
+         value = self.value_cache.view(num_block, block_size, -1)
+@@ -1268,7 +1578,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         """INT8 ChunkedPrefill: decode→BNSD+int8, prefill→TND+fp16."""
+-        print("!!!!!!![trace i am doing int8_chunked_prefill]",flush=True)
++      
+         num_decode = attn_metadata.num_decode_tokens
+         num_decodes = attn_metadata.num_decodes
+         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+@@ -1316,13 +1626,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
+ 
+             if all_new_prefill and float_key is not None and float_value is not None:
+                 # 全新 prefill: 直接用 fp16 fresh K/V
+-                print("!!!!!!![trace i am doing int8_all_new_prefill]",flush=True)
++             
+                 prefill_k = float_key[num_decode:num_tokens]
+                 prefill_v = float_value[num_decode:num_tokens]
+                 prefill_seq_kvlen = prefill_seq_qlen
+             else:
+                 # 承接已有 cache: gather paged int8 KV → dequant → dense fp16
+-                print("!!!!!!![trace i am doing int8_prefill_hit cache]",flush=True)
++             
+                 num_block, blk_size, _, _ = self.key_cache.shape
+                 paged_k = self.key_cache.view(num_block, blk_size, -1)
+                 paged_v = self.value_cache.view(num_block, blk_size, -1)
+@@ -1360,7 +1670,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         """INT8 Prefill: TND + fp16 (fresh K/V or dequant if from int8 cache)."""
+-        print("!!!!!!![trace i am doing int8_forward prefill]",flush=True)
++      
+         key, value, block_size, block_table, actual_seq_lengths_kv = \
+             self._get_fia_params(key, value, attn_metadata)
+ 
+@@ -1372,7 +1682,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+             and self.attn_type != AttentionType.ENCODER_DECODER
+         ):
+-            print("!!!!!!![trace i am doing int8_all_new_ prefill]",flush=True)
++           
+             key = key[:num_tokens]
+             value = value[:num_tokens]
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
+index 7ee072954..c2440ece9 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
+@@ -17,7 +17,7 @@ from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+ from vllm.logger import logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.mamba.abstract import MambaBase
+-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_kv_cache_torch_dtype
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+ 
+@@ -412,7 +412,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+     if vllm_config.cache_config.cache_dtype == "auto":
+         kv_cache_dtype = vllm_config.model_config.dtype
+     else:
+-        kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[vllm_config.cache_config.cache_dtype]
++        kv_cache_dtype = get_kv_cache_torch_dtype(
++            vllm_config.cache_config.cache_dtype,
++            vllm_config.model_config.dtype,
++        )
+ 
+     kv_cache_spec: dict[str, KVCacheSpec] = {}
+     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+diff --git a/vllm_ascend/patch/platform/patch_mamba_config.py b/vllm_ascend/patch/platform/patch_mamba_config.py
+index 919b58df5..14e25ad80 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_config.py
++++ b/vllm_ascend/patch/platform/patch_mamba_config.py
+@@ -29,10 +29,10 @@ def verify_and_update_config(cls, vllm_config) -> None:
+     model_config = vllm_config.model_config
+     parallel_config = vllm_config.parallel_config
+ 
+-    if cache_config.cache_dtype == "auto":
+-        kv_cache_dtype = model_config.dtype
+-    else:
+-        kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
++    kv_cache_dtype = get_kv_cache_torch_dtype(
++        cache_config.cache_dtype,
++        model_config.dtype,
++    )
+ 
+     kernel_block_size = 128
+     model_cls, _ = ModelRegistry.resolve_model_cls(
+diff --git a/vllm_ascend/patch/platform/patch_mamba_config_310.py b/vllm_ascend/patch/platform/patch_mamba_config_310.py
+index 121ac27e0..9cb1e8a6e 100644
+--- a/vllm_ascend/patch/platform/patch_mamba_config_310.py
++++ b/vllm_ascend/patch/platform/patch_mamba_config_310.py
+@@ -8,7 +8,7 @@ from vllm.logger import logger
+ from vllm.model_executor.models import ModelRegistry
+ from vllm.model_executor.models.config import MambaModelConfig
+ from vllm.utils.math_utils import cdiv
+-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++from vllm.utils.torch_utils import get_kv_cache_torch_dtype
+ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+ 
+ 
+@@ -32,10 +32,10 @@ def verify_and_update_config(cls, vllm_config) -> None:
+     model_config = vllm_config.model_config
+     parallel_config = vllm_config.parallel_config
+ 
+-    if cache_config.cache_dtype == "auto":
+-        kv_cache_dtype = model_config.dtype
+-    else:
+-        kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
++    kv_cache_dtype = get_kv_cache_torch_dtype(
++        cache_config.cache_dtype,
++        model_config.dtype,
++    )
+ 
+     # get attention page size (for 1 token)
+     if model_config.use_mla:
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index dd72bb5c0..4d7d21236 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
+     MambaSpec,
+     MLAAttentionSpec,
+     UniformTypeKVCacheSpecs,
++    KIVIInt4FullAttentionSpec,
+ )
+ from vllm.v1.outputs import (
+     EMPTY_MODEL_RUNNER_OUTPUT,
+@@ -3190,7 +3191,48 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
+         return kv_cache_spec.head_size, head_size_v
+-
++    
++    def _get_kivi_component_layout(
++        self,
++        spec: KIVIInt4FullAttentionSpec,
++        num_blocks: int,
++    ) -> list[tuple[str, int, torch.dtype, tuple[int, ...]]]:
++        group_size = spec.kivi_group_size
++        pack_factor = 32 // spec.quant_bits  # int4 -> 8 values per int32
++
++        q_dtype = spec.quant_packed_dtype      # torch.int32
++        s_dtype = spec.scale_dtype             # fp16/bf16
++
++        q_bytes = get_dtype_size(q_dtype)
++        s_bytes = get_dtype_size(s_dtype)
++
++        block_size = spec.block_size
++        num_kv_heads = spec.num_kv_heads
++        head_size = spec.head_size
++
++        k_quant_shape = (num_blocks, num_kv_heads, head_size, block_size // pack_factor)
++        k_scale_shape = (num_blocks, num_kv_heads, head_size, block_size // group_size)
++        k_mn_shape = k_scale_shape
++
++        v_quant_shape = (num_blocks, block_size, num_kv_heads, head_size // pack_factor)
++        v_scale_shape = (num_blocks, block_size, num_kv_heads, head_size // group_size)
++        v_mn_shape = v_scale_shape
++
++        def nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
++            numel = 1
++            for x in shape:
++                numel *= x
++            return numel * get_dtype_size(dtype)
++
++        return [
++            ("k_quant", nbytes(k_quant_shape, q_dtype), q_dtype, k_quant_shape),
++            ("k_scale", nbytes(k_scale_shape, s_dtype), s_dtype, k_scale_shape),
++            ("k_mn",    nbytes(k_mn_shape, s_dtype), s_dtype, k_mn_shape),
++            ("v_quant", nbytes(v_quant_shape, q_dtype), q_dtype, v_quant_shape),
++            ("v_scale", nbytes(v_scale_shape, s_dtype), s_dtype, v_scale_shape),
++            ("v_mn",    nbytes(v_mn_shape, s_dtype), s_dtype, v_mn_shape),
++        ]
++        
+     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+         """
+         Initializes the KV cache buffer with the correct size. The buffer needs
+@@ -3251,7 +3293,25 @@ class NPUModelRunner(GPUModelRunner):
+                     # and rope head dim.
+                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+                     assert isinstance(current_kv_cache_spec, AttentionSpec)
++                    if isinstance(current_kv_cache_spec, KIVIInt4FullAttentionSpec):
++                        assert kv_cache_tensor.size % current_kv_cache_spec.page_size_bytes == 0
++                        num_blocks = kv_cache_tensor.size // current_kv_cache_spec.page_size_bytes
++
++                        layout = self._get_kivi_component_layout(current_kv_cache_spec, num_blocks)
++                        raw_tensors = []
++                        for _, component_nbytes, _, _ in layout:
++                            if self.vllm_config.kv_transfer_config is None:
++                                t = torch.zeros(component_nbytes, dtype=torch.int8, device=self.device)
++                            else:
++                                t = torch.zeros(component_nbytes + alignment, dtype=torch.int8, device=self.device)
++                                t = self._align_memory(t, alignment)[:component_nbytes]
++                            raw_tensors.append(t)
+ 
++                        for layer_name_inner in kv_cache_tensor.shared_by:
++                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
++                                kv_cache_raw_tensors[layer_name_inner] = tuple(raw_tensors)
++                        continue
++                    
+                     if self.use_sparse:
+                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
+                         kv_cache_spec = layer_kv_cache_spec[layer_name]
+@@ -3371,6 +3431,50 @@ class NPUModelRunner(GPUModelRunner):
+                     # _allocate_kv_cache_tensors; route them to the dedicated
+                     # elif branch below before the sparse branch tries to
+                     # unpack them as a (k, v, dsa_k[, scale]) tuple.
++                    if isinstance(current_kv_cache_spec, KIVIInt4FullAttentionSpec):
++                        raw_k_quant, raw_k_scale, raw_k_mn, raw_v_quant, raw_v_scale, raw_v_mn = kv_cache_raw_tensors[layer_name]
++
++                        total_nbytes = (
++                            raw_k_quant.numel()
++                            + raw_k_scale.numel()
++                            + raw_k_mn.numel()
++                            + raw_v_quant.numel()
++                            + raw_v_scale.numel()
++                            + raw_v_mn.numel()
++                        )
++                        assert total_nbytes % current_kv_cache_spec.page_size_bytes == 0
++                        num_blocks = total_nbytes // current_kv_cache_spec.page_size_bytes
++                        assert num_blocks >= kv_cache_config.num_blocks
++
++                        layout = self._get_kivi_component_layout(current_kv_cache_spec, num_blocks)
++
++                        k_quant_dtype = current_kv_cache_spec.quant_packed_dtype
++                        scale_dtype = current_kv_cache_spec.scale_dtype
++
++                        _, _, _, k_quant_shape = layout[0]
++                        _, _, _, k_scale_shape = layout[1]
++                        _, _, _, k_mn_shape = layout[2]
++                        _, _, _, v_quant_shape = layout[3]
++                        _, _, _, v_scale_shape = layout[4]
++                        _, _, _, v_mn_shape = layout[5]
++
++                        k_quant_cache = raw_k_quant.view(k_quant_dtype).view(k_quant_shape)
++                        k_scale_cache = raw_k_scale.view(scale_dtype).view(k_scale_shape)
++                        k_mn_cache = raw_k_mn.view(scale_dtype).view(k_mn_shape)
++
++                        v_quant_cache = raw_v_quant.view(k_quant_dtype).view(v_quant_shape)
++                        v_scale_cache = raw_v_scale.view(scale_dtype).view(v_scale_shape)
++                        v_mn_cache = raw_v_mn.view(scale_dtype).view(v_mn_shape)
++
++                        kv_caches[layer_name] = (
++                            k_quant_cache,
++                            k_scale_cache,
++                            k_mn_cache,
++                            v_quant_cache,
++                            v_scale_cache,
++                            v_mn_cache,
++                        )
++                        continue
+                     if self.use_sparse and "cache_only_layers" not in layer_name:
+                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(current_kv_cache_spec)
+                         if current_sparse_c8:
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index b5a94273f..f3e4a0f65 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -44,7 +44,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.utils.mem_constants import GiB_bytes
+ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_kv_cache_torch_dtype
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+@@ -341,7 +341,10 @@ class NPUWorker(WorkerBase):
+         if self.cache_config.cache_dtype == "auto":
+             self.cache_dtype = self.model_config.dtype
+         else:
+-            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
++            self.cache_dtype = get_kv_cache_torch_dtype(
++                self.cache_config.cache_dtype,
++                self.model_config.dtype,
++            )
+ 
+         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
+         self.profiler_config = vllm_config.profiler_config
+-- 
+2.53.0.windows.3
+

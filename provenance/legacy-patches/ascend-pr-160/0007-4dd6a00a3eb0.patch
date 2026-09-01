@@ -1,0 +1,316 @@
+From 4dd6a00a3eb0002eca596e731340f952727ed75a Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Fri, 28 Aug 2026 17:08:10 +0800
+Subject: [PATCH] fix(kv-cache): gate int4 execution contracts
+
+---
+ .../test_kv_cache_int4_backend.py             |  37 +++++--
+ tests/ut/quantization/test_kv_cache_quant.py  | 102 +++++++++++-------
+ vllm_ascend/platform.py                       |   6 ++
+ vllm_ascend/quantization/kv_cache_utils.py    |  19 +++-
+ 4 files changed, 120 insertions(+), 44 deletions(-)
+
+diff --git a/tests/ut/quantization/test_kv_cache_int4_backend.py b/tests/ut/quantization/test_kv_cache_int4_backend.py
+index e9ebdff82f..3fe25f95be 100644
+--- a/tests/ut/quantization/test_kv_cache_int4_backend.py
++++ b/tests/ut/quantization/test_kv_cache_int4_backend.py
+@@ -32,13 +32,16 @@ Tests are skipped when no NPU is available.
+ """
+ 
+ import itertools
++from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+ 
+ torch_npu = pytest.importorskip("torch_npu")
+ 
++from vllm_ascend.attention import attention_v1  # noqa: E402
+ from vllm_ascend.attention.attention_v1 import (  # noqa: E402
++    AscendAttentionState,
+     AscendInt4AttentionBackendImpl,
+ )
+ 
+@@ -256,11 +259,16 @@ def test_decode_append_mutates_cache_and_keeps_prefill(device):
+     assert cos2 > 0.9, f"decode-path attention cosine too low: {cos2:.4f}"
+ 
+ 
+-def test_multi_step_decode_caches_each_new_token(device):
++def test_multi_step_decode_caches_each_new_token(device, monkeypatch):
+     """Multi-step decode: every newly decoded K/V token is cached and later
+     decode steps attend to the full extended sequence (prefill + all prior
+     decode tokens).  This is the exact paired-head contract that was broken
+     when ``forward`` skipped the write path for ``DecodeOnly``."""
++    monkeypatch.setattr(
++        attention_v1,
++        "_EXTRA_CTX",
++        SimpleNamespace(capturing=False),
++    )
+     backend = _make_backend(device)
+     mask = _make_mask(device)
+     seq_lens = [37, 23, 51]
+@@ -319,16 +327,33 @@ def test_multi_step_decode_caches_each_new_token(device):
+             key_all[i] = torch.cat([key_all[i], k_dec[i : i + 1]], dim=0)
+             value_all[i] = torch.cat([value_all[i], v_dec[i : i + 1]], dim=0)
+ 
+-        kp, vp, ks, vs = backend._quantize_kv_to_int4(k_dec, v_dec, bsz)
++        q_dec = (
++            torch.randn(
++                bsz,
++                _NUM_HEADS,
++                _HEAD_SIZE,
++                generator=rng,
++                device=device,
++            )
++            * 0.5
++        ).to(_DTYPE)
+         harness_step = _Harness(
+             slot_mapping=_next_slots(cur_lens),
+             num_actual_tokens=bsz,
+             block_tables=block_table_pad,
+             seq_lens_list=[s + step + 1 for s in seq_lens],
+             attn_mask=mask,
+-            attn_state=None,
++            attn_state=AscendAttentionState.DecodeOnly,
++        )
++        actual = backend.forward(
++            layer=None,
++            query=q_dec,
++            key=k_dec,
++            value=v_dec,
++            kv_cache=(backend.key_cache, backend.value_cache),
++            attn_metadata=harness_step,
++            output=torch.empty_like(q_dec),
+         )
+-        backend._reshape_and_cache_int4(kp, vp, ks, vs, harness_step)
+ 
+         # Dequantize the full extended sequence and compare to the ideal dense
+         # stack in the same per-sequence (block-major) order.
+@@ -344,10 +369,8 @@ def test_multi_step_decode_caches_each_new_token(device):
+         assert v_cos > 0.99, f"step {step}: V reconstruction cosine too low: {v_cos:.4f}"
+ 
+         # Decode attention over the extended sequence matches the bf16 reference.
+-        q_dec = (torch.randn(bsz, _NUM_HEADS, _HEAD_SIZE, generator=rng, device=device) * 0.5).to(_DTYPE)
+         cu2 = torch.tensor(list(itertools.accumulate(seq_lens_full)), dtype=torch.int32, device=device)
+         q_cu = torch.arange(1, bsz + 1, dtype=torch.int32, device=device)
+         ref2 = _fia_dense(q_dec, key_full, value_full, mask, q_cu, cu2, device)
+-        out2 = _fia_dense(q_dec, dk.to(_DTYPE), dv.to(_DTYPE), mask, q_cu, cu2, device)
+-        cos2 = _cosine(out2, ref2)
++        cos2 = _cosine(actual, ref2)
+         assert cos2 > 0.9, f"step {step}: decode-path attention cosine too low: {cos2:.4f}"
+diff --git a/tests/ut/quantization/test_kv_cache_quant.py b/tests/ut/quantization/test_kv_cache_quant.py
+index b37c83ee6e..6a64afbcc8 100644
+--- a/tests/ut/quantization/test_kv_cache_quant.py
++++ b/tests/ut/quantization/test_kv_cache_quant.py
+@@ -46,28 +46,32 @@ def _make_mock_module(name, attrs=None):
+     return mod
+ 
+ 
+-_mock_torch_npu = _make_mock_module("torch_npu", attrs={
+-    "is_available": MagicMock(return_value=False),
+-    "Event": MagicMock(),
+-    "Stream": MagicMock(),
+-    "current_stream": MagicMock(return_value=MagicMock()),
+-    "current_device": MagicMock(return_value=0),
+-    "synchronize": MagicMock(),
+-    "set_device": MagicMock(),
+-    "device_count": MagicMock(return_value=0),
+-    "mem_get_info": MagicMock(return_value=(0, 0)),
+-    "get_device_name": MagicMock(return_value="MockNPU"),
+-    "get_device_properties": MagicMock(),
+-    "manual_seed_all": MagicMock(),
+-    "reset_peak_memory_stats": MagicMock(),
+-    "max_memory_allocated": MagicMock(return_value=0),
+-    "empty_cache": MagicMock(),
+-    "is_current_stream_capturing": MagicMock(return_value=False),
+-    "set_compile_mode": MagicMock(),
+-})
++_mock_torch_npu = _make_mock_module(
++    "torch_npu",
++    attrs={
++        "is_available": MagicMock(return_value=False),
++        "Event": MagicMock(),
++        "Stream": MagicMock(),
++        "current_stream": MagicMock(return_value=MagicMock()),
++        "current_device": MagicMock(return_value=0),
++        "synchronize": MagicMock(),
++        "set_device": MagicMock(),
++        "device_count": MagicMock(return_value=0),
++        "mem_get_info": MagicMock(return_value=(0, 0)),
++        "get_device_name": MagicMock(return_value="MockNPU"),
++        "get_device_properties": MagicMock(),
++        "manual_seed_all": MagicMock(),
++        "reset_peak_memory_stats": MagicMock(),
++        "max_memory_allocated": MagicMock(return_value=0),
++        "empty_cache": MagicMock(),
++        "is_current_stream_capturing": MagicMock(return_value=False),
++        "set_compile_mode": MagicMock(),
++    },
++)
+ sys.modules["torch_npu"] = _mock_torch_npu
+ 
+ import torch  # noqa: E402
++
+ torch.npu = _mock_torch_npu
+ 
+ # Mock torchaudio to avoid libcudart.so loading errors
+@@ -75,14 +79,23 @@ sys.modules["torchaudio"] = _make_mock_module("torchaudio")
+ 
+ import pytest  # noqa: E402
+ 
+-from vllm_ascend.quantization.kv_cache_utils import (
++from vllm_ascend.quantization.kv_cache_utils import (  # noqa: E402
+     get_kv_cache_scheme,
+     setup_kv_cache_quant,
++    validate_kv_cache_quant_config,
++)
++from vllm_ascend.quantization.methods.kv_fp4_e2m1 import (  # noqa: E402
++    AscendKVCacheFP4E2M1Method,
++)
++from vllm_ascend.quantization.methods.kv_fp8_e4m3 import (  # noqa: E402
++    AscendKVCacheFP8E4M3Method,
++)
++from vllm_ascend.quantization.methods.kv_int4 import (  # noqa: E402
++    AscendKVCacheInt4Method,
++)
++from vllm_ascend.quantization.methods.kv_nvfp4 import (  # noqa: E402
++    AscendKVCacheNVFP4Method,
+ )
+-from vllm_ascend.quantization.methods.kv_int4 import AscendKVCacheInt4Method
+-from vllm_ascend.quantization.methods.kv_nvfp4 import AscendKVCacheNVFP4Method
+-from vllm_ascend.quantization.methods.kv_fp8_e4m3 import AscendKVCacheFP8E4M3Method
+-from vllm_ascend.quantization.methods.kv_fp4_e2m1 import AscendKVCacheFP4E2M1Method
+ 
+ # ---------------------------------------------------------------------------
+ # Helper
+@@ -100,7 +113,6 @@ def _make_layer():
+ 
+ 
+ class TestAscendKVCacheInt4Method:
+-
+     def test_create_weights_sets_uint8_dtype(self):
+         layer = _make_layer()
+         scheme = AscendKVCacheInt4Method()
+@@ -144,7 +156,6 @@ class TestAscendKVCacheInt4Method:
+ 
+ 
+ class TestAscendKVCacheNVFP4Method:
+-
+     def test_create_weights_sets_uint8_dtype(self):
+         layer = _make_layer()
+         scheme = AscendKVCacheNVFP4Method()
+@@ -186,7 +197,6 @@ class TestAscendKVCacheNVFP4Method:
+ 
+ 
+ class TestAscendKVCacheFP8E4M3Method:
+-
+     def test_create_weights_sets_fp8_dtype(self):
+         layer = _make_layer()
+         scheme = AscendKVCacheFP8E4M3Method()
+@@ -229,7 +239,6 @@ class TestAscendKVCacheFP8E4M3Method:
+ 
+ 
+ class TestAscendKVCacheFP4E2M1Method:
+-
+     def test_create_weights_sets_uint8_dtype(self):
+         layer = _make_layer()
+         scheme = AscendKVCacheFP4E2M1Method()
+@@ -271,15 +280,17 @@ class TestAscendKVCacheFP4E2M1Method:
+ 
+ 
+ class TestKVCacheUtils:
+-
+     # -- get_kv_cache_scheme -------------------------------------------------
+ 
+-    @pytest.mark.parametrize("dtype,expected_cls", [
+-        ("int4", AscendKVCacheInt4Method),
+-        ("nvfp4", AscendKVCacheNVFP4Method),
+-        ("fp8_e4m3", AscendKVCacheFP8E4M3Method),
+-        ("fp4_e2m1", AscendKVCacheFP4E2M1Method),
+-    ])
++    @pytest.mark.parametrize(
++        "dtype,expected_cls",
++        [
++            ("int4", AscendKVCacheInt4Method),
++            ("nvfp4", AscendKVCacheNVFP4Method),
++            ("fp8_e4m3", AscendKVCacheFP8E4M3Method),
++            ("fp4_e2m1", AscendKVCacheFP4E2M1Method),
++        ],
++    )
+     def test_get_kv_cache_scheme_returns_correct_type(self, dtype, expected_cls):
+         """For each known dtype string, ``get_kv_cache_scheme`` returns a
+         non-None instance of the correct handler class."""
+@@ -331,4 +342,23 @@ class TestKVCacheUtils:
+     def test_setup_kv_cache_quant_noop_for_empty_string(self):
+         layer = _make_layer()
+         setup_kv_cache_quant(layer, "")
+-        assert not hasattr(layer, "kv_cache_torch_dtype")
+\ No newline at end of file
++        assert not hasattr(layer, "kv_cache_torch_dtype")
++
++    def test_int4_config_requires_eager_execution(self):
++        config = types.SimpleNamespace(
++            cache_config=types.SimpleNamespace(cache_dtype="int4"),
++            model_config=types.SimpleNamespace(enforce_eager=False),
++            compilation_config=types.SimpleNamespace(cudagraph_mode=types.SimpleNamespace(name="FULL_DECODE_ONLY")),
++        )
++
++        with pytest.raises(ValueError, match="supports eager execution only"):
++            validate_kv_cache_quant_config(config)
++
++    def test_int4_config_accepts_eager_without_graph_capture(self):
++        config = types.SimpleNamespace(
++            cache_config=types.SimpleNamespace(cache_dtype="int4"),
++            model_config=types.SimpleNamespace(enforce_eager=True),
++            compilation_config=types.SimpleNamespace(cudagraph_mode=types.SimpleNamespace(name="NONE")),
++        )
++
++        validate_kv_cache_quant_config(config)
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index a9f206c011..04ffa5dfc1 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -685,6 +685,12 @@ class NPUPlatform(Platform):
+             )
+             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+ 
++        from vllm_ascend.quantization.kv_cache_utils import (
++            validate_kv_cache_quant_config,
++        )
++
++        validate_kv_cache_quant_config(vllm_config)
++
+         # Recompute cudagraph sizes after Ascend-specific compatibility updates.
+         # The platform default max is injected earlier via
+         # `apply_config_platform_defaults`, so this late pass should only honor
+diff --git a/vllm_ascend/quantization/kv_cache_utils.py b/vllm_ascend/quantization/kv_cache_utils.py
+index 785d46f559..3aaf0c4429 100644
+--- a/vllm_ascend/quantization/kv_cache_utils.py
++++ b/vllm_ascend/quantization/kv_cache_utils.py
+@@ -97,4 +97,21 @@ def setup_kv_cache_quant(layer: torch.nn.Module, cache_dtype: str) -> None:
+         "KV cache quantization enabled: dtype=%s, scheme=%s",
+         cache_dtype,
+         type(scheme).__name__,
+-    )
+\ No newline at end of file
++    )
++
++
++def validate_kv_cache_quant_config(vllm_config) -> None:
++    """Reject executable KV-cache modes whose runtime contract is incomplete."""
++    cache_config = getattr(vllm_config, "cache_config", None)
++    if getattr(cache_config, "cache_dtype", None) != "int4":
++        return
++
++    model_config = getattr(vllm_config, "model_config", None)
++    compilation_config = getattr(vllm_config, "compilation_config", None)
++    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
++    graph_disabled = getattr(cudagraph_mode, "name", None) == "NONE"
++    if not getattr(model_config, "enforce_eager", False) or not graph_disabled:
++        raise ValueError(
++            "Ascend INT4 KV cache currently supports eager execution only. "
++            "Set --enforce-eager; ACL graph capture is not yet supported."
++        )
+-- 
+2.53.0.windows.3
+

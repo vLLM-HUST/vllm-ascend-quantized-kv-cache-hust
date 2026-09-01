@@ -1,0 +1,48 @@
+From ab0a8e87d5b8a361e4c26d83c400d440b1c85f87 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Sat, 11 Jul 2026 00:52:01 +0800
+Subject: [PATCH] Fast path text-only block hashing
+
+---
+ vllm/v1/core/kv_cache_utils.py | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 7a5ebadb1..0e2d74139 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -736,6 +736,31 @@ def get_request_block_hasher(
+             request.block_hashes[-1] if request.block_hashes else None
+         )
+         new_block_hashes: list[BlockHash] = []
++
++        if (
++            not request.mm_features
++            and request.lora_request is None
++            and not request.cache_salt
++            and request.prompt_embeds is None
++        ):
++            token_ids = request.all_token_ids
++            while True:
++                end_token_idx = start_token_idx + hash_block_size
++                if end_token_idx > num_tokens:
++                    break
++
++                block_hash = hash_block_tokens(
++                    caching_hash_fn,
++                    prev_block_hash_value,
++                    token_ids[start_token_idx:end_token_idx],
++                    extra_keys=None,
++                )
++                new_block_hashes.append(block_hash)
++                start_token_idx = end_token_idx
++                prev_block_hash_value = block_hash
++
++            return new_block_hashes
++
+         while True:
+             end_token_idx = start_token_idx + hash_block_size
+             if end_token_idx > num_tokens:
+-- 
+2.53.0.windows.3
+

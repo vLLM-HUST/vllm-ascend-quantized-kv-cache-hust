@@ -1,0 +1,27 @@
+From 589999fee3187b1e0d13aa40c4928cbc42a2831b Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Mon, 17 Aug 2026 14:50:57 +0800
+Subject: [PATCH] style(envs): preserve formatter-clean revert
+
+---
+ vllm/envs.py | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 10bfbabfb..db05ab979 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1967,9 +1967,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         "VLLM_KNORM_SCORE_AGGREGATION", "min"
+     ),
+     # How to reduce norms across heads: 'mean', 'max', or 'sum'.
+-    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv(
+-        "VLLM_KNORM_NORM_REDUCE_OP", "mean"
+-    ),
++    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv("VLLM_KNORM_NORM_REDUCE_OP", "mean"),
+     # Whether to enable dual cuda streams for LoRA computation
+     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
+     # overlap the base layer compute with the LoRA fast path).
+-- 
+2.53.0.windows.3
+
