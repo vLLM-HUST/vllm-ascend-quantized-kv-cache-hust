@@ -4,18 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-ascend-quantized-kv-cache"
-version = "0.1.0.dev0"
-description = "vllm-ascend-quantized-kv-cache inert vLLM-HUST contract descriptor"
+description = "Pluggable quantized KV-cache solutions for the vLLM-HUST stack (vllm-hust and vllm-ascend-hust)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = []
+dynamic = ["version"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
 
 [project.entry-points."vllm_hust.extension_bundles"]
-"org.vllm-hust.quantized-kv-cache" = "vllm_ascend_quantized_kv_cache"
+"org.vllm-hust.quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.manifests"
+
+# Native vLLM bootstrap hook. It is a no-op unless explicitly requested via
+# VLLM_HUST_QUANT_KV_SOLUTIONS (installation must never change behaviour).
+[project.entry-points."vllm.general_plugins"]
+"vllm-hust-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+
+[tool.hatch.version]
+path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vllm_ascend_quantized_kv_cache"]
@@ -29,3 +37,8 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Verbatim port of the legacy triton-ascend kernels (ascend-pr-116 final
+# state): line lengths are preserved from the source patch on purpose.
+"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_cache.py" = ["E501"]

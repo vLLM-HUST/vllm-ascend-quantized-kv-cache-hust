@@ -1,0 +1,106 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.quantized-kv-cache",
+  "extension_version": "0.2.0.dev0",
+  "kind": "in_process_plugin",
+  "host": {
+    "provider": "vllm",
+    "name": "vllm-ascend",
+    "version_range": ">=0"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {"name": "vllm.kv-cache.dtype-registry", "version_range": ">=1,<2"},
+    {"name": "vllm.kv-cache.layout", "version_range": ">=1,<2"},
+    {"name": "vllm.attention.quantized-kv", "version_range": ">=1,<2"},
+    {"name": "vllm.kv-transfer.quantized-layout", "version_range": ">=1,<2"}
+  ],
+  "components": [
+    {
+      "component_id": "quantized-kv-layout",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.dtypes:resolve_layout",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1",
+        "vllm.kv-transfer.quantized-layout.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "solution-int8-dynamic",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.solutions.int8_dynamic:SOLUTION_SPEC",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "solution-kivi-int4",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.solutions.kivi_int4:SOLUTION_SPEC",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "solution-packed-schemes",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.solutions.packed:SOLUTION_SPECS",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.dtypes",
+      "object": "resolve_layout",
+      "status": "import_only"
+    },
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.solutions.int8_dynamic",
+      "object": "SOLUTION_SPEC",
+      "status": "import_only"
+    },
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.solutions.kivi_int4",
+      "object": "SOLUTION_SPEC",
+      "status": "import_only"
+    },
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.solutions.packed",
+      "object": "SOLUTION_SPECS",
+      "status": "import_only"
+    }
+  ],
+  "requires_services": [],
+  "activation": {
+    "entry_points": [],
+    "environment": {},
+    "additional_config": {}
+  }
+}
