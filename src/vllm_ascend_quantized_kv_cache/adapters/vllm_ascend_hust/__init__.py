@@ -1,26 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vllm-ascend-hust host adapter.
+"""vllm-ascend-hust 宿主适配器。
 
-Attach mechanism (no host changes required):
+挂载机制（零宿主改动）：
 
-1. the solution's scheme class is registered into the host's
-   ``@register_scheme`` registry under a namespaced quant_type key;
-2. attention layers pick it up through the checkpoint ``fa_quant_type``
-   key (ModelSlim path), or the bootstrap registers it in every process;
-3. for the stateful solutions the scheme's ``create_weights`` swaps the
-   layer impl to our mixin-backed ``AscendAttentionBackendImpl`` subclass
-   (the in-tree C8 precedent).
+1. 方法的 scheme 类以带命名空间的 quant_type 键注册进宿主的
+   @register_scheme 注册表；
+2. attention 层经 checkpoint 的 fa_quant_type 键（ModelSlim 路径）
+   命中该 scheme，或由 bootstrap 在每个进程里注册；
+3. 有状态方法由 scheme 的 create_weights 把 layer impl 换成 mixin
+   支撑的 AscendAttentionBackendImpl 子类（在树 C8 先例）。
 """
 
-from .attention import apply_impl_surgery, build_impl_cls, supported_impl_solutions
+from .attention import apply_impl_surgery, build_impl_cls, supported_impl_methods
 from .register import AscendHustAdapter
-from .scheme import build_scheme_cls, packed_scheme_for
+from .scheme import build_scheme_cls, packed_semantics_for
 
 __all__ = [
     "AscendHustAdapter",
     "apply_impl_surgery",
     "build_impl_cls",
     "build_scheme_cls",
-    "packed_scheme_for",
-    "supported_impl_solutions",
+    "packed_semantics_for",
+    "supported_impl_methods",
 ]

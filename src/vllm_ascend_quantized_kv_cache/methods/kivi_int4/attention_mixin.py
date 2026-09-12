@@ -1,25 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Attention-backend mixin for the KIVI INT4 solution.
+"""KIVI INT4 方案的 attention backend mixin（本库最大的单文件）。
 
-Ported from legacy ascend PR #116 commits 0003-0009 (final state of the
-``AscendAttentionBackendImpl`` KIVI branches). Design summary:
+移植自 legacy ascend PR #116 提交 0003-0009（AscendAttentionBackendImpl
+KIVI 分支的最终状态）。设计总览：
 
-* The paged cache is a 6-tuple ``(k_quant, k_scale, k_mn, v_quant, v_scale,
-  v_mn)``; keys are quantized per token-group over the residual window,
-  values per head-dim group per token.
-* The most recent ``kivi_residual_length`` tokens stay full precision in a
-  per-request residual row (ring buffer sized ``max_num_seqs``); overflowing
-  key windows are flushed whole into the int4 history, values one slot at a
-  time.
-* Attention runs on the NPU fused-inference operator (TND) over a dense
-  gather + dequant of the history, with the full-precision residual tail
-  overlaid on the last tokens.
+* 分页缓存是 6 元组 ``(k_quant, k_scale, k_mn, v_quant, v_scale, v_mn)``。
+  键：残差窗口按 token 组量化（组内逐 (head,dim) min/max）；
+  值：每个 token 按 head 维组量化。
+* 每个请求最近 ``kivi_residual_length`` 个 token 保持全精度，存在
+  "残差行"里（环形缓冲，行数 = max_num_seqs，一行一个请求）。键窗口
+  写满后整组 flush 进 int4 历史区；值则每挤掉一个最老槽位。
+* 注意力计算：把 int4 历史区 gather + 反量化成稠密张量，交 NPU
+  fused-inference 算子（TND 布局），再把全精度残差尾覆盖回最后几个
+  token —— 即"历史区量化省显存，残差区保精度"。
 
-Host base classes are supplied at class-construction time (see
-``adapters.vllm_ascend_hust.attention.build_impl_cls``). triton-ascend
-kernels and torch_npu are imported lazily inside the methods that need
-them; attention states are matched by enum-member name so the module
-imports cleanly outside any host.
+宿主基类在构造子类时传入（bind 式，见 adapters.vllm_ascend_hust）。
+triton 内核 / torch_npu 在用到的方法里惰性导入；注意力状态按枚举成员
+名字匹配，模块在任何宿主之外都能干净导入（stub 测试依赖这一点）。
 """
 
 from __future__ import annotations
@@ -43,12 +40,18 @@ class KiviInt4AttentionMixin:
     """KIVI INT4 (2-bit-window residual + int4 history) attention path."""
 
     # ------------------------------------------------------------------
-    # state
+    # 状态：方案属性 + 布局校验 + 6 元组缓存绑定
     # ------------------------------------------------------------------
 
     def _init_kivi_state(
         self, kv_cache_dtype: str | None, vllm_config: Any = None
     ) -> None:
+        """建立 KIVI 全部实例状态。
+
+        group_size / residual_length 优先读宿主 cache_config 的
+        kivi_group_size / kivi_residual_length（默认 128/128）；
+        残差行数取 scheduler 的 max_num_seqs（一行服务一个请求）。
+        """
         self.enable_kivi = kv_cache_dtype in ("kivi_int4", "kivi")
         cache_config = getattr(vllm_config, "cache_config", None)
         group_size = getattr(cache_config, "kivi_group_size", 128)
@@ -111,10 +114,11 @@ class KiviInt4AttentionMixin:
         return self.k_quant_cache.shape[-1] * 8
 
     # ------------------------------------------------------------------
-    # cache binding
+    # 缓存绑定：6 元组（k/v 各 quant+scale+mn）与稠密 2 元组的统一入口
     # ------------------------------------------------------------------
 
     def _bind_kivi_cache(self, kv_cache: Any) -> None:
+        """绑定 6 元组分页缓存；首次绑定时顺带分配残差缓冲。"""
         if kv_cache is None:
             return
         if not isinstance(kv_cache, list | tuple):
@@ -146,10 +150,15 @@ class KiviInt4AttentionMixin:
         self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
 
     # ------------------------------------------------------------------
-    # residual rows
+    # 残差行：每个请求占一行（行数 = max_num_seqs），请求结束回收
     # ------------------------------------------------------------------
 
     def _ensure_kivi_residual_buffers(self) -> None:
+        """惰性分配残差环形缓冲（每请求一行 × residual_length 槽）。
+
+        slot_ids 记录每个 lane 存的是哪个绝对槽位（-1 = 空闲）；
+        start/len 构成环形队列的读出顺序。
+        """
         if self.kivi_residual_key_cache is not None:
             return
 
@@ -225,7 +234,7 @@ class KiviInt4AttentionMixin:
             self._release_kivi_residual_row(req_key)
 
     # ------------------------------------------------------------------
-    # residual ring buffer
+    # 残差环形缓冲：行内是 start/len 环形队列，写满按策略挤前缀
     # ------------------------------------------------------------------
 
     def _get_kivi_residual_buffers(
@@ -250,6 +259,10 @@ class KiviInt4AttentionMixin:
         return self.kivi_residual_value_start, self.kivi_residual_value_len
 
     def _get_kivi_residual_lanes(self, row_idx: int, *, is_key: bool) -> list[int]:
+        """按环形（FIFO）顺序返回该行已占用 lane 的下标列表。
+
+        start+len 越过容量时回绕：range(start, cap) + range(0, ...)。
+        """
         starts, lengths = self._get_kivi_residual_state(is_key=is_key)
         length = lengths[row_idx]
         if length <= 0:
@@ -339,6 +352,11 @@ class KiviInt4AttentionMixin:
     def _flush_kivi_residual_prefix(
         self, req_key: str, *, is_key: bool, count: int
     ) -> None:
+        """把残差窗口最老的 count 个槽位 flush 进 int4 历史区。
+
+        键窗口满时 count = 整个窗口（整组 flush）；值则 count = 1
+        （每次挤掉一个最老槽位）——这是 legacy 的非对称策略。
+        """
         row_idx = self._get_kivi_residual_row(req_key, create=False)
         if row_idx is None:
             return
@@ -368,6 +386,11 @@ class KiviInt4AttentionMixin:
     def _store_kivi_residual_entries(
         self, values: torch.Tensor, slots: torch.Tensor, *, req_key: str, is_key: bool
     ) -> None:
+        """向请求的残差环形行追加 token；写满则先 flush 前缀再写入。
+
+        逐槽处理：命中已有 lane 就原地覆盖；否则走环形尾写入，
+        写入前 while 循环保证有空间（键挤整窗、值挤一个）。
+        """
         if values.numel() == 0 or slots.numel() == 0:
             return
 
@@ -505,7 +528,7 @@ class KiviInt4AttentionMixin:
         self._set_kivi_residual_window(req_key, keep_slots, keep_tensor, is_key=is_key)
 
     # ------------------------------------------------------------------
-    # write / flush into the paged int4 history
+    # 写入 / flush：残差 -> 分页 int4 历史区（经 triton 打包内核）
     # ------------------------------------------------------------------
 
     def _write_kivi_cache(
@@ -623,6 +646,11 @@ class KiviInt4AttentionMixin:
             prev_q_end = q_end
 
     def _write_kivi_key_quant_cache(self, key: Any, slot_mapping: Any) -> None:
+        """键整组 flush 入历史区：先做全部布局校验，再发 triton 打包内核。
+
+        校验清单：head 对齐、整组 token、word 对齐、组大小、块大小、
+        槽位连续且块对齐——任何不满足都在发内核前 fail-closed。
+        """
         self._check_kivi_cache_bound()
         if key is None or slot_mapping is None:
             return
@@ -777,6 +805,11 @@ class KiviInt4AttentionMixin:
         req_ids: list[str] | None,
         finished_req_ids: set[str] | None = None,
     ) -> None:
+        """每步同步：回收 finished 请求的残差行 + 清理各请求的过期槽位。
+
+        请求被抢占/换块后，残差行里可能残留不再属于它的槽位，
+        全部清掉，防止读到陈旧的全精度值。
+        """
         req_keys = self._get_kivi_req_keys(req_ids, len(seq_lens))
         ordered_slots = self._get_kivi_ordered_slots(block_table, seq_lens)
         if finished_req_ids:
@@ -791,7 +824,7 @@ class KiviInt4AttentionMixin:
             self._clear_stale_kivi_residual_entries(req_key, live_slots, is_key=False)
 
     # ------------------------------------------------------------------
-    # gather + dequant the paged history
+    # gather + 反量化：int4 历史区 -> 稠密张量（残差尾覆盖回尾部）
     # ------------------------------------------------------------------
 
     def _get_kivi_ordered_slots(
@@ -820,7 +853,13 @@ class KiviInt4AttentionMixin:
         target_dtype: Any,
         req_ids: list[str] | None = None,
     ) -> tuple[Any, Any]:
-        from ...ops.triton.kivi_cache import kivi_dequant_gather_cache
+        """int4 历史区 -> 稠密 K/V，并把全精度残差尾覆盖回每请求尾部。
+
+        triton dequant-gather（torch 路径，见 ops.kivi_gather）产出历史
+        区的稠密张量；随后每请求取残差窗口里的张量按尾部对齐覆盖——
+        历史区里这些槽位还是旧的量化值，覆盖后才与真实 KV 一致。
+        """
+        from ...ops.kivi_gather import kivi_dequant_gather_cache
 
         cache_device = self.k_quant_cache.device
         batch_size = len(seq_lens)
@@ -896,7 +935,7 @@ class KiviInt4AttentionMixin:
         )
 
     # ------------------------------------------------------------------
-    # attention paths
+    # 注意力路径：按注意力状态分派（prefill/decode/chunked/兜底稠密）
     # ------------------------------------------------------------------
 
     def _repeat_kv(self, tensor: Any) -> Any:
@@ -939,6 +978,15 @@ class KiviInt4AttentionMixin:
         output: Any,
         kv_cache: Any = None,
     ) -> Any:
+        """KIVI 的 forward 总入口：回收 finished 行 -> 写入 -> 按状态分派。
+
+        分派规则：
+          * PrefillNoCache：整段直接量化入历史 + FIA prefill（不进残差）；
+          * DecodeOnly：写残差 -> 同步窗口 -> gather+反量化 -> TND FIA；
+          * ChunkedPrefill：只支持"decode 行 + 全新 prefill"组合，
+            prefill 带历史的场景直接 RuntimeError（fail-closed）；
+          * 其他状态（PrefillCacheHit 等）：写 + 同步 + 纯 torch 稠密兜底。
+        """
         self._bind_kivi_cache(kv_cache)
 
         finished_req_ids = getattr(attn_metadata, "finished_req_ids", None)
@@ -1266,7 +1314,7 @@ class KiviInt4AttentionMixin:
         causal: bool,
         output: Any,
     ) -> Any:
-        """Pure-torch dense attention over the dequantized KV (fallback)."""
+        """纯 torch 稠密注意力兜底路径（逐请求 softmax，无需 NPU 算子）。"""
         prev_q_end = 0
         kv_start = 0
         outputs = []

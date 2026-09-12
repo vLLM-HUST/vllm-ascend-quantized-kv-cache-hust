@@ -19,7 +19,7 @@ separate device-provider components with hardware-specific tests.
 
 ## Interim native integration path (before the contract lands)
 
-The solution library is usable today through each host's existing extension
+The method library is usable today through each host's existing extension
 surfaces, without any host-repository change and without flipping the
 manifest away from `import_only`:
 
@@ -34,7 +34,7 @@ manifest away from `import_only`:
 This interim path is *fail-closed by construction* (unknown names, missing
 hosts, missing kernels, and non-NPU devices all raise), but it is not the
 manager-mediated activation: enabling intent lives in the operator's
-environment (`VLLM_HUST_QUANT_KV_SOLUTIONS`), not in the Extension Manager
+environment (`VLLM_HUST_KV_METHODS`), not in the Extension Manager
 catalog. Flip the manifest `implementation.status` to `active` only when
 the four protocols above exist in the host, adapter-mediated activation
 replaces the environment opt-in, and compatibility evidence (minimum and

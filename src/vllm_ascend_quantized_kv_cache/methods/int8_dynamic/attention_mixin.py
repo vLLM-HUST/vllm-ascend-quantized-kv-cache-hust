@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Attention-backend mixin for the dynamic per-channel INT8 solution.
+"""动态 per-channel INT8 方案的 attention backend mixin。
 
-Ported from legacy ascend PR #116 commit 0001
-(``AscendAttentionBackendImpl`` INT8 branches), with the host base class
-supplied at class-construction time (see
-``adapters.vllm_ascend_hust.attention.build_impl_cls``).
+移植自 legacy ascend PR #116 提交 0001（AscendAttentionBackendImpl 的
+INT8 分支）；宿主基类在"构造子类"时才传入（见
+adapters.vllm_ascend_hust.attention.build_impl_cls 的 bind 式工厂）。
 
-The mixin never imports torch_npu or the host at module import time: the
-NPU operator module is resolved lazily inside each method and the attention
-state is matched by enum-member name, so the whole module imports cleanly
-under stub tests. Debug ``print`` traces from the legacy patch were dropped;
-quantization math is delegated to :mod:`.semantics`.
+三条 forward 分支（按注意力状态分派）：
+  * decode：BNSD 布局直接对分页 int8 缓存做 fused attention + antiquant；
+  * chunked prefill：decode 行走 int8 缓存，prefill 行走 fp16
+    （新 token 直接用，命中缓存的先 gather 反量化）；
+  * prefill：TND 布局 + fp16（缓存命中时手动反量化）。
+
+本模块导入期不碰 torch_npu 和宿主：NPU 算子在方法内惰性解析，注意力
+状态按枚举成员"名字"匹配（避免 import 宿主枚举），stub 测试可完整导入。
+legacy 补丁里的调试 print 已剔除；量化数学委托给 semantics 模块。
 """
 
 from __future__ import annotations
@@ -46,9 +49,10 @@ class Int8DynamicAttentionMixin:
     def _init_int8_dynamic_state(
         self, kv_cache_dtype: str | None, vllm_config: Any = None
     ) -> None:
+        """建立 INT8 方案的全部实例状态（构造或类手术后调用）。"""
         # Accept every dtype spelling that reaches the impl constructor: the
         # legacy patch keyed on "int8", the layout contract on
-        # "int8_per_token_head", and host adapters may use the solution name.
+        # "int8_per_token_head", and host adapters may use the method name.
         self.enable_int8 = kv_cache_dtype in (
             "int8",
             "int8_per_token_head",
@@ -61,12 +65,13 @@ class Int8DynamicAttentionMixin:
 
     @property
     def _sem(self) -> Int8DynamicSemantics:
+        # self 自身就带 num_kv_heads/head_size 属性，可直接当 config 用
         return Int8DynamicSemantics(self)
 
     # -- store path ---------------------------------------------------------
 
     def _calc_int8_scales(self, key: Any, value: Any) -> None:
-        """Online amax over the token dim, once, on the first prefill."""
+        """首次 prefill 时沿 token 维取一次 amax（之后一直复用）。"""
         self._int8_scales = self._sem.calc_scales(key, value)
         self._int8_ready = True
 
@@ -83,7 +88,7 @@ class Int8DynamicAttentionMixin:
         return Int8DynamicSemantics.quantize(x, inv_scale, offset)
 
     def _int8_quantize_for_store(self, key: Any, value: Any) -> tuple[Any, Any]:
-        """Quantize fresh K/V before they enter the paged cache."""
+        """新 token 进分页缓存前的量化（K/V 各用各的 scale）。"""
         scales = self._int8_scales_or_raise()
         return (
             self._quantize_kv_to_int8(key, scales.k_inv_scale, scales.k_offset),
@@ -93,7 +98,10 @@ class Int8DynamicAttentionMixin:
     def do_kv_cache_update(
         self, key: Any, value: Any, kv_cache: Any, attn_metadata: Any, layer: Any
     ) -> None:
-        """Quantize K/V, then delegate to the host store path."""
+        """覆写宿主的缓存写入：先量化 K/V，再委托宿主原始路径。
+
+        首次调用时顺便完成 scale 计算（legacy 的"只算一次"语义）。
+        """
         if getattr(self, "enable_int8", False):
             if not self._int8_ready:
                 self._calc_int8_scales(key, value)
@@ -103,6 +111,7 @@ class Int8DynamicAttentionMixin:
     # -- compute path -------------------------------------------------------
 
     def _int8_aq_kwargs(self) -> dict[str, Any]:
+        """NPU fused attention 的 antiquant 反量化参数包（BNSD 视图）。"""
         scales = self._int8_scales_or_raise()
         return {
             "key_antiquant_scale": scales.k_aq_scale,
@@ -122,6 +131,7 @@ class Int8DynamicAttentionMixin:
         target_dtype: Any,
     ) -> tuple[Any, Any]:
         scales = self._int8_scales_or_raise()
+        # 分页 int8 -> 稠密 fp16（prefill 命中缓存时用）
         return int8_ops.dequant_paged_kv_to_dense(
             key,
             value,
@@ -142,7 +152,10 @@ class Int8DynamicAttentionMixin:
         attn_metadata: Any,
         output: Any,
     ) -> Any:
-        """INT8 decode: BNSD layout over the paged INT8 cache + antiquant."""
+        """INT8 decode：BNSD 布局直接吃分页 int8 缓存 + antiquant。
+
+        decode 每 request 只有 1 个 query token，unsqueeze 成 BNSD 的 [B,1]。
+        """
         torch_npu = import_torch_npu("_forward_int8_decode")
         num_block, block_size, _, _ = self.key_cache.shape
         key = self.key_cache.view(num_block, block_size, -1)
@@ -175,8 +188,11 @@ class Int8DynamicAttentionMixin:
         attn_metadata: Any,
         output: Any,
     ) -> Any:
-        """INT8 chunked prefill: decode rows use BNSD + int8 cache;
-        prefill rows use TND + fp16 (fresh K/V or dequantized cache)."""
+        """INT8 chunked prefill：decode 行走 BNSD+int8，prefill 行走 TND+fp16。
+
+        prefill 部分区分两种情况：全部是新请求 -> 直接用 fp16 新 K/V；
+        承接已有缓存 -> 先 gather 分页 int8 再反量化成稠密 fp16。
+        """
         torch = import_torch("_forward_int8_chunked_prefill")
         torch_npu = import_torch_npu("_forward_int8_chunked_prefill")
         num_decode = attn_metadata.num_decode_tokens
@@ -266,7 +282,7 @@ class Int8DynamicAttentionMixin:
         attn_metadata: Any,
         output: Any,
     ) -> Any:
-        """INT8 prefill: TND + fp16 (fresh K/V, or dequant when cache-hit)."""
+        """INT8 prefill：TND + fp16（新 K/V；缓存命中则先手动反量化）。"""
         torch = import_torch("_forward_int8_prefill")
         torch_npu = import_torch_npu("_forward_int8_prefill")
         key, value, block_size, block_table, actual_seq_lengths_kv = (
@@ -336,13 +352,15 @@ class Int8DynamicAttentionMixin:
         attn_metadata: Any,
         output: Any,
     ) -> Any:
-        """Full forward for the INT8 path (store + dispatch by attn state).
+        """INT8 路径的完整 forward（量化写缓存 + 按状态分派计算）。
 
-        Mirrors the legacy ``forward`` branches once ``enable_int8`` is on.
-        States outside decode / chunked-prefill / prefill fail closed.
+        与 legacy forward 的 INT8 分支一一对应：保存 fp16 副本 -> 量化
+        K/V -> 写缓存 -> 按注意力状态分派。decode/chunked/prefill 之外
+        的状态 fail-closed（不支持的状态静默走错路径比报错更危险）。
         """
         float_key, float_value = None, None
         if key is not None and value is not None:
+            # decode 不需要 fp16 副本（直接吃 int8 缓存）；prefill 需要
             if _attn_state_name(attn_metadata) != "DecodeOnly":
                 float_key, float_value = key, value
             if not self._int8_ready:
@@ -368,7 +386,7 @@ class Int8DynamicAttentionMixin:
                 output,
             )
         raise RuntimeError(
-            f"int8_dynamic solution does not support attention state {state!r}"
+            f"int8_dynamic method does not support attention state {state!r}"
         )
 
 

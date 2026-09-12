@@ -31,11 +31,11 @@ jobs:
           .release-smoke/bin/python -c "
           import importlib.metadata as im
           assert im.version('vllm-ascend-quantized-kv-cache') == '0.2.0.dev0'
-          from vllm_ascend_quantized_kv_cache import kv_solutions, __version__
+          from vllm_ascend_quantized_kv_cache import kv_methods, __version__
           assert __version__ == '0.2.0.dev0'
-          names = kv_solutions.list()
+          names = kv_methods.list()
           assert 'kivi_int4' in names and 'int8_dynamic' in names
-          sol = kv_solutions.get('kivi_int4', head_size=128)
+          sol = kv_methods.get('kivi_int4', head_size=128)
           assert sol.resolve_layout().storage_dtype == 'uint8'
           print('smoke OK:', names)
           "

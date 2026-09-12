@@ -11,7 +11,7 @@ import torch
 
 from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.attention import (
     build_impl_cls,
-    supported_impl_solutions,
+    supported_impl_methods,
 )
 from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.scheme import (
     build_scheme_cls,
@@ -52,11 +52,11 @@ class _StubAscendImpl:
         )
 
 
-def test_supported_impl_solutions() -> None:
-    assert set(supported_impl_solutions()) == {"int8_dynamic", "kivi_int4"}
+def test_supported_impl_methods() -> None:
+    assert set(supported_impl_methods()) == {"int8_dynamic", "kivi_int4"}
 
 
-def test_build_impl_cls_unknown_solution_fails_closed() -> None:
+def test_build_impl_cls_unknown_method_fails_closed() -> None:
     with pytest.raises(ValueError, match="no Ascend impl mixin"):
         build_impl_cls("warp9_drive", _StubAscendImpl)
 
@@ -97,7 +97,7 @@ class _StubAscendScheme:
 
 
 def test_build_packed_scheme_cls_matches_handler() -> None:
-    scheme_cls = build_scheme_cls("int4", _StubAscendScheme)
+    scheme_cls = build_scheme_cls("int4_packed", _StubAscendScheme)
     scheme = scheme_cls()
     assert scheme.scheme_key == "VLLM_HUST_KV_INT4"
     layer = torch.nn.Module()
@@ -137,7 +137,7 @@ def test_build_stateful_scheme_cls_performs_surgery(monkeypatch) -> None:
     import types
 
     import vllm_ascend_quantized_kv_cache.core.runtime as runtime
-    from vllm_ascend_quantized_kv_cache.solutions.kivi_int4 import (
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4 import (
         attention_mixin as kivi,
     )
 
@@ -180,9 +180,88 @@ def test_dtype_literal_negotiation() -> None:
     assert set(DTYPE_LITERAL_MAP) == {
         "int8_dynamic",
         "kivi_int4",
-        "int4",
+        "int4_packed",
         "nvfp4",
         "fp8_e4m3",
     }
     with pytest.raises(ValueError, match="no vllm-hust CacheDType"):
         map_cache_dtype("fp4_e2m1")
+
+
+def _install_fake_ascend_registry(monkeypatch) -> dict:
+    """用桩模块顶替 vllm_ascend 的 scheme 注册表（CI 无宿主栈也可跑）。"""
+    import sys
+    import types
+
+    class _FakeRegistry:
+        def __init__(self):
+            self.reg: dict = {}
+
+        def register_scheme(self, key, layer_type):
+            def deco(cls):
+                k = (key, layer_type)
+                if k in self.reg:
+                    raise ValueError(
+                        f"Scheme already registered for {key}/{layer_type}: "
+                        f"{self.reg[k].__name__}"
+                    )
+                self.reg[k] = cls
+                return cls
+
+            return deco
+
+        def get_scheme_class(self, key, layer_type):
+            return self.reg.get((key, layer_type))
+
+    fake = _FakeRegistry()
+    fake_module = types.ModuleType("vllm_ascend.quantization.methods.registry")
+    fake_module.register_scheme = fake.register_scheme
+    fake_module.get_scheme_class = fake.get_scheme_class
+    base_module = types.ModuleType("vllm_ascend.quantization.methods.base")
+
+    class _AscendAttentionScheme:
+        def __init__(self, quant_description=None, prefix=None):
+            self.quant_description = quant_description or {}
+            self.prefix = prefix or ""
+
+    base_module.AscendAttentionScheme = _AscendAttentionScheme
+    for name, mod in (
+        ("vllm_ascend", types.ModuleType("vllm_ascend")),
+        (
+            "vllm_ascend.quantization",
+            types.ModuleType("vllm_ascend.quantization"),
+        ),
+        (
+            "vllm_ascend.quantization.methods",
+            types.ModuleType("vllm_ascend.quantization.methods"),
+        ),
+        ("vllm_ascend.quantization.methods.registry", fake_module),
+        ("vllm_ascend.quantization.methods.base", base_module),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return fake.reg
+
+
+def test_ascend_register_idempotent_and_conflict(monkeypatch) -> None:
+    from vllm_ascend_quantized_kv_cache import kv_methods
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust import (
+        AscendHustAdapter,
+    )
+
+    reg = _install_fake_ascend_registry(monkeypatch)
+    method = kv_methods.get("int8_dynamic")
+    adapter = AscendHustAdapter(method)
+    monkeypatch.setattr(adapter, "require_host", lambda: None)
+
+    first = adapter.register()
+    assert first["quant_type"] == "VLLM_HUST_KV_INT8_DYNAMIC"
+    assert first["already_registered"] is False
+
+    # 第二次激活生成新的等价类（同名）：幂等 no-op
+    second = adapter.register()
+    assert second["already_registered"] is True
+
+    # 键相同但类名不同（真冲突）：fail-closed
+    reg[("VLLM_HUST_KV_FOREIGN", "attention")] = type("SomeoneElsesScheme", (), {})
+    with pytest.raises(ValueError, match="Scheme already registered"):
+        adapter.register(quant_type="VLLM_HUST_KV_FOREIGN")

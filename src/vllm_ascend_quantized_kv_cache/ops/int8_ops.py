@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NPU tensor helpers for the dynamic per-channel INT8 solution.
+"""动态 per-channel INT8 方案的 NPU 张量辅助算子。
 
-Ported from legacy ascend PR #116 commit 0001. The gather-and-dequant path
-runs on plain torch ops, so it is exercised by the CPU unit tests; the NPU
-fused-inference calls stay inside the attention mixin.
+移植自 legacy ascend PR #116 提交 0001。gather + 反量化路径是普通
+torch 运算，CPU 单测直接覆盖；NPU fused-inference 调用则留在
+attention mixin 里（依赖 torch_npu 与 attn_metadata）。
 """
 
 from __future__ import annotations
@@ -27,9 +27,10 @@ def dequant_paged_kv_to_dense(
     v_inv_scale: Any,
     v_offset: Any,
 ) -> tuple[Any, Any]:
-    """Gather paged INT8 KV blocks and dequantize to a dense target dtype.
+    """按块表 gather 分页 INT8 KV，并反量化成稠密目标 dtype。
 
-    Mirrors ``AscendAttentionBackendImpl._dequant_paged_kv_to_dense``.
+    对应 legacy ``_dequant_paged_kv_to_dense``：把 [batch, max_blocks]
+    个缓存块摊平 -> 用 seq_lens 掩掉无效槽位 -> 逐通道反量化。
     """
     batch_size = block_table.shape[0]
     block_size = key.shape[1]

@@ -18,7 +18,7 @@ echo "wheel:      ${WHEEL}"
 echo "version:    ${EXPECTED_VERSION}"
 echo "--- contents (filtered) ---"
 python -m zipfile -l "${WHEEL}" | awk '{print $1}' | grep -E \
-  'manifests/vllm-hust-extension-v0.2.json|entry_points.txt|METADATA|_version.py|kivi_cache.py|bootstrap.py' ||
+  'manifests/vllm-hust-extension-v0.2.json|entry_points.txt|METADATA|_version.py|kivi_pack.py|bootstrap.py' ||
   { echo "FAIL: expected files missing from wheel"; exit 1; }
 
 echo "--- entry points ---"

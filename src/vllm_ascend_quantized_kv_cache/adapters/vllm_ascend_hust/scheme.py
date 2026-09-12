@@ -1,43 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Quant-scheme class construction for the vllm-ascend-hust host.
+"""vllm-ascend-hust 宿主的 quant scheme 类构造。
 
-The host dispatches attention-layer quant schemes from the checkpoint's
-``fa_quant_type`` via ``@register_scheme``; a scheme's ``create_weights``
-may then perform the C8-style impl surgery. This module generates scheme
-classes for both families:
+宿主通过 checkpoint 的 ``fa_quant_type`` 键经 @register_scheme 分发
+attention 层的量化 scheme；scheme 的 create_weights 随后可以执行
+C8 式 impl 手术。本模块为两类方法生成 scheme 类：
 
-* packed solutions (int4/fp4_e2m1/fp8_e4m3/nvfp4): the handler decides the
-  storage dtype and carries scales; ``apply`` stays a RuntimeError.
-* stateful solutions (int8_dynamic/kivi_int4): ``create_weights`` swaps the
-  layer's attention impl to the mixin-backed subclass.
+* packed 系（int4/fp4_e2m1/fp8_e4m3/nvfp4）：handler 决定存储 dtype、
+  携带 scale；apply 保持 RuntimeError（量化在 backend 内核）。
+* 有状态系（int8_dynamic/kivi_int4）：create_weights 把 layer 的
+  attention impl 换成 mixin 支撑的子类。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from ...solutions.packed.base import PackedKvScheme
-from ...solutions.packed.schemes import CACHE_DTYPE_TO_SCHEME
+from ...methods.packed_base import METHOD_NAME_TO_SEMANTICS, PackedFormatSemantics
 
 
-def packed_scheme_for(solution_name: str) -> type[PackedKvScheme] | None:
-    return CACHE_DTYPE_TO_SCHEME.get(solution_name)
+def packed_semantics_for(method_name: str) -> type[PackedFormatSemantics] | None:
+    return METHOD_NAME_TO_SEMANTICS.get(method_name)
 
 
-def build_scheme_cls(solution_name: str, base_scheme_cls: type) -> type:
-    """Generate a scheme class over the host ``AscendAttentionScheme``."""
-    packed_cls = packed_scheme_for(solution_name)
+def build_scheme_cls(method_name: str, base_scheme_cls: type) -> type:
+    """在宿主 AscendAttentionScheme 之上生成方法专属的 scheme 类。"""
+    packed_cls = packed_semantics_for(method_name)
 
     def __init__(self: Any, quant_description: Any = None, prefix: Any = None) -> None:
         base_scheme_cls.__init__(self, quant_description, prefix)
         self.quant_description = quant_description or {}
         self.prefix = prefix or ""
-        self._solution_name = solution_name
+        self._method_name = method_name
 
     namespace: dict[str, Any] = {"__init__": __init__}
 
     if packed_cls is not None:
-        # Metadata from the packed handler, behaviour inherited from it.
+        # packed 系：元数据来自 handler，行为也委托给 handler 实例。
         namespace.update(
             scheme_key=packed_cls.scheme_key,
             cache_dtype=packed_cls.cache_dtype,
@@ -60,10 +58,10 @@ def build_scheme_cls(solution_name: str, base_scheme_cls: type) -> type:
             process_weights_after_loading=process_weights_after_loading,
             apply=apply,
         )
-        class_name = f"VllmHustPackedKvScheme_{solution_name}"
+        class_name = f"VllmHustPackedSemantics_{method_name}"
     else:
-        # Stateful solution: create_weights performs the impl surgery.
-        namespace.update(scheme_key=f"VLLM_HUST_KV_{solution_name.upper()}")
+        # 有状态系：create_weights 执行 impl 类手术（C8 先例）。
+        namespace.update(scheme_key=f"VLLM_HUST_KV_{method_name.upper()}")
 
         def create_weights(self: Any, layer: Any) -> None:
             base_scheme_cls.create_weights(self, layer)
@@ -80,11 +78,12 @@ def build_scheme_cls(solution_name: str, base_scheme_cls: type) -> type:
 
             from .attention import apply_impl_surgery, build_impl_cls
 
-            impl_cls = build_impl_cls(solution_name, AscendAttentionBackendImpl)
+            impl_cls = build_impl_cls(method_name, AscendAttentionBackendImpl)
+            # 手术 + 术后状态初始化（换类不会自动跑 __init__）
             if not apply_impl_surgery(layer, impl_cls):
                 raise RuntimeError(
                     f"layer {type(layer).__name__} has no 'impl' attribute; "
-                    f"cannot activate the {solution_name} solution"
+                    f"cannot activate the {method_name} method"
                 )
 
         def process_weights_after_loading(self: Any, layer: Any) -> None:
@@ -92,7 +91,7 @@ def build_scheme_cls(solution_name: str, base_scheme_cls: type) -> type:
 
         def apply(self: Any, *args: Any) -> Any:
             err_msg = (
-                f"[vllm-hust/{solution_name}] apply should not be called; "
+                f"[vllm-hust/{method_name}] apply should not be called; "
                 "quantized KV compute happens in the attention backend impl."
             )
             raise RuntimeError(err_msg)
@@ -102,13 +101,13 @@ def build_scheme_cls(solution_name: str, base_scheme_cls: type) -> type:
             process_weights_after_loading=process_weights_after_loading,
             apply=apply,
         )
-        class_name = f"VllmHustKvScheme_{solution_name}"
+        class_name = f"VllmHustKvScheme_{method_name}"
 
     namespace["__doc__"] = (
-        f"Generated quant scheme binding the {solution_name} solution to "
+        f"Generated quant scheme binding the {method_name} method to "
         f"{base_scheme_cls.__name__}."
     )
     return type(class_name, (base_scheme_cls,), namespace)
 
 
-__all__ = ["build_scheme_cls", "packed_scheme_for"]
+__all__ = ["build_scheme_cls", "packed_semantics_for"]

@@ -39,6 +39,9 @@ line-length = 88
 select = ["B", "E", "F", "I", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# Verbatim port of the legacy triton-ascend kernels (ascend-pr-116 final
+# Verbatim ports of the legacy triton-ascend kernels (ascend-pr-116 final
 # state): line lengths are preserved from the source patch on purpose.
-"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_cache.py" = ["E501"]
+"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_pack.py" = ["E501"]
+"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_gather_experimental.py" = ["E501"]
+# NPU-only diagnostic scripts (run on the Ascend container, not in CI).
+"scripts/npu_*.py" = ["E501"]

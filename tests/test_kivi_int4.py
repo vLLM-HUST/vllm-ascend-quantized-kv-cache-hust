@@ -1,4 +1,4 @@
-"""KIVI INT4 solution: semantics math and residual-window state machine.
+"""KIVI INT4 method: semantics math and residual-window state machine.
 
 The triton-ascend kernels themselves require an Ascend NPU; here the
 mixin's write paths are exercised against stub kernels, and the pure
@@ -8,11 +8,11 @@ semantics run on CPU tensors.
 import pytest
 import torch
 
-from vllm_ascend_quantized_kv_cache.core.spec import SolutionConfig
-from vllm_ascend_quantized_kv_cache.solutions.kivi_int4 import (
+from vllm_ascend_quantized_kv_cache.methods.base import MethodConfig
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4 import (
     attention_mixin as am,
 )
-from vllm_ascend_quantized_kv_cache.solutions.kivi_int4.semantics import (
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4.semantics import (
     KiviInt4Semantics,
     validate_kivi_config,
 )
@@ -29,7 +29,7 @@ BLOCK = 16
 
 
 def test_validate_config_accepts_aligned_geometry() -> None:
-    cfg = SolutionConfig(
+    cfg = MethodConfig(
         head_size=HEAD_SIZE,
         group_size=GROUP,
         residual_length=2 * GROUP,
@@ -54,7 +54,7 @@ def test_validate_config_rejects_bad_geometry(overrides: dict, match: str) -> No
     )
     kwargs.update(overrides)
     with pytest.raises(ValueError, match=match):
-        validate_kivi_config(SolutionConfig(**kwargs))
+        validate_kivi_config(MethodConfig(**kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ def test_fake_quant_error_bounded_by_group_range() -> None:
     torch.manual_seed(1)
     key = torch.randn(32, NUM_KV_HEADS, HEAD_SIZE)
     sem = KiviInt4Semantics(
-        SolutionConfig(
+        MethodConfig(
             head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
         )
     )
@@ -91,7 +91,7 @@ def test_dequant_key_blocks_roundtrip_shape() -> None:
     torch.manual_seed(2)
     batch, blocks, block_size = 1, 3, BLOCK
     sem = KiviInt4Semantics(
-        SolutionConfig(
+        MethodConfig(
             head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
         )
     )
@@ -115,7 +115,7 @@ def test_dequant_key_blocks_roundtrip_shape() -> None:
 
 def test_is_aligned_key_window() -> None:
     sem = KiviInt4Semantics(
-        SolutionConfig(
+        MethodConfig(
             head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
         )
     )
@@ -135,7 +135,7 @@ def test_is_aligned_key_window() -> None:
 
 def test_build_causal_mask_shape_and_values() -> None:
     sem = KiviInt4Semantics(
-        SolutionConfig(
+        MethodConfig(
             head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
         )
     )
@@ -332,3 +332,117 @@ def test_chunked_prefill_with_history_fails_closed() -> None:
         num_prefills=1,
     )
     assert impl._is_kivi_chunked_prefill_all_new(md) is False
+
+
+# ---------------------------------------------------------------------------
+# torch-op gather path (routed by kivi_dequant_gather_cache) — CPU roundtrip
+# ---------------------------------------------------------------------------
+
+
+def _build_packed_key_cache(
+    key, *, num_blocks, block_size, group_size, num_kv_heads, head_size
+):
+    """Emulate the (NPU-only) pack kernel layout on CPU via semantics math."""
+    torch.manual_seed(3)
+    kq = torch.zeros(
+        num_blocks, num_kv_heads, head_size, block_size // 8, dtype=torch.int32
+    )
+    ks = torch.zeros(num_blocks, num_kv_heads, head_size, block_size // group_size)
+    km = torch.zeros_like(ks)
+    for b in range(num_blocks):
+        block_key = key[b * block_size : (b + 1) * block_size]  # [B, KVH, H]
+        grouped = block_key.view(
+            block_size // group_size, group_size, num_kv_heads, head_size
+        )
+        mn = grouped.amin(dim=1, keepdim=True)
+        mx = grouped.amax(dim=1, keepdim=True)
+        scale = (mx - mn).clamp(min=1e-6) / 15.0
+        quant = torch.clamp(torch.round((grouped - mn) / scale), 0, 15).to(torch.int32)
+        # [groups, group, KVH, H] -> [KVH, H, block/8, 8]
+        words = quant.permute(2, 3, 0, 1).reshape(
+            num_kv_heads, head_size, block_size // 8, 8
+        )
+        kq[b] = KiviInt4Semantics.pack_int4(words)
+        ks[b] = scale[:, 0].permute(1, 2, 0)  # [KVH, H, groups]
+        km[b] = mn[:, 0].permute(1, 2, 0)
+    return kq, ks, km
+
+
+def test_dequant_gather_cache_torch_roundtrip_cpu() -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_gather import (
+        kivi_dequant_gather_cache,
+    )
+
+    torch.manual_seed(4)
+    nb, block, group, kvh, head = 3, 16, 8, 2, 32
+    total = nb * block
+    key = torch.randn(total, kvh, head)
+    value = torch.randn(total, kvh, head)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=group,
+            block_size=block,
+        )
+    )
+    kq, ks, km = _build_packed_key_cache(
+        key,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    # values: per-token per-head-dim-group quantization
+    grouped = value.view(total, kvh, head // group, group)
+    vmn = grouped.amin(-1)
+    vscale = (grouped.amax(-1) - vmn).clamp(min=1e-6) / 15.0
+    vquant = (
+        torch.clamp(
+            torch.round((grouped - vmn.unsqueeze(-1)) / vscale.unsqueeze(-1)), 0, 15
+        )
+        .to(torch.int32)
+        .view(total, kvh, head)
+    )
+    pad = torch.zeros(total, kvh, (8 - head % 8) % 8, dtype=torch.int32)
+    vquant = torch.cat([vquant, pad], dim=-1)
+    vq_words = KiviInt4Semantics.pack_int4(vquant.view(nb, block, kvh, head // 8, 8))
+    v_mn = vmn.view(nb, block, kvh, head // group)
+    v_scale = vscale.view(nb, block, kvh, head // group)
+
+    block_table = torch.arange(nb).view(1, nb)
+    seq_lens = torch.tensor([total])
+    k_out, v_out = kivi_dequant_gather_cache(
+        kq,
+        ks,
+        km,
+        vq_words,
+        v_scale,
+        v_mn,
+        block_table,
+        seq_lens,
+        torch.float32,
+        group,
+    )
+    ref_k = sem.fake_quant_key(key)
+    ref_v = sem.fake_quant_value(value)
+    assert torch.allclose(k_out, ref_k, atol=1e-5)
+    assert torch.allclose(v_out, ref_v, atol=1e-5)
+
+    # partial sequence: only live tokens come back
+    k_out2, v_out2 = kivi_dequant_gather_cache(
+        kq,
+        ks,
+        km,
+        vq_words,
+        v_scale,
+        v_mn,
+        block_table,
+        torch.tensor([total - 3]),
+        torch.float32,
+        group,
+    )
+    assert k_out2.shape[0] == total - 3
+    assert torch.equal(k_out2, k_out[: total - 3])
