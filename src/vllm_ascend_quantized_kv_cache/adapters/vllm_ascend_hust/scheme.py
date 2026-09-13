@@ -27,7 +27,15 @@ def build_scheme_cls(method_name: str, base_scheme_cls: type) -> type:
     packed_cls = packed_semantics_for(method_name)
 
     def __init__(self: Any, quant_description: Any = None, prefix: Any = None) -> None:
-        base_scheme_cls.__init__(self, quant_description, prefix)
+        # 宿主基类的 __init__ 表面随 fork 版本漂移：有的定义
+        # (quant_description, prefix)，有的直接继承 object.__init__
+        # （不接受参数）。先按参数化形式转发，TypeError 时退化为
+        # 无参初始化——生成的 scheme 自身把 quant_description/prefix
+        # 存在本体上，不依赖基类行为。
+        try:
+            base_scheme_cls.__init__(self, quant_description, prefix)
+        except TypeError:
+            base_scheme_cls.__init__(self)
         self.quant_description = quant_description or {}
         self.prefix = prefix or ""
         self._method_name = method_name

@@ -243,13 +243,41 @@ vllm serve <model> \
 | 能力 | 状态 |
 |---|---|
 | 安装后零行为改变 | ✅ 设计保证（bootstrap 默认 no-op，有测试） |
-| CPU 语义层 / 契约 / 注册表 / 适配器逻辑 | ✅ 95 项单测全绿 |
+| CPU 语义层 / 契约 / 注册表 / 适配器逻辑 | ✅ 97 项单测全绿 |
 | KIVI triton pack 内核 + torch gather（910B2） | ✅ 逐位验证通过 |
 | 统一激活管线（`kv_methods.activate` → 宿主 `register_scheme`） | ✅ 910B2 容器真实 vllm-ascend-hust 宿主进程内实测通过（2026-09-11，`container-86`；六方法注册可见 + 幂等再激活 OK） |
-| INT8 / KIVI attention mixin 的 NPU 前向 | ⚠️ 端口保真度；需要 NPU 宿主联调 |
-| vllm-ascend-hust：fa_quant_type 分发 + impl 手术 + serving | ⚠️ 注册链路已实测（见上行）；分发/手术/serving 待宿主联调 |
+| **fa_quant_type 分发 + impl 类手术（真实引擎）** | ✅ 2026-09-12 实测：Qwen3-0.6B + 注入 `fa_quant_type=VLLM_HUST_KV_INT8_DYNAMIC` 的 checkpoint，28/28 层经 `AscendKVCacheMethod.create_weights` 完成类手术（日志为证） |
+| **真实 serving 冒烟（浮点前向路径）** | ✅ 同环境 `LLM.generate` 生成成功（enforce_eager，fp16，`kv-cache-dtype` 未设时走浮点 KV） |
+| 真实 serving 冒烟（int8 存储路径） | ⚠️ 阻塞于**宿主侧**：`model_runner_v1._reshape_kv_cache_tensors` 对 `int8_per_token_head` 字面量的分配/重排不一致（初始化器分配 `[2314,128,8,64]` 打包布局，重排要求 `[1122,128,8,128]`）——见下"宿主联调工作项" |
+| INT8 / KIVI attention mixin 的 NPU 前向 | ⚠️ 端口保真度；浮点路径已在真实引擎验证，int8 缓存路径待上述宿主问题解决后复验 |
 | vllm-hust：CUSTOM backend 注册 + dtype 协商 | ⚠️ 脚手架就绪，端到端待宿主集成验证 |
 | Extension Manager 激活（manager-mediated enable） | ❌ 设计上被阻塞（manifest `import_only`），等 HOST_CONTRACT 四协议落地，见 [integration.md](integration.md) §4 |
+
+### 8.1 宿主联调工作项（2026-09-12 serving 冒烟结论）
+
+在 `container-86`（vllm-ascend-hust + vllm-hust 双栈，torch_npu 环境）上的
+复现配方：Qwen3-0.6B 拷贝 + `config.json` 注入
+`quantization_config = {"quant_method": "ascend",
+"fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC", "model.layers.N.self_attn.fa_k.scale": …,
+"<各线性层>.weight": "FLOAT"}`；`VLLM_HUST_KV_METHODS=int8_dynamic` + 显式
+`bootstrap.register_plugins()`（V1 in-proc 引擎在模型加载前不触发
+`vllm.general_plugins`，见下）。已验证通过：注册 → fa_quant_type 分发 →
+scheme 实例化 → 28/28 层 impl 手术 → 引擎加载与浮点前向生成。
+遗留阻塞：`kv_cache_dtype=int8_per_token_head` 时宿主
+`model_runner_v1.py` 的 KV cache 初始化器分配 head/2 打包布局、
+而 `_reshape_kv_cache_tensors` 按满 head int8 重排（两者不一致）。
+
+两个附带发现（已修复或待办）：
+
+1. 生成 scheme 构造器曾向宿主基类 `AscendAttentionScheme` 传参，而该基类
+   继承 `object.__init__`（不同 fork 表面漂移）——已改为参数化转发失败时
+   无参回退（`tests/test_adapters.py` 覆盖两种基类表面）。
+2. 多继承动态 impl 类的 `tp_base` 落在 mixin 上，`__class__` 赋值被
+   CPython 拒绝（`tp_base` 不一致）——`apply_impl_surgery` 已加
+   "整实例克隆替换"回退（`tests/test_adapters.py` 覆盖）。
+3. **待办**：`vllm.general_plugins` 钩子在 V1 in-proc 引擎的模型加载前
+   未被触发；`vllm serve` 完整入口是否触发需在宿主侧确认，必要时把
+   环境变量 opt-in 的触发点提前（宿主协议议题）。
 
 ## 9. 常见问题排查
 

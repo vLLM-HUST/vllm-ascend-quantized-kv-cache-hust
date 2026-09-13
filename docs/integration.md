@@ -54,7 +54,12 @@ kv_methods.activate("int8_dynamic")   # host=None → 自动探测宿主栈
 - **已在真实宿主实测**：2026-09-11 在 910B2 容器
   （vllm-ascend-hust + torch_npu 环境）上，六方法注册可见，
   `activate("int8_dynamic")` / `activate("kivi_int4")` 注册进宿主
-  scheme 注册表成功且幂等（进程内注册；serving 仍未验证）。
+  scheme 注册表成功且幂等（进程内注册）。**2026-09-12 serving 冒烟
+  推进**：Qwen3-0.6B checkpoint 注入 `fa_quant_type` 后，真实 vLLM
+  引擎内 28/28 层经 `AscendKVCacheMethod` 完成 impl 类手术，浮点
+  KV 路径 `LLM.generate` 生成成功；int8 存储路径当前阻塞于宿主
+  `model_runner_v1` 对 `int8_per_token_head` 的分配/重排不一致
+  （复现配方与证据见 [how-to-run.md](how-to-run.md) §8.1）。
 
 ## 2. 宿主 A：vllm-ascend-hust 挂载细节
 

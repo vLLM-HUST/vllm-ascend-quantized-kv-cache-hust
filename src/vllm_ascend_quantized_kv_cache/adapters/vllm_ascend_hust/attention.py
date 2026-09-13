@@ -75,11 +75,30 @@ def apply_impl_surgery(layer: Any, impl_cls: type) -> bool:
     关键细节：换 __class__ 不会重跑 __init__，所以交换后要显式调用
     mixin 的状态初始化方法——否则 enable_kivi / 残差窗口等属性缺失，
     forward 时才会炸。
+
+    兼容性：__class__ 赋值要求新旧类的 tp_base 一致。多继承动态类
+    （mixin, base）的 tp_base 落在 mixin 上，与在役实例的基类不同，
+    CPython 会拒绝赋值（真机 910B2 宿主实测）。因此首选直接换类，
+    TypeError 时回退为"整实例克隆替换"：以新类新建空实例、浅拷贝
+    旧实例 __dict__、重新赋给 layer.impl——状态完整保留，且新类
+    MRO 同时含 mixin 与宿主基类，super() 语义不变。
     """
     if not hasattr(layer, "impl"):
         return False
     impl = layer.impl
-    impl.__class__ = impl_cls
+    old_cls = type(impl)
+    try:
+        impl.__class__ = impl_cls
+    except TypeError:
+        new_impl = object.__new__(impl_cls)
+        new_impl.__dict__.update(impl.__dict__)
+        layer.impl = new_impl
+        impl = new_impl
+    print(
+        f"[vllm-hust-quantized-kv-cache] impl surgery applied: "
+        f"{old_cls.__name__} -> {impl_cls.__name__}",
+        flush=True,
+    )
     init_method = getattr(impl_cls, "_state_init_method", None)
     if init_method is not None:
         getattr(impl, init_method)(

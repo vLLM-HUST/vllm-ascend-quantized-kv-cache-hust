@@ -265,3 +265,73 @@ def test_ascend_register_idempotent_and_conflict(monkeypatch) -> None:
     reg[("VLLM_HUST_KV_FOREIGN", "attention")] = type("SomeoneElsesScheme", (), {})
     with pytest.raises(ValueError, match="Scheme already registered"):
         adapter.register(quant_type="VLLM_HUST_KV_FOREIGN")
+
+
+def test_build_scheme_cls_over_bare_base() -> None:
+    # Host bases vary across forks: some define __init__(quant_description,
+    # prefix), others inherit object.__init__. Seen on a real
+    # vllm-ascend-hust install — the generated class must work with both.
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.scheme import (
+        build_scheme_cls,
+    )
+
+    class _BareBase:  # defines no __init__ at all
+        def create_weights(self, layer):
+            return
+
+    cls = build_scheme_cls("int8_dynamic", _BareBase)
+    inst = cls()  # the host instantiates with no args
+    assert inst._method_name == "int8_dynamic"
+    assert inst.scheme_key == "VLLM_HUST_KV_INT8_DYNAMIC"
+    assert inst.quant_description == {}
+
+    class _ParamBase:
+        def __init__(self, quant_description=None, prefix=None):
+            self.base_quant_description = quant_description
+
+    cls2 = build_scheme_cls("int8_dynamic", _ParamBase)
+    inst2 = cls2({"fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC"}, "model.layers.0")
+    assert inst2.base_quant_description == {
+        "fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC"
+    }
+    assert inst2.quant_description == {"fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC"}
+
+
+def test_impl_surgery_falls_back_when_layout_incompatible() -> None:
+    # On a real vllm-ascend-hust host, __class__ assignment between the
+    # multi-inheritance dynamic impl class and the in-flight impl instance
+    # can be rejected (tp_base mismatch). The surgery must fall back to
+    # instance replacement while keeping state and re-running state init.
+    from types import SimpleNamespace
+
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.attention import (
+        apply_impl_surgery,
+    )
+    from vllm_ascend_quantized_kv_cache.methods.int8_dynamic.attention_mixin import (
+        Int8DynamicAttentionMixin,
+    )
+
+    class _SlottedMixin:
+        __slots__ = ("extra",)
+
+    class _Old:
+        def __init__(self):
+            self.kv_cache_dtype = "int8"
+            self.vllm_config = None
+
+    old = _Old()
+    layer = SimpleNamespace(impl=old)
+    impl_cls = type(
+        "MixOnOld",
+        (Int8DynamicAttentionMixin, _SlottedMixin, _Old),
+        {"_state_init_method": "_init_int8_dynamic_state"},
+    )
+    with pytest.raises(TypeError):
+        old.__class__ = impl_cls
+
+    assert apply_impl_surgery(layer, impl_cls) is True
+    new_impl = layer.impl
+    assert new_impl is not old
+    assert isinstance(new_impl, impl_cls)
+    assert new_impl.kv_cache_dtype == "int8"
+    assert new_impl.enable_int8 is True
