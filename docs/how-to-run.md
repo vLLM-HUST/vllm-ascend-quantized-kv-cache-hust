@@ -65,7 +65,7 @@ vllm-hust-ext extension inspect org.vllm-hust.quantized-kv-cache
 ## 3. CPU 测试与静态检查（L1）
 
 ```bash
-pytest -q                     # 当前基线：95 passed, 1 skipped
+pytest -q                     # 当前基线：118 passed, 1 skipped
 ruff check .
 ruff format --check .
 ```
@@ -174,19 +174,68 @@ vllm serve <model> ...
 `@register_scheme` 注册表（键 `VLLM_HUST_KV_*`）。不设变量 =
 完全 no-op。
 
-### 6.2 让模型真正走量化 scheme
+### 6.2 让模型真正走量化 scheme（checkpoint 注入）
 
 注册只解决"scheme 在注册表里"；注意力层选择哪个 scheme 由 checkpoint
-的量化配置键 **`fa_quant_type`**（ModelSlim 路径）分发。两个入口：
+的量化配置分发（ModelSlim 路径）。
 
-- 模型 checkpoint 的 quant_description 里带
-  `fa_quant_type=VLLM_HUST_KV_<SOLUTION>`（如
-  `VLLM_HUST_KV_INT8_DYNAMIC` / `VLLM_HUST_KV_KIVI_INT4` /
-  `VLLM_HUST_KV_INT4` / `VLLM_HUST_KV_FP8_E4M3` / `VLLM_HUST_KV_NVFP4`
-  / `VLLM_HUST_KV_FP4_E2M1`）；
-- 或在加载后由 scheme 的 `create_weights` 对有状态方案执行 C8 式
-  `layer.impl.__class__` 类手术（本库自动完成，见
-  [npu-implementation.md](npu-implementation.md) §4）。
+**注意：只往 `config.json` 里加两个全局字段（`"quant_method": "ascend"`
++ `"fa_quant_type": "VLLM_HUST_KV_*"`）是不够的——一层都不会命中。**
+宿主解析器（`AscendModelSlimConfig`）的 ModelSlim 契约是：
+
+1. `fa_quant_type` 只是全局开关；
+2. 生效层清单从逐层键 `<prefix>.layers.N.self_attn.fa_k.scale` 推导
+   （`kvcache_quant_layers`）；没有逐层键就没有任何层走 FA 量化分支；
+3. 完整的 ModelSlim 描述要求每个可量化模块显式声明类型，保持浮点的
+   模块写 `"FLOAT"`（q/k/v/o_proj 与 mlp gate/up/down_proj 等）。
+
+用工具一行生成完整描述（推荐）：
+
+```bash
+vllm-hust-kv-inject <model_dir> --method int8_dynamic           # 注入（自动备份）
+vllm-hust-kv-inject <model_dir> --method kivi_int4 --dry-run    # 只打印不落盘
+vllm-hust-kv-inject <model_dir> --restore                       # 回滚
+```
+
+等价的模块入口：`python -m
+vllm_ascend_quantized_kv_cache.tools.checkpoint ...`。工具写入
+`quantization_config`：`quant_method=ascend`、`fa_quant_type=<注册键>`、
+每层 `fa_k.scale`/`fa_v.scale`（`FAQuant`）、全部线性层与 `embed_tokens`
+的 `FLOAT`（`--include-lm-head` 可加 `lm_head`）。幂等可重跑；遇到外部
+ModelSlim 描述（含本工具不生成的键）会拒绝覆盖，`--force` 才放行；
+权重已量化的 checkpoint（非 ascend quant_method）一律拒绝。
+
+手工等效配方（2 层示意，工具生成的就是这个形状）：
+
+```json
+"quantization_config": {
+  "quant_method": "ascend",
+  "version": "1.0.0",
+  "fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC",
+  "model.embed_tokens.weight": "FLOAT",
+  "model.layers.0.self_attn.fa_k.scale": "FAQuant",
+  "model.layers.0.self_attn.fa_v.scale": "FAQuant",
+  "model.layers.0.self_attn.q_proj.weight": "FLOAT",
+  "model.layers.0.self_attn.k_proj.weight": "FLOAT",
+  "model.layers.0.self_attn.v_proj.weight": "FLOAT",
+  "model.layers.0.self_attn.o_proj.weight": "FLOAT",
+  "model.layers.0.mlp.gate_proj.weight": "FLOAT",
+  "model.layers.0.mlp.up_proj.weight": "FLOAT",
+  "model.layers.0.mlp.down_proj.weight": "FLOAT"
+}
+```
+
+（每层一组如上条目；`fa_quant_type` 取值即各方法的注册键：
+`VLLM_HUST_KV_INT8_DYNAMIC` / `VLLM_HUST_KV_KIVI_INT4` /
+`VLLM_HUST_KV_INT4` / `VLLM_HUST_KV_FP8_E4M3` / `VLLM_HUST_KV_NVFP4` /
+`VLLM_HUST_KV_FP4_E2M1`。）
+
+职责边界：checkpoint 注入只解决"分发"这一半（`fa_quant_type` →
+scheme → `create_weights` 对有状态方案执行 C8 式
+`layer.impl.__class__` 类手术，本库自动完成，见
+[npu-implementation.md](npu-implementation.md) §4）；"注册"那一半
+仍需 §6.1 的环境变量 opt-in；int8 存储路径另需 serve 期
+`--kv-cache-dtype`（§6.4）。
 
 ### 6.3 KIVI 旋钮
 
@@ -243,7 +292,7 @@ vllm serve <model> \
 | 能力 | 状态 |
 |---|---|
 | 安装后零行为改变 | ✅ 设计保证（bootstrap 默认 no-op，有测试） |
-| CPU 语义层 / 契约 / 注册表 / 适配器逻辑 | ✅ 97 项单测全绿 |
+| CPU 语义层 / 契约 / 注册表 / 适配器逻辑 | ✅ 118 项单测全绿 |
 | KIVI triton pack 内核 + torch gather（910B2） | ✅ 逐位验证通过 |
 | 统一激活管线（`kv_methods.activate` → 宿主 `register_scheme`） | ✅ 910B2 容器真实 vllm-ascend-hust 宿主进程内实测通过（2026-09-11，`container-86`；六方法注册可见 + 幂等再激活 OK） |
 | **fa_quant_type 分发 + impl 类手术（真实引擎）** | ✅ 2026-09-12 实测：Qwen3-0.6B + 注入 `fa_quant_type=VLLM_HUST_KV_INT8_DYNAMIC` 的 checkpoint，28/28 层经 `AscendKVCacheMethod.create_weights` 完成类手术（日志为证） |
@@ -259,7 +308,9 @@ vllm serve <model> \
 复现配方：Qwen3-0.6B 拷贝 + `config.json` 注入
 `quantization_config = {"quant_method": "ascend",
 "fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC", "model.layers.N.self_attn.fa_k.scale": …,
-"<各线性层>.weight": "FLOAT"}`；`VLLM_HUST_KV_METHODS=int8_dynamic` + 显式
+"<各线性层>.weight": "FLOAT"}`——即 §6.2 的完整 ModelSlim 形状，
+今天直接用 `vllm-hust-kv-inject <model_dir> --method int8_dynamic` 生成；
+`VLLM_HUST_KV_METHODS=int8_dynamic` + 显式
 `bootstrap.register_plugins()`（V1 in-proc 引擎在模型加载前不触发
 `vllm.general_plugins`，见下）。已验证通过：注册 → fa_quant_type 分发 →
 scheme 实例化 → 28/28 层 impl 手术 → 引擎加载与浮点前向生成。

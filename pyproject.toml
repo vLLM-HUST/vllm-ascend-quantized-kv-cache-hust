@@ -18,9 +18,14 @@ test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
 "org.vllm-hust.quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.manifests"
 
 # Native vLLM bootstrap hook. It is a no-op unless explicitly requested via
-# VLLM_HUST_QUANT_KV_SOLUTIONS (installation must never change behaviour).
+# VLLM_HUST_KV_METHODS (installation must never change behaviour).
 [project.entry-points."vllm.general_plugins"]
 "vllm-hust-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+
+# Checkpoint injection tool: writes the complete ModelSlim-style
+# quantization_config (fa_quant_type dispatch) — see docs/how-to-run.md §6.2.
+[project.scripts]
+"vllm-hust-kv-inject" = "vllm_ascend_quantized_kv_cache.tools.checkpoint:main"
 
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"

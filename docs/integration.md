@@ -27,6 +27,7 @@ pip install vllm-ascend-quantized-kv-cache        # 装进宿主所在环境
 
 # vllm-ascend-hust（宿主 A）
 export VLLM_HUST_KV_METHODS=int8_dynamic   # 逗号分隔可多个
+vllm-hust-kv-inject <model_dir> --method int8_dynamic  # 注入分发配置（§2/how-to-run §6.2）
 vllm serve <model> ...
 # scheme 经 checkpoint fa_quant_type=VLLM_HUST_KV_* 分发到注意力层
 
@@ -82,8 +83,11 @@ kv_methods.activate("int8_dynamic")   # host=None → 自动探测宿主栈
    [npu-implementation.md](npu-implementation.md) §4）。
 
 集成者需要做的：保证 checkpoint 的 `fa_quant_type` 值与注册键一致
-（如 `VLLM_HUST_KV_KIVI_INT4`）；KIVI 另需在宿主 cache 配置里给
-`kivi_group_size` / `kivi_residual_length`。
+（如 `VLLM_HUST_KV_KIVI_INT4`）。注意这不是"加两个全局字段"就行：
+宿主的 ModelSlim 契约要求逐层 `fa_k.scale` 键 + 全部可量化模块显式
+`FLOAT`，推荐用 `vllm-hust-kv-inject` 一行生成完整描述（安全策略与
+手工配方见 [how-to-run.md](how-to-run.md) §6.2）；KIVI 另需在宿主
+cache 配置里给 `kivi_group_size` / `kivi_residual_length`。
 
 ## 3. 宿主 B：vllm-hust 挂载细节
 

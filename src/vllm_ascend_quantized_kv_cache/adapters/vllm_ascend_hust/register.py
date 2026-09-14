@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..ascend_keys import ascend_scheme_key
 from ..base import HostAdapter
-from .attention import supported_impl_methods
-from .scheme import build_scheme_cls, packed_semantics_for
+from .scheme import build_scheme_cls
 
 
 class AscendHustAdapter(HostAdapter):
@@ -76,12 +76,8 @@ class AscendHustAdapter(HostAdapter):
 
     @staticmethod
     def default_quant_type(method_name: str) -> str:
-        packed = packed_semantics_for(method_name)
-        if packed is not None:
-            return packed.scheme_key
-        if method_name in supported_impl_methods():
-            return f"VLLM_HUST_KV_{method_name.upper()}"
-        raise ValueError(f"unknown method for the Ascend adapter: {method_name!r}")
+        """注册键推导的唯一出处见 adapters/ascend_keys.py。"""
+        return ascend_scheme_key(method_name)
 
 
 __all__ = ["AscendHustAdapter"]

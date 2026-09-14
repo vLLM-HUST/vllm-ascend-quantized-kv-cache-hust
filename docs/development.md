@@ -47,8 +47,11 @@ src/vllm_ascend_quantized_kv_cache/
 │       └── kivi_gather_experimental.py # 融合 gather（保留不路由）
 ├── adapters/
 │   ├── base.py            # HostAdapter（宿主 import 只在方法内）
+│   ├── ascend_keys.py     # Ascend scheme 注册键唯一推导（零 torch）
 │   ├── vllm_ascend_hust/  # register / scheme / attention（impl 手术）
 │   └── vllm_hust/         # register（dtype 协商）/ backend（惰性构建）
+├── tools/
+│   └── checkpoint.py      # checkpoint 注入 CLI（vllm-hust-kv-inject，零重依赖）
 ├── bootstrap.py           # vllm.general_plugins 钩子（默认 no-op）
 ├── manifests/             # Extension Manager 清单（import_only）
 └── _version.py            # 唯一版本源
