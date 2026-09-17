@@ -23,18 +23,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 class MethodConfig:
     """所有方法共享的几何/量化配置（不可变）。
 
-    字段与 legacy 实现从宿主 ``cache_config`` 读取的旋钮一一对应：
-    KIVI 系使用 ``group_size``（量化组大小，对应 kivi_group_size）与
-    ``residual_length``（全精度残差窗口长度，对应 kivi_residual_length）；
-    其余几何字段是布局计算与设备路径的通用输入。
+    字段是 INT8 布局计算与设备路径的通用输入。
     """
 
     head_size: int = 128  # 每个注意力头的维度 D
     num_kv_heads: int = 8  # KV 头数
     num_heads: int = 32  # Q 头数（num_heads = num_queries_per_kv * num_kv_heads）
     block_size: int = 128  # 分页缓存块大小（每块 token 数）
-    group_size: int = 128  # 量化组大小（KIVI：键按 token 分组，值按 head 维分组）
-    residual_length: int = 128  # KIVI：每请求保留全精度的残差窗口长度
 
     def validated(self) -> MethodConfig:
         """基础合法性检查（正数性、头数关系）。
@@ -66,7 +61,7 @@ class MethodSpec:
       - adapter_factories: 宿主名 -> 适配器工厂（工厂内部才 import 宿主）
     """
 
-    name: str  # 方法名（注册表主键），如 "kivi_int4"
+    name: str  # 方法名（注册表主键）
     dtype: str  # 契约层的 dtype 字符串（对应 dtypes.get_kv_quant_mode 的键）
     summary: str  # 一句话说明（量化语义、来源）
     provenance: str  # 出处：provenance/legacy-patches 下的补丁编号
@@ -125,20 +120,18 @@ class KvQuantMethod:
                 "num_kv_heads",
                 "num_heads",
                 "block_size",
-                "group_size",
-                "residual_length",
             )
         }
         return payload
 
     def supports(self, host: str) -> bool:
-        """该方法是否声明支持某个宿主（vllm_hust / vllm_ascend_hust）。"""
+        """该方法是否声明支持给定宿主。"""
         return host in self.spec.supports
 
     # -- 契约 ---------------------------------------------------------------
 
     def resolve_layout(self) -> KVCacheLayout:
-        """解析存储布局（层 0 契约），例如 kivi_int4@128 -> uint8/packed 64。"""
+        """解析 INT8 存储布局。"""
         return resolve_layout(self.spec.dtype, self.config.head_size)
 
     # -- 语义 ---------------------------------------------------------------

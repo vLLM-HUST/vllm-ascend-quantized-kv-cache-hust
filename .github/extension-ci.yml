@@ -16,7 +16,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
       - run: python -m pip install -e ".[test]" build
       - run: ruff check .
       - run: ruff format --check .
@@ -34,10 +33,11 @@ jobs:
           from vllm_ascend_quantized_kv_cache import kv_methods, __version__
           assert __version__ == '0.2.0.dev0'
           names = kv_methods.list()
-          assert 'kivi_int4' in names and 'int8_dynamic' in names
-          sol = kv_methods.get('kivi_int4', head_size=128)
-          assert sol.resolve_layout().storage_dtype == 'uint8'
+          assert names == ['int8_dynamic']
+          method = kv_methods.get('int8_dynamic', head_size=128)
+          assert method.resolve_layout().storage_dtype == 'int8'
           print('smoke OK:', names)
           "
-      - name: Extension Manager discovery
-        run: vllm-hust-ext extension inspect org.vllm-hust.quantized-kv-cache
+      - name: Validate Bundle v1 manifest
+        run: |
+          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend'}; assert len(p['components'])==1"

@@ -3,8 +3,7 @@
 
 这是"宿主进程如何点亮一个量化方法"的唯一路径，两处入口共用：
   - 门面 ``kv_methods.activate(name, host=...)``（显式、可编程）；
-  - ``bootstrap.register_plugins``（``vllm.general_plugins`` 钩子，
-    环境变量 ``VLLM_HUST_KV_METHODS`` opt-in）。
+  - ``bootstrap.register_plugins``（``vllm.general_plugins`` 动态加载钩子）。
 
 fail-closed 语义：未知名、非法配置、未知宿主、宿主栈缺失、宿主不
 支持/未接线，全部立即抛 ValueError / RuntimeError，绝不静默跳过。
