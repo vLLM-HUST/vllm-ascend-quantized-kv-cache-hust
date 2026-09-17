@@ -19,15 +19,6 @@ test = ["pytest>=8", "ruff>=0.12"]
 [project.entry-points."vllm.general_plugins"]
 "vllm-ascend-int8-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
 
-# Checkpoint injection tool: writes the complete ModelSlim-style
-# quantization_config (fa_quant_type dispatch) — see docs/how-to-run.md §6.2.
-[project.scripts]
-"vllm-hust-kv-inject" = "vllm_ascend_quantized_kv_cache.tools.checkpoint:main"
-# Read-only environment/readiness diagnosis — see docs/how-to-run.md §2.
-"vllm-hust-kv-doctor" = "vllm_ascend_quantized_kv_cache.tools.doctor:main"
-# Evidence record validator (docs/acceptance-matrix.md discipline).
-"vllm-hust-kv-evidence" = "vllm_ascend_quantized_kv_cache.tools.evidence:main"
-
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 
