@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..ascend_keys import ascend_scheme_key
 from ..base import HostAdapter
 
 BACKEND_CLASS_PATH = (
