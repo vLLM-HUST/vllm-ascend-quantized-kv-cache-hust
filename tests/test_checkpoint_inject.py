@@ -24,7 +24,9 @@ from vllm_ascend_quantized_kv_cache.adapters.ascend_keys import (
 )
 from vllm_ascend_quantized_kv_cache.tools.checkpoint import (
     DEFAULT_FLOAT_MODULES,
+    MANIFEST_NAME,
     build_quant_description,
+    check_checkpoint,
     inject,
     known_method_names,
     main,
@@ -260,6 +262,100 @@ def test_cli_error_returns_exit_code_2(
 def test_cli_lists_methods(capsys: pytest.CaptureFixture) -> None:
     assert main(["--list-methods"]) == 0
     assert "int8_dynamic" in capsys.readouterr().out
+
+
+# -- 注入契约清单（manifest + --check）----------------------------------------
+
+
+def test_inject_writes_manifest_and_check_passes(model_dir: Path) -> None:
+    inject(model_dir, method="int8_dynamic")
+    manifest_path = model_dir / MANIFEST_NAME
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "vllm-hust-kv-inject-manifest-v1"
+    assert manifest["method"] == "int8_dynamic"
+    assert manifest["fa_quant_type"] == "VLLM_HUST_KV_INT8_DYNAMIC"
+    assert manifest["num_layers"] == 2
+    # config.json 的 size/SHA-256 绑定真实文件
+    import hashlib
+
+    payload = (model_dir / "config.json").read_bytes()
+    assert manifest["config_json"] == {
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    # serve 前校验通过
+    report = check_checkpoint(model_dir)
+    assert report["valid"], report["issues"]
+    assert report["description_matches"]
+
+
+def test_check_detects_post_injection_drift(model_dir: Path) -> None:
+    inject(model_dir, method="int8_dynamic")
+    config_path = model_dir / "config.json"
+    config = _read_config(model_dir)
+    # 有人在注入后手改了 config.json：哈希失配必须抓住
+    config["num_hidden_layers"] = 99
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    report = check_checkpoint(model_dir)
+    assert not report["valid"]
+    assert any("hash mismatch" in issue for issue in report["issues"])
+
+
+def test_check_detects_missing_manifest(model_dir: Path) -> None:
+    inject(model_dir, method="int8_dynamic")
+    (model_dir / MANIFEST_NAME).unlink()
+    report = check_checkpoint(model_dir)
+    assert not report["valid"]
+    assert any(MANIFEST_NAME in issue for issue in report["issues"])
+
+
+def test_check_is_json_only_manifest_compatible(model_dir: Path) -> None:
+    # 旧版注入（没有清单）不该被 --check 误判为有效
+    inject(model_dir, method="int8_dynamic")
+    (model_dir / MANIFEST_NAME).unlink()
+    assert check_checkpoint(model_dir)["valid"] is False
+
+
+def test_restore_removes_manifest(model_dir: Path) -> None:
+    inject(model_dir, method="int8_dynamic")
+    restore(model_dir)
+    assert not (model_dir / MANIFEST_NAME).exists()
+    # 回滚后残留的清单不能再让 --check 通过（防"陈旧契约"假绿）
+    report = check_checkpoint(model_dir)
+    assert not report["valid"]
+
+
+def test_manifest_tracks_extra_options(model_dir: Path) -> None:
+    inject(
+        model_dir,
+        method="kivi_int4",
+        layer_prefix="transformer",
+        include_lm_head=True,
+        extra_float_modules=("mlp.shared_expert.gate_proj",),
+    )
+    report = check_checkpoint(model_dir)
+    assert report["valid"], report["issues"]
+    manifest = report["manifest"]
+    assert manifest["layer_prefix"] == "transformer"
+    assert manifest["include_lm_head"] is True
+    assert manifest["extra_float_modules"] == ["mlp.shared_expert.gate_proj"]
+
+
+def test_cli_check_exit_codes(model_dir: Path, capsys: pytest.CaptureFixture) -> None:
+    assert main([str(model_dir), "--method", "int8_dynamic"]) == 0
+    assert main([str(model_dir), "--check"]) == 0
+    out = capsys.readouterr().out
+    assert '"valid": true' in out
+    # 篡改 config 后 --check 必须退出 2
+    config_path = model_dir / "config.json"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("qwen3", "qwenX"),
+        encoding="utf-8",
+    )
+    assert main([str(model_dir), "--check"]) == 2
+    assert '"valid": false' in capsys.readouterr().out
+    assert main([str(model_dir), "--check", "--restore"]) == 0  # restore 优先无碍
 
 
 # -- 导入卫生 -----------------------------------------------------------------

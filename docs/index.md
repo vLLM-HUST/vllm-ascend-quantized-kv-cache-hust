@@ -25,6 +25,11 @@ INT4、int4 / fp4_e2m1 / fp8_e4m3 / nvfp4 packed handler）挖掘成**独立、
 |---|---|---|
 | [schemes.md](schemes.md) | 模块的作用与含义；六个量化方法的语义、布局、差异与选型建议 | 所有人，先读这篇 |
 | [how-to-run.md](how-to-run.md) | **How to run**：CPU 测试、Python API 使用、NPU 冒烟、在两个宿主上跑起来、故障排查 | 想跑起来的人 |
+| [acceptance-matrix.md](acceptance-matrix.md) | 验收与证据矩阵：六级推广门、方法状态、负向门（逐条挂测试） | 做验证/发版的人 |
+| [validation-int8-20260912.md](validation-int8-20260912.md) | int8 真机验证记录（container-86，2026-09-12）：已证/阻塞/待办 | 做验证的人 |
+| [gap-analysis-vs-ascend-llm-quant.md](gap-analysis-vs-ascend-llm-quant.md) | 对照 Ascend-LLM-quant 的差距分析：补了什么、还缺什么、下一步排序 | 所有人 |
+| [release-checklist.md](release-checklist.md) | 发布清单：版本一致、默认关闭、隔离安装、证据口径 | 发版的人 |
+| [adr/](adr/) | 架构决策记录（0001：中间态激活走环境变量 opt-in） | 架构参考 |
 | [integration.md](integration.md) | 怎么集成进 vllm-hust / vllm-ascend-hust；Extension Manager 与 HOST_CONTRACT 路线 | 做集成/平台的人 |
 | [layers.md](layers.md) | **调用层次与宿主可见性**：vllm-hust / vllm-ascend-hust 各自能调什么、两条激活链路 | 所有人 |
 | [npu-implementation.md](npu-implementation.md) | NPU 实现要点：内核路由、fail-closed 守卫、C8 类手术、残差窗口状态机、已验证/已知问题 | 改内核或 attention 路径的人 |

@@ -71,6 +71,11 @@ remains a host-integration roadmap item.
 | [docs/index.md](docs/index.md) | 文档导航 + 30 秒了解本项目 |
 | [docs/schemes.md](docs/schemes.md) | 模块作用与含义；六个量化方案的语义、布局、差异与选型 |
 | [docs/how-to-run.md](docs/how-to-run.md) | **How to run**：安装、CPU 测试、Python API、NPU 冒烟、宿主 serving、故障排查 |
+| [docs/acceptance-matrix.md](docs/acceptance-matrix.md) | 验收与证据矩阵：推广门、方法状态、负向门 |
+| [docs/validation-int8-20260912.md](docs/validation-int8-20260912.md) | int8 真机验证记录（container-86） |
+| [docs/gap-analysis-vs-ascend-llm-quant.md](docs/gap-analysis-vs-ascend-llm-quant.md) | 对照 Ascend-LLM-quant 的差距分析与下一步 |
+| [docs/release-checklist.md](docs/release-checklist.md) | 发布清单 |
+| [docs/adr/](docs/adr/) | 架构决策记录 |
 | [docs/integration.md](docs/integration.md) | 怎么集成进 vllm-hust / vllm-ascend-hust；Extension Manager 路线 |
 | [docs/layers.md](docs/layers.md) | **调用层次与宿主可见性**：vllm-hust / vllm-ascend-hust 各自能调什么、两条激活链路 |
 | [docs/npu-implementation.md](docs/npu-implementation.md) | NPU 实现要点：内核路由、fail-closed、C8 类手术、残差窗口、已知问题 |
@@ -102,6 +107,18 @@ dtype literal negotiated by the adapter (e.g. `int4_per_token_head` for
 `import_only` — the manager can inspect but must refuse enablement until
 the [HOST_CONTRACT.md](HOST_CONTRACT.md) protocols land in the host. See
 `docs/architecture.md` for the flip conditions.
+
+**Operator tools** (stdlib-only, no heavy imports):
+
+```bash
+vllm-hust-kv-doctor                                   # environment/readiness diagnosis
+vllm-hust-kv-inject <model_dir> --method int8_dynamic # inject dispatch config (auto-backup)
+vllm-hust-kv-inject <model_dir> --check               # pre-serve contract check (SHA-256 bound)
+vllm-hust-kv-inject <model_dir> --restore             # roll back
+vllm-hust-kv-evidence validate --file <record.json>   # evidence record validation
+python scripts/verify_host_sources.py \
+    --vllm-ascend-src <host-checkout>                 # static host-surface verification
+```
 
 ## Extension framework
 

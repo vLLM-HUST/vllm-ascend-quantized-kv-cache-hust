@@ -65,6 +65,12 @@ class AscendHustAdapter(HostAdapter):
             if existing is None or existing.__name__ != scheme_cls.__name__:
                 raise
             already_registered = True
+        # KV 分配守卫：默认 no-op；VLLM_HUST_KV_ALLOC_GUARD=1 时调和宿主
+        # fa_quant 分配的 K/V 字节切分（int8 存储路径的已知阻塞，
+        # 见 provenance/host-fixes/README.md 与 how-to-run.md §6.5）。
+        from .alloc_guard import install_alloc_guard
+
+        guard_status = install_alloc_guard()["status"]
         return {
             "host": self.host,
             "method": method_name,
@@ -72,6 +78,7 @@ class AscendHustAdapter(HostAdapter):
             "layer_type": layer_type,
             "scheme_cls": scheme_cls,
             "already_registered": already_registered,
+            "alloc_guard": guard_status,
         }
 
     @staticmethod

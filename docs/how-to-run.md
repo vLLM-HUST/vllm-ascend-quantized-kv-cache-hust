@@ -62,10 +62,18 @@ vllm-hust-ext extension inspect org.vllm-hust.quantized-kv-cache
 # 期望：discovery 成功，activation_ready=false（import_only 是设计使然）
 ```
 
+装好包之后还可以用只读诊断 CLI 快速回答"这台机器能跑到哪一层"
+（包版本、torch/torch_npu/triton/宿主探测、方法清单、磁盘；`--model`
+附带注入契约校验；`--json` 供脚本消费；退出码即就绪门）：
+
+```bash
+vllm-hust-kv-doctor --require host_serving
+```
+
 ## 3. CPU 测试与静态检查（L1）
 
 ```bash
-pytest -q                     # 当前基线：118 passed, 1 skipped
+pytest -q                     # 当前基线：135 passed, 1 skipped
 ruff check .
 ruff format --check .
 ```
@@ -174,6 +182,9 @@ vllm serve <model> ...
 `@register_scheme` 注册表（键 `VLLM_HUST_KV_*`）。不设变量 =
 完全 no-op。
 
+> 运维提示：除非你维护着**完整**的宿主插件 allowlist，否则不要收窄
+> `VLLM_PLUGINS`——它会同时过滤掉宿主 platform/ascend 必需的入口点。
+
 ### 6.2 让模型真正走量化 scheme（checkpoint 注入）
 
 注册只解决"scheme 在注册表里"；注意力层选择哪个 scheme 由 checkpoint
@@ -194,8 +205,16 @@ vllm serve <model> ...
 ```bash
 vllm-hust-kv-inject <model_dir> --method int8_dynamic           # 注入（自动备份）
 vllm-hust-kv-inject <model_dir> --method kivi_int4 --dry-run    # 只打印不落盘
+vllm-hust-kv-inject <model_dir> --check                         # serve 前校验
 vllm-hust-kv-inject <model_dir> --restore                       # 回滚
 ```
+
+每次注入都会落一份契约清单 `kv_inject_manifest.json`（方法、
+`fa_quant_type`、层数与 config.json 的 size/SHA-256 绑定）；
+`--check` 校验三件事——清单在、哈希与当前 config.json 一致、描述与
+清单参数重新生成的结果逐键一致——任何一条不满足退出码 2。**serve 前
+跑一次 `--check`**，把"注入完又被人手改了 checkpoint"这类事故挡在
+启动前。`--restore` 回滚 config.json 时会一并删除清单。
 
 等价的模块入口：`python -m
 vllm_ascend_quantized_kv_cache.tools.checkpoint ...`。工具写入
@@ -252,6 +271,28 @@ mixin 的 enable 标志按 impl 收到的 `kv_cache_dtype` 字符串打开：
 成功但 enable 保持关闭（量化路径不生效），务必用 §6.1 的日志行 +
 一次小流量请求验证确实走了量化路径。
 
+### 6.5 int8 存储路径与分配守卫（VLLM_HUST_KV_ALLOC_GUARD）
+
+int8 量化存储路径在宿主 vllm-ascend-hust@`b0613602f` 上有一个已定位
+的分配阻塞：fa_quant 层的 K/V 字节切分（legacy"V×2"口径）与
+int8/int8 存储 + 满头重排矛盾，K 只分到重排所需字节的 2/3，初始化即
+失败。根因算术与上游修复提案见
+[provenance/host-fixes/README.md](../provenance/host-fixes/README.md)。
+
+宿主合入修复前，可用**插件侧守卫**（默认关闭，显式 opt-in）调和：
+
+```bash
+export VLLM_HUST_KV_METHODS=int8_dynamic
+export VLLM_HUST_KV_ALLOC_GUARD=1        # 对称维度强制对称切分（守卫日志可见）
+vllm serve <model> --kv-cache-dtype int8_per_token_head ...
+```
+
+守卫语义：包装宿主 `get_kv_quant_split_factor`——仅当 K/V 维度相等而
+宿主切分不对称时改回对称；MLA（维度不等，V 确实留 fp16）不触碰；
+宿主修复后自动退化 no-op。启动日志里守卫会逐层打印 override 行。
+该路径已通过 CPU 侧单测（`tests/test_alloc_guard.py`，stub 复刻宿主
+行为），**NPU 端到端复验仍是第一版本的最后一步**（§8.1）。
+
 ## 7. 在 vllm-hust 上运行（L4，宿主 B）
 
 **前提**：环境里可 `import vllm`（vllm-hust fork），NPU 可用，本包已
@@ -292,17 +333,31 @@ vllm serve <model> \
 | 能力 | 状态 |
 |---|---|
 | 安装后零行为改变 | ✅ 设计保证（bootstrap 默认 no-op，有测试） |
-| CPU 语义层 / 契约 / 注册表 / 适配器逻辑 | ✅ 118 项单测全绿 |
+| CPU 语义层 / 契约 / 注册表 / 适配器逻辑 | ✅ 135 项单测全绿 |
 | KIVI triton pack 内核 + torch gather（910B2） | ✅ 逐位验证通过 |
 | 统一激活管线（`kv_methods.activate` → 宿主 `register_scheme`） | ✅ 910B2 容器真实 vllm-ascend-hust 宿主进程内实测通过（2026-09-11，`container-86`；六方法注册可见 + 幂等再激活 OK） |
 | **fa_quant_type 分发 + impl 类手术（真实引擎）** | ✅ 2026-09-12 实测：Qwen3-0.6B + 注入 `fa_quant_type=VLLM_HUST_KV_INT8_DYNAMIC` 的 checkpoint，28/28 层经 `AscendKVCacheMethod.create_weights` 完成类手术（日志为证） |
 | **真实 serving 冒烟（浮点前向路径）** | ✅ 同环境 `LLM.generate` 生成成功（enforce_eager，fp16，`kv-cache-dtype` 未设时走浮点 KV） |
-| 真实 serving 冒烟（int8 存储路径） | ⚠️ 阻塞于**宿主侧**：`model_runner_v1._reshape_kv_cache_tensors` 对 `int8_per_token_head` 字面量的分配/重排不一致（初始化器分配 `[2314,128,8,64]` 打包布局，重排要求 `[1122,128,8,128]`）——见下"宿主联调工作项" |
-| INT8 / KIVI attention mixin 的 NPU 前向 | ⚠️ 端口保真度；浮点路径已在真实引擎验证，int8 缓存路径待上述宿主问题解决后复验 |
+| 真实 serving 冒烟（int8 存储路径） | ⚠️ 阻塞已**定位到行**（宿主 fa_quant 分配切分 `[3,1.5]` vs 重排需对称 `[2,2]`，见 `provenance/host-fixes/README.md`）：宿主修复提案已备 + 插件侧守卫可用（`VLLM_HUST_KV_ALLOC_GUARD=1`，§6.5）——**待 NPU 复验** |
+| INT8 / KIVI attention mixin 的 NPU 前向 | ⚠️ 端口保真度；浮点路径已在真实引擎验证，int8 缓存路径待守卫/宿主修复在 NPU 上复验 |
 | vllm-hust：CUSTOM backend 注册 + dtype 协商 | ⚠️ 脚手架就绪，端到端待宿主集成验证 |
 | Extension Manager 激活（manager-mediated enable） | ❌ 设计上被阻塞（manifest `import_only`），等 HOST_CONTRACT 四协议落地，见 [integration.md](integration.md) §4 |
 
 ### 8.1 宿主联调工作项（2026-09-12 serving 冒烟结论）
+
+> 本节是当日结论的摘要；正式验证记录见
+> [validation-int8-20260912.md](validation-int8-20260912.md)，推广门与
+> 负向门口径见 [acceptance-matrix.md](acceptance-matrix.md)。宿主侧
+> 遗留项可用 `scripts/verify_host_sources.py --vllm-ascend-src <checkout>`
+> 静态点名（含 int8 阻塞函数）。
+>
+> **2026-09-17 进展**：int8 存储路径的阻塞已从"现象记录"推进到"根因
+> 定位 + 可用修复"——宿主 `AscendModelSlimConfig.get_kv_quant_split_factor`
+> 的 V×2 遗留口径与 int8/int8 存储矛盾（逐行算术见
+> [provenance/host-fixes/README.md](../provenance/host-fixes/README.md)，
+> 附可 `git apply` 的宿主补丁提案）；插件侧过渡守卫已实现
+> （§6.5，CPU 单测通过）。剩余动作只有一个：**容器上复验 int8
+> 端到端**。
 
 在 `container-86`（vllm-ascend-hust + vllm-hust 双栈，torch_npu 环境）上的
 复现配方：Qwen3-0.6B 拷贝 + `config.json` 注入

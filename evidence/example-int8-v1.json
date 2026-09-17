@@ -1,0 +1,56 @@
+{
+  "schema": "vllm-hust-kv-evidence-v1",
+  "run_id": "example-int8-host-registration",
+  "date": "2026-09-12",
+  "method": "int8_dynamic",
+  "profile": "int8_storage",
+  "evidence_level": "host_registration",
+  "status": "blocked",
+  "environment": {
+    "host": "vllm_ascend_hust",
+    "device": "Ascend 910B2",
+    "container": "container-86",
+    "torch": null,
+    "torch_npu": null,
+    "vllm": null,
+    "vllm_ascend": null,
+    "cann": null,
+    "tensor_parallel": 1
+  },
+  "model": {
+    "name": "Qwen3-0.6B",
+    "num_layers": 28,
+    "dtype": "float16"
+  },
+  "recipe": {
+    "fa_quant_type": "VLLM_HUST_KV_INT8_DYNAMIC",
+    "kv_cache_dtype": "int8_per_token_head",
+    "env": {
+      "VLLM_HUST_KV_METHODS": "int8_dynamic"
+    }
+  },
+  "results": [
+    {
+      "name": "scheme registration + fa_quant dispatch + impl surgery",
+      "verdict": "passed",
+      "detail": "28/28 layers class-surgery OK (see docs/validation-int8-20260912.md)"
+    },
+    {
+      "name": "int8 storage allocation",
+      "verdict": "blocked",
+      "detail": "fa_quant split factor asymmetry; see provenance/host-fixes/README.md"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "config.json",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "raw_logs": [
+    "container-86 local experiment archive"
+  ],
+  "notes": "EXAMPLE record with placeholder values; it documents the record shape, not a hardware claim. Produce real records per validation run (docs/acceptance-matrix.md).",
+  "matched_baseline_run_id": null
+}

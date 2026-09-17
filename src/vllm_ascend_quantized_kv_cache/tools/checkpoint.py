@@ -15,6 +15,10 @@
 （bootstrap，见 docs/how-to-run.md §6.1）；int8 存储路径另需 serve 期
 ``--kv-cache-dtype``（§6.4）。
 
+注入同时落一份契约清单 ``kv_inject_manifest.json``（方法、fa_quant_type、
+层数与 config.json 的 size/SHA-256 绑定）：serve 前 ``--check`` 用它校验
+checkpoint 未漂移；``--restore`` 回滚 config.json 时一并删除清单。
+
 本模块只依赖标准库 + 本包轻量元数据：绝不 import torch / vllm / 宿主栈
 （tests/test_checkpoint_inject.py 有子进程导入卫生测试钉住）。
 """
@@ -22,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -46,6 +51,17 @@ _FA_QUANT = "FAQuant"
 _SCHEMA_VERSION = "1.0.0"
 #: 注入前 config.json 的备份后缀。
 _BACKUP_SUFFIX = ".bak-kvinject"
+#: 注入契约清单文件名：把注入事实与 config.json 的 size/SHA-256 绑定，
+#: 供 serve 前 ``--check`` 校验 checkpoint 未漂移（对标离线量化工件的
+#: contract 思路，范围仅限本工具触碰的 config.json）。
+MANIFEST_NAME = "kv_inject_manifest.json"
+_MANIFEST_SCHEMA = "vllm-hust-kv-inject-manifest-v1"
+
+
+def _file_digest(path: Path) -> dict[str, int | str]:
+    """文件的 size + SHA-256 绑定记录（contract 的最小完整形状）。"""
+    payload = path.read_bytes()
+    return {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
 
 
 def known_method_names() -> tuple[str, ...]:
@@ -185,6 +201,26 @@ def inject(
         config_path.write_text(
             json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        manifest_path = model_path / MANIFEST_NAME
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": _MANIFEST_SCHEMA,
+                    "method": method_name,
+                    "fa_quant_type": fa_quant_type,
+                    "num_layers": layers,
+                    "layer_prefix": layer_prefix,
+                    "include_lm_head": include_lm_head,
+                    "extra_float_modules": list(extra_float_modules),
+                    "tool_version": _tool_version(),
+                    "config_json": _file_digest(config_path),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     return {
         "model_dir": str(model_path),
@@ -196,6 +232,91 @@ def inject(
         "backup": None
         if dry_run
         else str(config_path.with_name(config_path.name + _BACKUP_SUFFIX)),
+        "manifest": None if dry_run else str(model_path / MANIFEST_NAME),
+    }
+
+
+def _tool_version() -> str:
+    from .._version import __version__
+
+    return __version__
+
+
+def check_checkpoint(model_dir: str | Path) -> dict:
+    """serve 前校验：注入清单存在、config.json 未漂移、描述与清单一致。
+
+    校验三件事（任何一条不满足即 ``valid=False`` 并给出 issue）：
+    1. ``kv_inject_manifest.json`` 存在且 schema 可识别；
+    2. config.json 的 size/SHA-256 与清单绑定值一致（注入后没被人改过）；
+    3. config.json 里的 ``quantization_config`` 与按清单参数重新生成的
+       完整描述逐键一致（防"清单新、内容旧"的半截注入）。
+
+    返回结构化报告 dict，``valid`` 为总体布尔；CLI ``--check`` 打印它。
+    """
+    model_path = Path(model_dir)
+    issues: list[str] = []
+    config_path = model_path / "config.json"
+    manifest_path = model_path / MANIFEST_NAME
+
+    manifest: dict | None = None
+    if not manifest_path.is_file():
+        issues.append(
+            f"no {MANIFEST_NAME} under {model_path}; was the checkpoint "
+            "injected by vllm-hust-kv-inject? (re-run inject to create it)"
+        )
+    else:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            issues.append(f"{MANIFEST_NAME} is not valid JSON: {exc}")
+        else:
+            if manifest.get("schema") != _MANIFEST_SCHEMA:
+                issues.append(
+                    f"unsupported manifest schema {manifest.get('schema')!r}; "
+                    f"expected {_MANIFEST_SCHEMA!r}"
+                )
+                manifest = None
+
+    digest = _file_digest(config_path) if config_path.is_file() else None
+    if digest is None:
+        issues.append(f"no config.json under {model_path}")
+    elif manifest is not None and digest != manifest.get("config_json"):
+        issues.append(
+            "config.json hash mismatch: manifest binds "
+            f"{manifest.get('config_json')}, found {digest} "
+            "(checkpoint drifted after injection?)"
+        )
+
+    description_matches = False
+    if manifest is not None and config_path.is_file():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            issues.append(f"config.json is not valid JSON: {exc}")
+        else:
+            expected = build_quant_description(
+                manifest["num_layers"],
+                manifest["fa_quant_type"],
+                layer_prefix=manifest.get("layer_prefix", "model"),
+                include_lm_head=bool(manifest.get("include_lm_head")),
+                extra_float_modules=tuple(manifest.get("extra_float_modules", ())),
+            )
+            actual = config.get("quantization_config")
+            if actual == {"quant_method": "ascend", **expected}:
+                description_matches = True
+            else:
+                issues.append(
+                    "config.json quantization_config does not match the "
+                    "description bound by the manifest"
+                )
+
+    return {
+        "model_dir": str(model_path),
+        "valid": not issues,
+        "issues": issues,
+        "manifest": manifest,
+        "config_json": digest,
+        "description_matches": description_matches,
     }
 
 
@@ -210,6 +331,11 @@ def restore(model_dir: str | Path) -> dict:
         )
     config_path.write_text(backup_path.read_text(encoding="utf-8"), encoding="utf-8")
     backup_path.unlink()
+    # 回滚后清单描述的不再是 checkpoint 的事实，一并删掉，避免留下
+    # "看起来还能过 --check"的陈旧契约。
+    manifest_path = config_path.with_name(MANIFEST_NAME)
+    if manifest_path.is_file():
+        manifest_path.unlink()
     return {"model_dir": str(config_path.parent), "restored": str(config_path)}
 
 
@@ -268,6 +394,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--restore", action="store_true", help="用备份回滚 config.json")
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "serve 前校验：注入清单 + config.json 哈希 + 描述一致性；"
+            "打印 JSON 报告，valid 时退出 0 否则 2"
+        ),
+    )
+    parser.add_argument(
         "--list-methods", action="store_true", help="列出全部方法后退出"
     )
     args = parser.parse_args(argv)
@@ -283,6 +417,12 @@ def main(argv: list[str] | None = None) -> int:
             info = restore(args.model_dir)
             print(f"[vllm-hust-kv-inject] restored {info['restored']}")
             return 0
+        if args.check:
+            if args.model_dir is None:
+                parser.error("model_dir is required for --check")
+            report = check_checkpoint(args.model_dir)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report["valid"] else 2
         if args.model_dir is None:
             parser.error("model_dir is required (or use --list-methods)")
         if not args.method:
@@ -315,8 +455,10 @@ def main(argv: list[str] | None = None) -> int:
         print("  (--force 覆盖了已有的外部 ascend 量化描述)")
     if not info["dry_run"]:
         print(f"  备份: {info['backup']}（--restore 回滚）")
+        print(f"  契约清单: {info['manifest']}（serve 前 --check 校验）")
     print(
         "下一步：注册 scheme 用 VLLM_HUST_KV_METHODS 环境变量（§6.1）；"
+        "serve 前用 --check 复核 checkpoint；"
         "int8 存储另需 serve 期 --kv-cache-dtype（§6.4/§8.1）"
     )
     return 0

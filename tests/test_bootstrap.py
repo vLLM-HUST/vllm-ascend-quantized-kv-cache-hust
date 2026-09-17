@@ -27,6 +27,9 @@ def test_requested_methods_parse_and_dedupe(monkeypatch) -> None:
 
 def test_unknown_method_fails_closed(monkeypatch) -> None:
     monkeypatch.setenv(bootstrap.ENV_KV_METHODS, "warp_drive")
+    # 与环境解耦：宿主探测自有专测（下方 missing-host），这里给一个确定性
+    # 宿主，保证无 vllm 栈的机器也走到"未知方法"这条分支而非先撞宿主守卫。
+    monkeypatch.setattr(bootstrap, "detect_host", lambda: "vllm_hust")
     with pytest.raises(ValueError, match="unknown quantized KV method"):
         bootstrap.register_plugins()
 
