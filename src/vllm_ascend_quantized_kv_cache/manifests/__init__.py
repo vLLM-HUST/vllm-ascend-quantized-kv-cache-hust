@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Manifest package for the vLLM-HUST Extension Manager.
+"""Extension Manager 的 manifest 包。
 
-The ``vllm_hust.extension_bundles`` entry point in ``pyproject.toml`` points
-at this module. The manager reads the static ``vllm-hust-extension-v0.2.json``
-descriptor shipped here as package data; discovery must never import the
-implementation modules, so this package intentionally stays empty.
+pyproject 里的 ``vllm_hust.extension_bundles`` entry point 指向本模块。
+管理器从包数据里读静态的 ``vllm-hust-extension-v0.2.json`` 描述符；
+发现阶段绝不导入实现模块，所以本包刻意保持为空。
 """

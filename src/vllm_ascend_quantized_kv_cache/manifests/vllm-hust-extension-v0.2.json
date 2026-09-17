@@ -35,8 +35,8 @@
       "permissions": ["device_access"]
     },
     {
-      "component_id": "solution-int8-dynamic",
-      "implementation_ref": "vllm_ascend_quantized_kv_cache.solutions.int8_dynamic:SOLUTION_SPEC",
+      "component_id": "method-int8-dynamic",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.methods.int8_dynamic:METHOD_SPEC",
       "contracts": [
         "vllm.kv-cache.dtype-registry.v1",
         "vllm.kv-cache.layout.v1",
@@ -47,8 +47,8 @@
       "permissions": ["device_access"]
     },
     {
-      "component_id": "solution-kivi-int4",
-      "implementation_ref": "vllm_ascend_quantized_kv_cache.solutions.kivi_int4:SOLUTION_SPEC",
+      "component_id": "method-kivi-int4",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.methods.kivi_int4:METHOD_SPEC",
       "contracts": [
         "vllm.kv-cache.dtype-registry.v1",
         "vllm.kv-cache.layout.v1",
@@ -59,8 +59,44 @@
       "permissions": ["device_access"]
     },
     {
-      "component_id": "solution-packed-schemes",
-      "implementation_ref": "vllm_ascend_quantized_kv_cache.solutions.packed:SOLUTION_SPECS",
+      "component_id": "method-int4-packed",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.methods.int4_packed:METHOD_SPEC",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "method-fp4-e2m1",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.methods.fp4_e2m1:METHOD_SPEC",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "method-fp8-e4m3",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.methods.fp8_e4m3:METHOD_SPEC",
+      "contracts": [
+        "vllm.kv-cache.dtype-registry.v1",
+        "vllm.kv-cache.layout.v1",
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "method-nvfp4",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.methods.nvfp4:METHOD_SPEC",
       "contracts": [
         "vllm.kv-cache.dtype-registry.v1",
         "vllm.kv-cache.layout.v1",
@@ -80,20 +116,38 @@
     },
     {
       "type": "python_module",
-      "module": "vllm_ascend_quantized_kv_cache.solutions.int8_dynamic",
-      "object": "SOLUTION_SPEC",
+      "module": "vllm_ascend_quantized_kv_cache.methods.int8_dynamic",
+      "object": "METHOD_SPEC",
       "status": "import_only"
     },
     {
       "type": "python_module",
-      "module": "vllm_ascend_quantized_kv_cache.solutions.kivi_int4",
-      "object": "SOLUTION_SPEC",
+      "module": "vllm_ascend_quantized_kv_cache.methods.kivi_int4",
+      "object": "METHOD_SPEC",
       "status": "import_only"
     },
     {
       "type": "python_module",
-      "module": "vllm_ascend_quantized_kv_cache.solutions.packed",
-      "object": "SOLUTION_SPECS",
+      "module": "vllm_ascend_quantized_kv_cache.methods.int4_packed",
+      "object": "METHOD_SPEC",
+      "status": "import_only"
+    },
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.methods.fp4_e2m1",
+      "object": "METHOD_SPEC",
+      "status": "import_only"
+    },
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.methods.fp8_e4m3",
+      "object": "METHOD_SPEC",
+      "status": "import_only"
+    },
+    {
+      "type": "python_module",
+      "module": "vllm_ascend_quantized_kv_cache.methods.nvfp4",
+      "object": "METHOD_SPEC",
       "status": "import_only"
     }
   ],

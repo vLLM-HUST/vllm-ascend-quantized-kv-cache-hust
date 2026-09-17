@@ -1,33 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lazily-built attention backend for the vllm-hust host.
+"""vllm-hust 宿主的惰性构建 attention backend。
 
-The host registry stores fully qualified class *paths* and imports them
-lazily at backend selection. This module therefore exposes
-``HustQuantizedKvAttentionBackend`` through a module-level ``__getattr__``:
-the class (which must subclass the host ``AttentionBackend``) is only
-constructed when a vllm process actually resolves the path, so the
-package stays dependency-free everywhere else.
+宿主注册表存的是"全限定类路径"，选定后端时才惰性 import。因此本模块
+通过模块级 ``__getattr__`` 暴露 ``HustQuantizedKvAttentionBackend``：
+这个类（必须是宿主 AttentionBackend 的子类）只在 vllm 进程真正解析
+该路径的那一刻才被构建——包在其他所有环境保持零依赖。
 
-Status: interface-ready scaffolding. The class implements the registry
-surface (name, supported dtypes, cache shapes) from the layout contract
-and binds the solution mixins for device execution on Ascend NPU. The
-metadata builder delegates to the host's generic builder; end-to-end
-serving through this backend is validated by the host-integration roadmap
-item, not by this release.
+成熟度：接口就绪的脚手架。类实现了注册表面（名字、支持的 dtype、
+缓存形状，来自布局契约），并把方法 mixin 绑定到 Ascend NPU 设备执行。
+metadata builder 委托宿主的通用 builder；经此后端的端到端 serving
+属于宿主集成路线图项，本版本未验证。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-_SOLUTION_NAME = "int8_dynamic"
+_METHOD_NAME = "int8_dynamic"
 
 
-def _resolve_solution_name() -> str:
-    """Pick the solution this backend serves (env-overridable)."""
+def _resolve_method_name() -> str:
+    """选择该 backend 服务的方法（环境变量可覆盖；默认 int8_dynamic）。"""
     import os
 
-    return os.environ.get("VLLM_HUST_QKV_BACKEND_SOLUTION", _SOLUTION_NAME)
+    return os.environ.get("VLLM_HUST_KV_BACKEND_METHOD", _METHOD_NAME)
 
 
 def _build_backend() -> type:
@@ -37,18 +33,18 @@ def _build_backend() -> type:
     )
 
     from ....core.runtime import npu_available
-    from ....solutions.int8_dynamic.attention_mixin import (
+    from ....methods.int8_dynamic.attention_mixin import (
         Int8DynamicAttentionMixin,
     )
-    from ....solutions.kivi_int4.attention_mixin import KiviInt4AttentionMixin
+    from ....methods.kivi_int4.attention_mixin import KiviInt4AttentionMixin
     from .register import map_cache_dtype
 
-    solution_name = _resolve_solution_name()
-    cache_dtype_literal = map_cache_dtype(solution_name)
+    method_name = _resolve_method_name()
+    cache_dtype_literal = map_cache_dtype(method_name)
     mixin = {
         "int8_dynamic": Int8DynamicAttentionMixin,
         "kivi_int4": KiviInt4AttentionMixin,
-    }[solution_name]
+    }[method_name]
 
     class _Impl(mixin, AttentionImpl):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -56,7 +52,7 @@ def _build_backend() -> type:
             kv_cache_dtype = kwargs.get("kv_cache_dtype")
             if kv_cache_dtype is None and len(args) > 6:
                 kv_cache_dtype = args[6]
-            if solution_name == "int8_dynamic":
+            if method_name == "int8_dynamic":
                 self._init_int8_dynamic_state(kv_cache_dtype or cache_dtype_literal)
             else:
                 self._init_kivi_state(
@@ -65,12 +61,12 @@ def _build_backend() -> type:
                 )
 
     class HustQuantizedKvAttentionBackend(AttentionBackend):  # noqa: N801
-        _solution_name = solution_name
+        _method_name = method_name
         _cache_dtype_literal = cache_dtype_literal
 
         @classmethod
         def get_name(cls) -> str:
-            return f"VLLM_HUST_QUANTIZED_KV_{solution_name.upper()}"
+            return f"VLLM_HUST_QUANTIZED_KV_{method_name.upper()}"
 
         @classmethod
         def get_supported_kernel_block_sizes(cls) -> list[int]:
@@ -93,9 +89,10 @@ def _build_backend() -> type:
 
         @classmethod
         def get_impl_cls(cls) -> type:
+            # 设备执行只走 Ascend NPU 内核；非 NPU 环境拒绝启动
             if not npu_available():
                 raise RuntimeError(
-                    f"the {cls._solution_name} backend executes Ascend NPU "
+                    f"the {cls._method_name} backend executes Ascend NPU "
                     "kernels only; refusing to run on this device"
                 )
             return _Impl

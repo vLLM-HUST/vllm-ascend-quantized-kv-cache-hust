@@ -18,9 +18,18 @@ test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
 "org.vllm-hust.quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.manifests"
 
 # Native vLLM bootstrap hook. It is a no-op unless explicitly requested via
-# VLLM_HUST_QUANT_KV_SOLUTIONS (installation must never change behaviour).
+# VLLM_HUST_KV_METHODS (installation must never change behaviour).
 [project.entry-points."vllm.general_plugins"]
 "vllm-hust-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+
+# Checkpoint injection tool: writes the complete ModelSlim-style
+# quantization_config (fa_quant_type dispatch) — see docs/how-to-run.md §6.2.
+[project.scripts]
+"vllm-hust-kv-inject" = "vllm_ascend_quantized_kv_cache.tools.checkpoint:main"
+# Read-only environment/readiness diagnosis — see docs/how-to-run.md §2.
+"vllm-hust-kv-doctor" = "vllm_ascend_quantized_kv_cache.tools.doctor:main"
+# Evidence record validator (docs/acceptance-matrix.md discipline).
+"vllm-hust-kv-evidence" = "vllm_ascend_quantized_kv_cache.tools.evidence:main"
 
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"
@@ -39,6 +48,9 @@ line-length = 88
 select = ["B", "E", "F", "I", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# Verbatim port of the legacy triton-ascend kernels (ascend-pr-116 final
+# Verbatim ports of the legacy triton-ascend kernels (ascend-pr-116 final
 # state): line lengths are preserved from the source patch on purpose.
-"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_cache.py" = ["E501"]
+"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_pack.py" = ["E501"]
+"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_gather_experimental.py" = ["E501"]
+# NPU-only diagnostic scripts (run on the Ascend container, not in CI).
+"scripts/npu_*.py" = ["E501"]

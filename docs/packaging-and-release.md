@@ -25,7 +25,7 @@ how.
   - `vllm_hust.extension_bundles` → `org.vllm-hust.quantized-kv-cache` =
     `vllm_ascend_quantized_kv_cache.manifests`
   - `vllm.general_plugins` → `bootstrap:register_plugins`
-- The triton kernel module (`ops/triton/kivi_cache.py`) ships inside the
+- The triton kernel module (`ops/triton/kivi_pack.py`) ships inside the
   wheel; it is only imported on Ascend NPU paths.
 
 `scripts/verify-wheel.sh dist/*.whl` checks all of the above plus the
@@ -51,8 +51,8 @@ bash scripts/verify-wheel.sh dist/*.whl
 python -m venv .release-smoke
 .release-smoke/bin/pip install --no-cache-dir dist/*.whl
 .release-smoke/bin/python -c "
-from vllm_ascend_quantized_kv_cache import kv_solutions, __version__
-print(__version__, kv_solutions.list())
+from vllm_ascend_quantized_kv_cache import kv_methods, __version__
+print(__version__, kv_methods.list())
 "
 ```
 
@@ -85,7 +85,7 @@ alpha goes out before the end-to-end gate passes.
 ```bash
 pip install vllm-ascend-quantized-kv-cache
 # activation is explicit:
-VLLM_HUST_QUANT_KV_SOLUTIONS=int8_dynamic vllm serve MODEL ...
+VLLM_HUST_KV_METHODS=int8_dynamic vllm serve MODEL ...
 ```
 
 Installation alone must never change serving behaviour — that is what the

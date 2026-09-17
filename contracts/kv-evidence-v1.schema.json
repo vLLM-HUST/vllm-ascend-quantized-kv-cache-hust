@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vllm-hust.org/schemas/kv-evidence-v1.schema.json",
+  "title": "Quantized KV cache evidence record (v1)",
+  "description": "Closed, versioned evidence record for quantized-KV validation runs. Mirrors the acceptance gates in docs/acceptance-matrix.md. Unknown fields are intentionally rejected (see contracts discipline in Ascend-LLM-quant's evidence schema and docs/gap-analysis-vs-ascend-llm-quant.md). The validator is tools/evidence.py (zero-dependency subset); keep this file and the validator SPEC in sync (tests/test_evidence.py pins the drift).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "run_id",
+    "date",
+    "method",
+    "profile",
+    "evidence_level",
+    "status",
+    "environment",
+    "model",
+    "recipe",
+    "results"
+  ],
+  "properties": {
+    "schema": { "const": "vllm-hust-kv-evidence-v1" },
+    "run_id": { "type": "string", "description": "Immutable run identifier, e.g. container-86-int8-20260912." },
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "method": { "type": "string", "description": "Method name from the registry, e.g. int8_dynamic." },
+    "profile": { "type": "string", "description": "Verified surface, e.g. float_serving, int8_storage, kivi_packed_storage." },
+    "evidence_level": {
+      "enum": ["schema_only", "cpu_semantics", "host_registration", "npu_kernel_bitexact", "npu_e2e", "matched_benchmark"],
+      "description": "Promotion gates from docs/acceptance-matrix.md."
+    },
+    "status": { "enum": ["passed", "failed", "blocked"] },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "device"],
+      "properties": {
+        "host": { "enum": ["vllm_ascend_hust", "vllm_hust"] },
+        "device": { "type": "string" },
+        "container": { "type": "string" },
+        "torch": { "type": ["string", "null"] },
+        "torch_npu": { "type": ["string", "null"] },
+        "vllm": { "type": ["string", "null"] },
+        "vllm_ascend": { "type": ["string", "null"] },
+        "cann": { "type": ["string", "null"] },
+        "tensor_parallel": { "type": "integer" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "num_layers"],
+      "properties": {
+        "name": { "type": "string" },
+        "num_layers": { "type": "integer", "minimum": 1 },
+        "dtype": { "type": "string" }
+      }
+    },
+    "recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fa_quant_type": { "type": ["string", "null"] },
+        "kv_cache_dtype": { "type": ["string", "null"] },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "verdict"],
+        "properties": {
+          "name": { "type": "string" },
+          "verdict": { "enum": ["passed", "failed", "blocked"] },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" },
+          "size": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "raw_logs": { "type": "array", "items": { "type": "string" } },
+    "notes": { "type": "string" },
+    "matched_baseline_run_id": {
+      "type": ["string", "null"],
+      "description": "Required (non-null) when evidence_level is matched_benchmark: the BF16 baseline run under the identical protocol."
+    }
+  }
+}

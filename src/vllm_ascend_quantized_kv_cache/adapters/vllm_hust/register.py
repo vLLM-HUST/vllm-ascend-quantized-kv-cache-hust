@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Registration entry point for the vllm-hust host.
+"""vllm-hust 宿主的注册入口。
 
-Zero-host-change attach path: the external package registers a fully
-qualified class path into the host attention registry under
-``AttentionBackendEnum.CUSTOM`` (the registry stores string paths and
-imports them lazily at selection time), then the engine picks it up with
-``--attention-backend CUSTOM``.
+零宿主改动的挂载路径：本包把一个"全限定类路径"注册进宿主 attention
+注册表的 ``AttentionBackendEnum.CUSTOM`` 槽位（注册表只存字符串路径，
+选定后端时才惰性 import），引擎以 ``--attention-backend CUSTOM`` 生效。
 
-``CacheDType`` on the host is a closed Literal enforced at three layers
-(pydantic config, backend selector, torch-dtype lookup), so a solution
-must reuse an existing dtype literal; :func:`map_cache_dtype` provides
-that negotiation and fails closed when no literal fits.
+注意：宿主的 CacheDType 是封闭 Literal，在三层各自 fail-closed
+（pydantic 配置、后端选择器、torch dtype 查表）。方法必须复用某个
+既有字面量；:func:`map_cache_dtype` 负责这个协商，没有合适字面量时
+fail-closed（如 fp4_e2m1，需要宿主路线图加字面量）。
 """
 
 from __future__ import annotations
@@ -19,30 +17,30 @@ from typing import Any
 
 from ..base import HostAdapter
 
-#: Solution name -> nearest existing ``CacheDType`` literal on vllm-hust.
+#: 方法名 -> vllm-hust 上最近的既有 CacheDType 字面量。
 #: Literal set (host cache.py): auto, float16, bfloat16, fp8, fp8_e4m3,
 #: fp8_e5m2, fp8_inc, fp8_ds_mla, turboquant_*, int4_per_token_head,
 #: int8_per_token_head, fp8_per_token_head, nvfp4.
 DTYPE_LITERAL_MAP: dict[str, str] = {
     "int8_dynamic": "int8_per_token_head",
     "kivi_int4": "int4_per_token_head",
-    "int4": "int4_per_token_head",
+    "int4_packed": "int4_per_token_head",
     "nvfp4": "nvfp4",
     "fp8_e4m3": "fp8_e4m3",
 }
 
 
-def map_cache_dtype(solution_name: str) -> str:
-    """Negotiate the host ``CacheDType`` literal for a solution.
+def map_cache_dtype(method_name: str) -> str:
+    """为方法协商宿主可用的 CacheDType 字面量。
 
-    Fail-closed: solutions without a fitting literal (fp4_e2m1 today) raise
-    instead of silently reusing a wrong layout.
+    Fail-closed：没有合适字面量的方法（当前是 fp4_e2m1）直接抛错，
+    绝不静默套用错误布局。
     """
     try:
-        return DTYPE_LITERAL_MAP[solution_name]
+        return DTYPE_LITERAL_MAP[method_name]
     except KeyError:
         raise ValueError(
-            f"solution {solution_name!r} has no vllm-hust CacheDType "
+            f"method {method_name!r} has no vllm-hust CacheDType "
             "literal mapping yet; adding one requires the host-side "
             "roadmap item (see docs/architecture.md)"
         ) from None
@@ -59,7 +57,7 @@ class VllmHustAdapter(HostAdapter):
     host_module = "vllm"
 
     def register(self) -> dict[str, Any]:
-        """Point ``AttentionBackendEnum.CUSTOM`` at our backend class path."""
+        """把 AttentionBackendEnum.CUSTOM 指到我们的 backend 类路径。"""
         self.require_host()
         try:
             from vllm.v1.attention.backends.registry import (
@@ -72,12 +70,12 @@ class VllmHustAdapter(HostAdapter):
                 "adapter targets the vllm-hust fork"
             ) from exc
 
-        solution_name = self.solution.name
-        cache_dtype_literal = map_cache_dtype(solution_name)
+        method_name = self.method.name
+        cache_dtype_literal = map_cache_dtype(method_name)
         register_backend(AttentionBackendEnum.CUSTOM, BACKEND_CLASS_PATH)
         return {
             "host": self.host,
-            "solution": solution_name,
+            "method": method_name,
             "attention_backend": "CUSTOM",
             "cache_dtype_literal": cache_dtype_literal,
             "backend_class_path": BACKEND_CLASS_PATH,

@@ -1,12 +1,12 @@
-"""Dynamic per-channel INT8 solution: semantics math and store path."""
+"""Dynamic per-channel INT8 method: semantics math and store path."""
 
 import pytest
 import torch
 
-from vllm_ascend_quantized_kv_cache.solutions.int8_dynamic import (
+from vllm_ascend_quantized_kv_cache.methods.int8_dynamic import (
     attention_mixin as am,
 )
-from vllm_ascend_quantized_kv_cache.solutions.int8_dynamic.semantics import (
+from vllm_ascend_quantized_kv_cache.methods.int8_dynamic.semantics import (
     Int8DynamicSemantics,
 )
 

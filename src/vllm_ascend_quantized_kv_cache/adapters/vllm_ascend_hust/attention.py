@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Impl-class construction for the vllm-ascend-hust host.
+"""vllm-ascend-hust 宿主的 Impl 类构造。
 
-Generates ``AscendAttentionBackendImpl`` subclasses combining our solution
-mixins with the host base class, following the in-tree C8 precedent
-(``kv_c8.py``: ``layer.impl.__class__ = AscendC8AttentionBackendImpl``
-inside a quant scheme's ``create_weights``).
+动态生成 "方法 mixin + 宿主 AscendAttentionBackendImpl 基类" 的子类，
+遵循宿主在树 C8 先例（kv_c8.py：在 quant scheme 的 create_weights 里
+做 layer.impl.__class__ = AscendC8AttentionBackendImpl 的类手术）。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from ...solutions.int8_dynamic.attention_mixin import Int8DynamicAttentionMixin
-from ...solutions.kivi_int4.attention_mixin import KiviInt4AttentionMixin
+from ...methods.int8_dynamic.attention_mixin import Int8DynamicAttentionMixin
+from ...methods.kivi_int4.attention_mixin import KiviInt4AttentionMixin
 
+# 方案名 -> (mixin 类, 状态初始化方法名)。
+# mixin 提供设备路径方法；状态初始化方法在构造/类手术后建立全部属性。
 _MIXINS: dict[str, tuple[type, str]] = {
     "int8_dynamic": (Int8DynamicAttentionMixin, "_init_int8_dynamic_state"),
     "kivi_int4": (KiviInt4AttentionMixin, "_init_kivi_state"),
@@ -25,21 +26,23 @@ _MIXINS: dict[str, tuple[type, str]] = {
 _KV_DTYPE_ARG_INDEX = 6
 
 
-def supported_impl_solutions() -> tuple[str, ...]:
+def supported_impl_methods() -> tuple[str, ...]:
     return tuple(sorted(_MIXINS))
 
 
-def build_impl_cls(solution_name: str, base_impl_cls: type) -> type:
-    """Combine the solution mixin with the host impl base class."""
+def build_impl_cls(method_name: str, base_impl_cls: type) -> type:
+    """把方法 mixin 与宿主 impl 基类组合成子类。"""
     try:
-        mixin_cls, init_method = _MIXINS[solution_name]
+        mixin_cls, init_method = _MIXINS[method_name]
     except KeyError:
         raise ValueError(
-            f"no Ascend impl mixin wired for solution {solution_name!r}; "
-            f"supported: {', '.join(supported_impl_solutions())}"
+            f"no Ascend impl mixin wired for method {method_name!r}; "
+            f"supported: {', '.join(supported_impl_methods())}"
         ) from None
 
     def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
+        # 先跑宿主基类构造（建立 num_heads/head_size/vllm_config 等属性），
+        # 再初始化方案状态；kv_cache_dtype 支持关键字或第 7 个位置参数。
         base_impl_cls.__init__(self, *args, **kwargs)
         kv_cache_dtype = kwargs.get("kv_cache_dtype")
         if kv_cache_dtype is None and len(args) > _KV_DTYPE_ARG_INDEX:
@@ -54,7 +57,7 @@ def build_impl_cls(solution_name: str, base_impl_cls: type) -> type:
         # class swap (a swap does not re-run __init__).
         "_state_init_method": init_method,
         "__doc__": (
-            f"{solution_name} quantized-KV attention impl "
+            f"{method_name} quantized-KV attention impl "
             f"(mixin {mixin_cls.__name__} over "
             f"{base_impl_cls.__name__})."
         ),
@@ -67,15 +70,35 @@ def build_impl_cls(solution_name: str, base_impl_cls: type) -> type:
 
 
 def apply_impl_surgery(layer: Any, impl_cls: type) -> bool:
-    """C8-style per-layer impl substitution (returns True when applied).
+    """C8 式逐 layer 的 impl 类替换（成功返回 True）。
 
-    After the swap the mixin state is initialised explicitly, mirroring
-    what the generated ``__init__`` does at construction time.
+    关键细节：换 __class__ 不会重跑 __init__，所以交换后要显式调用
+    mixin 的状态初始化方法——否则 enable_kivi / 残差窗口等属性缺失，
+    forward 时才会炸。
+
+    兼容性：__class__ 赋值要求新旧类的 tp_base 一致。多继承动态类
+    （mixin, base）的 tp_base 落在 mixin 上，与在役实例的基类不同，
+    CPython 会拒绝赋值（真机 910B2 宿主实测）。因此首选直接换类，
+    TypeError 时回退为"整实例克隆替换"：以新类新建空实例、浅拷贝
+    旧实例 __dict__、重新赋给 layer.impl——状态完整保留，且新类
+    MRO 同时含 mixin 与宿主基类，super() 语义不变。
     """
     if not hasattr(layer, "impl"):
         return False
     impl = layer.impl
-    impl.__class__ = impl_cls
+    old_cls = type(impl)
+    try:
+        impl.__class__ = impl_cls
+    except TypeError:
+        new_impl = object.__new__(impl_cls)
+        new_impl.__dict__.update(impl.__dict__)
+        layer.impl = new_impl
+        impl = new_impl
+    print(
+        f"[vllm-hust-quantized-kv-cache] impl surgery applied: "
+        f"{old_cls.__name__} -> {impl_cls.__name__}",
+        flush=True,
+    )
     init_method = getattr(impl_cls, "_state_init_method", None)
     if init_method is not None:
         getattr(impl, init_method)(
@@ -85,4 +108,4 @@ def apply_impl_surgery(layer: Any, impl_cls: type) -> bool:
     return True
 
 
-__all__ = ["apply_impl_surgery", "build_impl_cls", "supported_impl_solutions"]
+__all__ = ["apply_impl_surgery", "build_impl_cls", "supported_impl_methods"]
