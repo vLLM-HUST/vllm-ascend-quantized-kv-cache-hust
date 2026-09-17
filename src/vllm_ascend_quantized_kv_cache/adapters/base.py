@@ -39,7 +39,7 @@ class HostAdapter:
             )
 
     def register(self, **options: Any) -> dict[str, Any]:
-        """把方法注册进宿主；由各子类实现（见 vllm_ascend_hust / vllm_hust）。"""
+        """把方法注册进宿主；由 vllm_ascend_hust 适配器实现。"""
         raise NotImplementedError
 
 

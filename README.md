@@ -1,137 +1,95 @@
-# Quantized KV Cache for vLLM-HUST
+# Ascend INT8 KV Cache Plugin
 
-Pluggable quantized KV-cache **method** library for the vLLM-HUST stack. The
-package mines the provenance-preserved legacy implementations (INT8 dynamic
-per-channel, KIVI INT4, and the int4 / fp4_e2m1 / fp8_e4m3 / nvfp4 packed
-handlers) into **independent, self-registering method modules** behind one
-unified API, with host adapters for both **vllm-hust** and
-**vllm-ascend-hust**.
+面向 `vllm-ascend-hust` 的 INT8 KV-cache attention implementation 插件，
+运行在由 `vllm-hust` 启动的推理进程中。仓库只提供一种量化方式：运行时
+动态 per-channel INT8；它不是 CUDA、ROCm 或 CPU 可用的通用 vLLM 插件。
 
-This project is distinct from offline model quantization and the Adaptive
-Quantized KV observer project. Technical ownership: @hustcui,
-@SuccinctPaul. See [MAINTAINERS.md](MAINTAINERS.md) and
-[PROVENANCE.md](PROVENANCE.md).
-
-**Device scope: the kernel layer (triton-ascend / torch_npu) executes on
-Ascend NPU only. The pure semantics layer runs anywhere; every device path
-fails closed with an explicit error off-NPU.**
-
-## Install
+插件不读取模型 checkpoint 的 `fa_quant_type`，也不要求模型预量化。
+唯一启用开关是 vLLM 命令行参数：
 
 ```bash
-pip install vllm-ascend-quantized-kv-cache
+vllm serve MODEL --kv-cache-dtype int8
 ```
 
-Zero runtime dependencies. Installing never changes any vLLM behaviour.
+## 运行机制
 
-## Unified API
+安装 wheel 后，vLLM 通过 `vllm.general_plugins` 动态加载
+`bootstrap.register_plugins`。入口为宿主 `AscendAttentionBackend` 安装
+`get_impl_cls` 分派器：cache dtype 为 `int8` 时返回插件实现，其他 dtype
+继续调用宿主原始分派逻辑。未传 `--kv-cache-dtype int8` 时不会执行 INT8
+量化路径。
 
-```python
-from vllm_ascend_quantized_kv_cache import kv_methods
+INT8 scale 在每层首次收到 K/V 时沿 token 维计算，K/V 分别使用动态对称
+per-channel scale。decode 使用 Ascend fused attention 的在线 antiquant；
+prefill 和 chunked prefill 在需要时 gather 并反量化分页缓存。
 
-kv_methods.list()                          # every registered method
-kv_methods.list(host="vllm_ascend_hust")  # filtered by host
+实际类组合为：
 
-method = kv_methods.get("kivi_int4", head_size=128, block_size=128)
-method.descriptor        # name, quant mode, provenance, support matrix
-method.resolve_layout()  # -> KVCacheLayout (dtype / packed dim / storage)
-method.semantics         # pure math: scales, pack/unpack, window bookkeeping
-
-# Plug into a host (explicit; host imports are lazy)
-ad = method.host_adapter("vllm_ascend_hust")
-info = ad.register()  # registers the scheme into the host registry
+```text
+AscendInt8KvAttentionImpl
+  = plugin AscendInt8AttentionBackendMixin
+  + host AscendAttentionBackendImpl
 ```
 
-Unknown names, invalid configuration, and unsupported host/method pairs
-raise `ValueError` (fail-closed, mirroring the layout contract).
+当 context parallel 开启时 INT8 KV cache 会明确拒绝启动，与当前宿主限制一致。
 
-## Solutions
+## 安装与运行
 
-| method | dtype | source patch | semantics | Ascend NPU kernels | vllm-ascend-hust | vllm-hust |
-|---|---|---|---|---|---|---|
-| `int8_dynamic` | `int8_per_token_head` | ascend#116/0001 | pure | torch_npu fused attention | scheme + impl surgery | CUSTOM backend (NPU only) |
-| `kivi_int4` | `kivi_int4` | ascend#116/0003-0013 | pure | triton-ascend pack / gather | scheme + impl surgery | CUSTOM backend (NPU only) |
-| `int4_packed` | `int4` | ascend#160 | pure | backend-side | scheme | CUSTOM backend |
-| `fp4_e2m1` | `fp4_e2m1` | ascend#160 | pure | backend-side | scheme | no dtype literal yet |
-| `fp8_e4m3` | `fp8_e4m3` | ascend#160 | pure | backend-side | scheme | CUSTOM backend |
-| `nvfp4` | `nvfp4` | ascend#160 | pure | backend-side | scheme | CUSTOM backend |
+```bash
+conda activate vllm-hust-dev
+python -m pip install -e .
 
-Maturity notes: the **semantics layer** of every method is tested on CPU.
-Device execution is validated only to port fidelity; end-to-end serving
-needs an Ascend NPU environment. The host-registration link
-(`kv_methods.activate` → host `register_scheme`) has been verified
-in-process on a real vllm-ascend-hust 910B2 container (2026-09-11, six
-methods registered, idempotent re-activation OK); the full engine path
-remains a host-integration roadmap item.
+VLLM_LOGGING_LEVEL=INFO vllm serve MODEL \
+  --kv-cache-dtype int8 \
+  --max-model-len 8192
+```
 
-## Documentation
+不需要 `VLLM_HUST_KV_METHODS`，不需要修改 checkpoint。
 
-| doc | contents |
+检查动态插件入口：
+
+```bash
+python -c "from importlib.metadata import entry_points; print([e for e in entry_points(group='vllm.general_plugins') if e.name == 'vllm-ascend-int8-kv-cache'])"
+```
+
+## Bundle manifest
+
+wheel 内包含 Bundle v1 manifest：
+`vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json`。
+其宿主声明为 `provider=vllm`、`name=vllm-ascend`。
+需要静态准入的宿主可通过 `VLLM_EXTENSION_MANIFESTS` 显式传入该文件。
+Manifest 的 `implementation_ref` 描述插件提供的 backend 组件；实际运行时
+接入由 `vllm.general_plugins` 调用 `install_int8_impl_dispatch()` 完成。
+
+## 验证
+
+```bash
+PYTHONPATH=src python -m pytest -q
+python -m build
+bash scripts/verify-wheel.sh dist/*.whl
+```
+
+设备执行仅支持 Ascend NPU。当前目标环境为 Ascend 910B +
+`vllm-hust-dev`。
+
+### 已验证环境
+
+2026-09-16 完成了真实 NPU 端到端验证：
+
+| 项目 | 已验证值 |
 |---|---|
-| [docs/index.md](docs/index.md) | 文档导航 + 30 秒了解本项目 |
-| [docs/schemes.md](docs/schemes.md) | 模块作用与含义；六个量化方案的语义、布局、差异与选型 |
-| [docs/how-to-run.md](docs/how-to-run.md) | **How to run**：安装、CPU 测试、Python API、NPU 冒烟、宿主 serving、故障排查 |
-| [docs/acceptance-matrix.md](docs/acceptance-matrix.md) | 验收与证据矩阵：推广门、方法状态、负向门 |
-| [docs/validation-int8-20260912.md](docs/validation-int8-20260912.md) | int8 真机验证记录（container-86） |
-| [docs/gap-analysis-vs-ascend-llm-quant.md](docs/gap-analysis-vs-ascend-llm-quant.md) | 对照 Ascend-LLM-quant 的差距分析与下一步 |
-| [docs/release-checklist.md](docs/release-checklist.md) | 发布清单 |
-| [docs/adr/](docs/adr/) | 架构决策记录 |
-| [docs/integration.md](docs/integration.md) | 怎么集成进 vllm-hust / vllm-ascend-hust；Extension Manager 路线 |
-| [docs/layers.md](docs/layers.md) | **调用层次与宿主可见性**：vllm-hust / vllm-ascend-hust 各自能调什么、两条激活链路 |
-| [docs/npu-implementation.md](docs/npu-implementation.md) | NPU 实现要点：内核路由、fail-closed、C8 类手术、残差窗口、已知问题 |
-| [docs/development.md](docs/development.md) | 开发指南：分层纪律、新增方案、测试策略、CI |
-| [docs/architecture.md](docs/architecture.md) | 分层架构设计（英文） |
-| [docs/packaging-and-release.md](docs/packaging-and-release.md) | 打包与发布流程（英文） |
-| [HOST_CONTRACT.md](HOST_CONTRACT.md) | 宿主协议提案与中间态挂载路线 |
+| 插件版本 | `0.2.0.dev0` |
+| vLLM-HUST commit | `8a6655cf62` |
+| vLLM-Ascend-HUST commit | `f4f49832` |
+| vLLM 运行时版本 | `0.23.1.post1.dev498+g802ead286.dirty` |
+| 设备 | Ascend 910B，单卡 |
+| 模型 | Qwen2.5-14B-Instruct |
+| 模型权重 | BF16 |
+| KV cache | 动态 per-channel INT8 |
+| 上下文长度 | 8192 |
+| Prefill / decode | 通过 |
+| ACL Graph capture / replay | 通过 |
+| OpenAI Chat API | 3 次请求均返回 HTTP 200 |
 
-## Using from a host (pluggable activation)
-
-Installation is not activation. Two mechanisms exist:
-
-**1. Native vLLM bootstrap (works today, explicit per process):**
-
-```bash
-# vllm-ascend-hust or vllm-hust serving process
-VLLM_HUST_KV_METHODS=int8_dynamic,kivi_int4 vllm serve MODEL ...
-```
-
-The `vllm.general_plugins` hook stays a no-op unless this variable names
-methods. Each named method registers into the host that is importable
-in that process (unknown names / missing hosts fail closed). On
-vllm-hust, start the engine with `--attention-backend CUSTOM` and the
-dtype literal negotiated by the adapter (e.g. `int4_per_token_head` for
-`kivi_int4`).
-
-**2. Extension Manager (blocked by design):** the bundle
-`org.vllm-hust.quantized-kv-cache` ships a Manifest 0.2 descriptor and is
-`import_only` — the manager can inspect but must refuse enablement until
-the [HOST_CONTRACT.md](HOST_CONTRACT.md) protocols land in the host. See
-`docs/architecture.md` for the flip conditions.
-
-**Operator tools** (stdlib-only, no heavy imports):
-
-```bash
-vllm-hust-kv-doctor                                   # environment/readiness diagnosis
-vllm-hust-kv-inject <model_dir> --method int8_dynamic # inject dispatch config (auto-backup)
-vllm-hust-kv-inject <model_dir> --check               # pre-serve contract check (SHA-256 bound)
-vllm-hust-kv-inject <model_dir> --restore             # roll back
-vllm-hust-kv-evidence validate --file <record.json>   # evidence record validation
-python scripts/verify_host_sources.py \
-    --vllm-ascend-src <host-checkout>                 # static host-surface verification
-```
-
-## Extension framework
-
-```bash
-python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
-python -m pip install -e ".[test]"
-vllm-hust-ext extension inspect org.vllm-hust.quantized-kv-cache
-pytest -q
-```
-
-## Packaging and release
-
-Follows the vLLM-HUST packaging and release guide (bidkv reference):
-single version source (`_version.py`), manifest inside the wheel, wheel
-content verification, isolated smoke install, and tag-triggered PyPI
-publishing. See [docs/packaging-and-release.md](docs/packaging-and-release.md).
+该验证不代表已覆盖多卡、context parallel、所有模型或所有宿主版本。
+正式发布前应使用目标 wheel 在每个声明支持的宿主版本上重复验证。

@@ -65,6 +65,7 @@ jobs:
           .release-smoke/bin/python -c "
           from vllm_ascend_quantized_kv_cache import kv_methods, __version__
           assert __version__ == '${GITHUB_REF_NAME#v}', __version__
-          assert 'kivi_int4' in kv_methods.list()
+          assert kv_methods.list() == ['int8_dynamic']
+          assert kv_methods.get('int8_dynamic').resolve_layout().storage_dtype == 'int8'
           print('PyPI smoke OK:', __version__)
           "

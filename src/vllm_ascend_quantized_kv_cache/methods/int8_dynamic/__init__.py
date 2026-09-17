@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """动态 per-channel INT8 KV cache 方案。
 
-挖掘自 legacy ascend PR #116 提交 0001。量化语义见 semantics.py
-（token 维 amax 在线 scale + 对称量化），NPU forward 路径见
-attention_mixin.py（decode / chunked-prefill / prefill 三条分支）。
+量化语义见 semantics.py（token 维 amax 在线 scale + 对称量化），
+NPU forward 路径见 attention_backend.py。
 
 本 __init__ 只做"元数据注册"：构造 MethodSpec 并登记进注册表，
 绝不 import torch 或任何设备模块——这是导入惰性约束的一部分。
@@ -11,7 +10,7 @@ attention_mixin.py（decode / chunked-prefill / prefill 三条分支）。
 
 from __future__ import annotations
 
-from ...core.hosts import ALL_HOSTS
+from ...core.hosts import VLLM_ASCEND_HUST
 from ...dtypes import KVQuantMode
 from ..base import MethodConfig, MethodSpec
 from ..registry import register_method
@@ -47,31 +46,23 @@ def _make_spec() -> MethodSpec:
 
         return AscendHustAdapter(method)
 
-    def vllm_adapter(method):
-        from ...adapters.vllm_hust import VllmHustAdapter
-
-        return VllmHustAdapter(method)
-
     return MethodSpec(
         name="int8_dynamic",
-        # legacy 补丁以 kv_cache_dtype == "int8" 作开关；布局契约经
-        # "int8_per_token_head" 解析出同样的 int8 存储（带动态 scale 的
-        # 最近似契约模式）。
-        dtype="int8_per_token_head",
+        # 由 vLLM CLI 的 --kv-cache-dtype int8 直接选择，不依赖 checkpoint。
+        dtype="int8",
         summary=(
             "Dynamic per-channel INT8 KV cache: amax over the token dim on "
             "the first prefill, symmetric zero offset, online antiquant on "
             "the NPU fused-inference attention path."
         ),
         provenance=PROVENANCE,
-        quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
-        supports=tuple(ALL_HOSTS),
+        quant_mode=KVQuantMode.INT8_PER_TENSOR,
+        supports=(VLLM_ASCEND_HUST,),
         requires_npu_kernels=True,
         config_validator=_validate_config,
         semantics_loader=_load_semantics,
         adapter_factories={
             "vllm_ascend_hust": ascend_adapter,
-            "vllm_hust": vllm_adapter,
         },
     )
 

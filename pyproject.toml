@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-ascend-quantized-kv-cache"
-description = "Pluggable quantized KV-cache solutions for the vLLM-HUST stack (vllm-hust and vllm-ascend-hust)"
+description = "Runtime-loadable INT8 KV-cache attention backend for vLLM-Ascend-HUST"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -12,15 +12,12 @@ dependencies = []
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
+test = ["pytest>=8", "ruff>=0.12"]
 
-[project.entry-points."vllm_hust.extension_bundles"]
-"org.vllm-hust.quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.manifests"
-
-# Native vLLM bootstrap hook. It is a no-op unless explicitly requested via
-# VLLM_HUST_KV_METHODS (installation must never change behaviour).
+# Runtime plugin hook. It registers the backend; --kv-cache-dtype int8 is the
+# explicit activation switch.
 [project.entry-points."vllm.general_plugins"]
-"vllm-hust-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+"vllm-ascend-int8-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
 
 # Checkpoint injection tool: writes the complete ModelSlim-style
 # quantization_config (fa_quant_type dispatch) — see docs/how-to-run.md §6.2.
@@ -37,20 +34,18 @@ path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/vllm_ascend_quantized_kv_cache"]
 
+[tool.hatch.build]
+exclude = ["src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py310"
 line-length = 88
+extend-exclude = ["src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# Verbatim ports of the legacy triton-ascend kernels (ascend-pr-116 final
-# state): line lengths are preserved from the source patch on purpose.
-"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_pack.py" = ["E501"]
-"src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_gather_experimental.py" = ["E501"]
-# NPU-only diagnostic scripts (run on the Ascend container, not in CI).
-"scripts/npu_*.py" = ["E501"]
