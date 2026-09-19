@@ -9,7 +9,7 @@
 | `methods/kivi_int4/semantics.py` | legacy vllm-ascend PR #116 patch 0003-0009 | KIVI 分组量化数学、int32 打包/解包、残差窗口地址簿与对齐判据 |
 | `methods/kivi_int4/attention_backend.py` | legacy vllm-ascend PR #116 patch 0003-0009（宿主 KIVI 分支最终状态） | 分页缓存绑定（两张字节缓冲或 6 元组）、残差环形窗口与整组 flush 状态机、gather+反量化与 TND/稠密 FIA 分派 |
 | `ops/triton/kivi_pack.py` | legacy vllm-ascend PR #116 patch 0003-0009 | triton-ascend int4 打包内核（910B2 逐位验证过的实现） |
-| `ops/kivi_gather.py` / `ops/kivi_layout.py` | 本仓库移植（对照 legacy 打包布局） | 纯 torch 的 dequant-gather 与缓存布局校验，CPU 可测 |
+| `ops/kivi_gather.py` / `ops/kivi_layout.py` | 本仓库移植（对照 legacy 打包布局） | 纯 torch 的 dequant-gather、缓存布局与送内核前的 slot 闸门（已从 triton 模块移入，CPU 可测） |
 | `methods/kivi_int4/byte_cache.py` | 本仓库新增（非 legacy） | 把宿主按层给的两张字节缓冲切成内核期望的 6 个视图；区域预算与压缩比测算 |
 | `adapters/vllm_ascend_hust/` | 本仓库插件化适配 | 宿主 `get_impl_cls` 的量化 dtype 分派（`int8` / `kivi_int4`）与非量化 dtype 委托 |
 

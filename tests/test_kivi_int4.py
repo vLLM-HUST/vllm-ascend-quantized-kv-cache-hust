@@ -1273,3 +1273,73 @@ def test_forward_at_production_geometry_on_byte_buffers() -> None:
         2 * head / layout.bytes_per_token_head, rel=1e-9
     )
     assert 3.5 < layout.compression_vs_fp16() < 3.7
+
+
+# ---------------------------------------------------------------------------
+# kernel-boundary validators (moved out of the triton module so CPU tests can
+# reach them) and their agreement with the state machine's own gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "slots, num_tokens, match",
+    [
+        (torch.arange(8).view(2, 4), 8, "must be 1D"),
+        (torch.arange(7, dtype=torch.long), 8, "must match num_tokens"),
+        (torch.arange(8, dtype=torch.float32), 8, "int32/int64"),
+    ],
+)
+def test_slot_mapping_validator_rejects(slots, num_tokens, match) -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_layout import _check_slot_mapping
+
+    with pytest.raises(RuntimeError, match=match):
+        _check_slot_mapping(slots, num_tokens)
+
+
+def test_slot_mapping_validator_accepts_a_group() -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_layout import _check_slot_mapping
+
+    _check_slot_mapping(torch.arange(GROUP, dtype=torch.int32), GROUP)
+
+
+def _kernel_accepts(slots: list[int]) -> bool:
+    """True when the pack-kernel gate lets the window through."""
+    from vllm_ascend_quantized_kv_cache.ops.kivi_layout import _check_key_slot_groups
+
+    try:
+        _check_key_slot_groups(
+            torch.tensor(slots, dtype=torch.long),
+            block_size=BLOCK,
+            group_size=GROUP,
+        )
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_kivi_slot_group_guards_agree() -> None:
+    """The state machine and the kernel must accept/reject the same windows."""
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            group_size=GROUP,
+            residual_length=2 * GROUP,
+            block_size=BLOCK,
+        )
+    )
+    windows = {
+        "one aligned group": list(range(GROUP)),
+        "two aligned groups": list(range(2 * GROUP)),
+        "second group of a block": list(range(GROUP, 2 * GROUP)),
+        "misaligned start": list(range(1, 1 + GROUP)),
+        "offset inside block": list(range(4, 4 + GROUP)),
+        "hole in the window": [0, 1, 2, 3, 4, 5, 6, 9],
+        "partial group": list(range(GROUP - 1)),
+        # padding must never reach a flush; both gates refuse it
+        "padding slot present": [-1] + list(range(1, GROUP)),
+    }
+    for label, slots in windows.items():
+        assert bool(sem.is_aligned_key_window(slots, BLOCK)) == _kernel_accepts(
+            slots
+        ), f"guards disagree on {label}"

@@ -108,6 +108,61 @@ def _check_key_cache_layout(
     return block_size
 
 
+def _check_slot_mapping(slot_mapping: torch.Tensor, num_tokens: int) -> None:
+    if slot_mapping.ndim != 1:
+        raise RuntimeError(
+            f"slot_mapping must be 1D, got shape={tuple(slot_mapping.shape)}."
+        )
+    if slot_mapping.numel() != num_tokens:
+        raise RuntimeError(
+            "slot_mapping length must match num_tokens, got "
+            f"{slot_mapping.numel()} vs {num_tokens}."
+        )
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(
+            f"slot_mapping must be int32/int64, got {slot_mapping.dtype}."
+        )
+
+
+def _check_key_slot_groups(
+    slot_mapping: torch.Tensor,
+    *,
+    block_size: int,
+    group_size: int,
+) -> None:
+    """键整组 flush 的内核侧闸门：连续、组对齐、且不跨缓存块。
+
+    与 ``semantics.is_aligned_key_window`` 是同一条规则的两处实现（一处送
+    内核前、一处状态机里），由 ``test_kivi_slot_group_guards_agree`` 钉住
+    一致性。
+    """
+    if bool((slot_mapping < 0).any()):
+        raise RuntimeError(
+            "kivi_pack_key_cache requires all slot_mapping entries to be valid."
+        )
+
+    slot_groups = slot_mapping.view(-1, group_size)
+    first_slots = slot_groups[:, :1]
+    offsets = torch.arange(
+        group_size,
+        device=slot_mapping.device,
+        dtype=slot_mapping.dtype,
+    ).view(1, -1)
+    if not bool((slot_groups == first_slots + offsets).all()):
+        raise RuntimeError(
+            "kivi_pack_key_cache requires each token group to map to contiguous slots."
+        )
+    if not bool(((first_slots % group_size) == 0).all()):
+        raise RuntimeError(
+            "kivi_pack_key_cache requires each token group to be group-size aligned."
+        )
+    if not bool(((slot_groups // block_size) == (first_slots // block_size)).all()):
+        raise RuntimeError(
+            "kivi_pack_key_cache requires each token group to stay "
+            "within one cache block."
+        )
+
+
 def _check_block_table(block_table: torch.Tensor) -> None:
     if block_table.ndim != 2:
         raise RuntimeError(
@@ -188,7 +243,9 @@ __all__ = [
     "_check_contiguous",
     "_check_dequant_gather_metadata",
     "_check_key_cache_layout",
+    "_check_key_slot_groups",
     "_check_same_device",
     "_check_seq_lens",
+    "_check_slot_mapping",
     "_check_value_cache_layout",
 ]
