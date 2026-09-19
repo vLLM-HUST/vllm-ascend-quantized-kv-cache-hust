@@ -170,7 +170,16 @@ class _StubBase:
         self.num_queries_per_kv = 1
 
 
-def _make_impl(residual_length: int = 2 * GROUP, max_seqs: int = 2):
+def _make_impl(
+    residual_length: int = 2 * GROUP,
+    max_seqs: int = 2,
+    *,
+    head_size: int = HEAD_SIZE,
+    num_kv_heads: int = NUM_KV_HEADS,
+    group_size: int = GROUP,
+    block_size: int = BLOCK,
+    num_blocks: int = 4,
+):
     class Impl(ab.AscendKiviInt4AttentionBackendMixin, _StubBase):
         pass
 
@@ -179,20 +188,29 @@ def _make_impl(residual_length: int = 2 * GROUP, max_seqs: int = 2):
     # geometry below is intentionally smaller than the defaults)
     impl._init_kivi_state(None)
     impl.enable_kivi = True
-    impl.kivi_group_size = GROUP
+    impl.head_size = head_size
+    impl.num_kv_heads = num_kv_heads
+    impl.kivi_group_size = group_size
     impl.kivi_residual_length = residual_length
     impl.kivi_max_num_seqs = max_seqs
-    block_words = BLOCK // 8
     impl.k_quant_cache = torch.zeros(
-        4, NUM_KV_HEADS, HEAD_SIZE, block_words, dtype=torch.int32
+        num_blocks, num_kv_heads, head_size, block_size // 8, dtype=torch.int32
     )
-    impl.k_scale_cache = torch.ones(4, NUM_KV_HEADS, HEAD_SIZE, BLOCK // GROUP)
-    impl.k_mn_cache = torch.zeros(4, NUM_KV_HEADS, HEAD_SIZE, BLOCK // GROUP)
+    impl.k_scale_cache = torch.ones(
+        num_blocks, num_kv_heads, head_size, block_size // group_size
+    )
+    impl.k_mn_cache = torch.zeros(
+        num_blocks, num_kv_heads, head_size, block_size // group_size
+    )
     impl.v_quant_cache = torch.zeros(
-        4, BLOCK, NUM_KV_HEADS, HEAD_SIZE // 8, dtype=torch.int32
+        num_blocks, block_size, num_kv_heads, head_size // 8, dtype=torch.int32
     )
-    impl.v_scale_cache = torch.ones(4, BLOCK, NUM_KV_HEADS, HEAD_SIZE // GROUP)
-    impl.v_mn_cache = torch.zeros(4, BLOCK, NUM_KV_HEADS, HEAD_SIZE // GROUP)
+    impl.v_scale_cache = torch.ones(
+        num_blocks, block_size, num_kv_heads, head_size // group_size
+    )
+    impl.v_mn_cache = torch.zeros(
+        num_blocks, block_size, num_kv_heads, head_size // group_size
+    )
 
     # Stub only the kernel launches; the real write validations stay active.
     impl._kivi_key_launches: list = []
@@ -1167,3 +1185,91 @@ def test_forward_on_two_byte_buffers_matches_six_tuple_run(monkeypatch) -> None:
         torch.equal(new, old) for new, old in zip(derived, _six_tuple(two), strict=True)
     )
     assert buffers.any(), "int4 history must have been written into the host buffer"
+
+
+def test_forward_at_production_geometry_on_byte_buffers() -> None:
+    """head 128 / kv 8 / block 128 / group 128 -- the shipped defaults.
+
+    Every other test runs at a small toy geometry; the word math, the
+    one-group-per-block flush and the region budget all depend on the real
+    sizes, so they are exercised here over the host's two byte buffers.
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_caches_from_byte_tensors,
+    )
+
+    head, kvh, block, group = 128, 8, 128, 128
+    residual = 128
+    num_blocks = 3
+    tokens = residual + 1
+
+    layout = KiviByteCacheLayout(
+        num_blocks=num_blocks,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    key_buf = torch.zeros(
+        num_blocks, block, kvh, layout.bytes_per_token_head, dtype=torch.uint8
+    )
+    value_buf = torch.zeros_like(key_buf)
+    assert key_buf.numel() == layout.region_bytes
+
+    impl = _make_impl(
+        residual_length=residual,
+        head_size=head,
+        num_kv_heads=kvh,
+        group_size=group,
+        block_size=block,
+        num_blocks=num_blocks,
+    )
+    impl.num_heads = kvh
+    _install_cpu_packers(impl)
+
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=residual,
+            block_size=block,
+        )
+    )
+    torch.manual_seed(31)
+    query = torch.randn(tokens, kvh, head)
+    key = torch.randn(tokens, kvh, head)
+    value = torch.randn(tokens, kvh, head)
+    out = torch.zeros(tokens, kvh, head)
+
+    md = _metadata(
+        tokens,
+        block_tables=torch.tensor([[0, 1]], dtype=torch.long),
+        req_ids=["r"],
+    )
+    impl.forward(None, query, key, value, (key_buf, value_buf), md, out)
+
+    k_quant, k_scale, k_mn, v_quant, v_scale, v_mn = kivi_caches_from_byte_tensors(
+        key_buf, value_buf, layout
+    )
+    assert k_quant.shape == (num_blocks, kvh, head, block // 8)
+    assert k_scale.shape == (num_blocks, kvh, head, 1)  # one group per block
+    assert v_quant.shape == (num_blocks, block, kvh, head // 8)
+
+    # 128 keys flushed as a single aligned group into block 0, token 128 stayed
+    # exact; values evict only the oldest slot.
+    expected_k = torch.cat([sem.fake_quant_key(key[:residual]), key[residual:]])
+    expected_v = torch.cat([sem.fake_quant_value(value[:1]), value[1:]])
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        torch.tensor([[0, 1]], dtype=torch.long), [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5)
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5)
+    assert key_buf.any() and value_buf.any()
+
+    # memory claim, measured rather than quoted: ~3.6x vs fp16 at this geometry
+    assert layout.compression_vs_fp16() == pytest.approx(
+        2 * head / layout.bytes_per_token_head, rel=1e-9
+    )
+    assert 3.5 < layout.compression_vs_fp16() < 3.7

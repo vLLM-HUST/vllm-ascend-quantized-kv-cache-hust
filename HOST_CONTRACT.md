@@ -24,7 +24,8 @@ dtype 始终委托给宿主原始 `get_impl_cls`。
 INT8 要求宿主支持 `CacheConfig.cache_dtype == "int8"`，并为它分配未打包的
 `torch.int8` KV cache。
 
-INT4（KIVI）额外要求宿主：
+INT4（KIVI）额外要求宿主（逐步改动清单与已核实的宿主行号见
+`docs/int4-host-integration.md`）：
 
 1. 接受 CLI 字面量 `--kv-cache-dtype kivi_int4`；
 2. 为该 dtype 每层分配**两张等大的字节缓冲**：键侧与值侧各

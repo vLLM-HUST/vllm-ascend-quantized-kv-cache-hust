@@ -698,7 +698,7 @@ class AscendKiviInt4AttentionBackendMixin:
                 f"({self.kivi_group_size}) to be divisible by 8."
             )
 
-        block_size = self.k_quant_cache.shape[-1] * 8
+        block_size = self._get_kivi_block_size()
         if block_size % self.kivi_group_size != 0:
             raise RuntimeError(
                 f"KIVI INT4 key cache requires block_size ({block_size}) to be "
@@ -845,7 +845,7 @@ class AscendKiviInt4AttentionBackendMixin:
         self, block_table: Any, seq_lens: list[int]
     ) -> list[list[int]]:
         self._check_kivi_cache_bound()
-        block_size = self.k_quant_cache.shape[-1] * 8
+        block_size = self._get_kivi_block_size()
         return KiviInt4Semantics.ordered_slots(block_table, seq_lens, block_size)
 
     def _gather_dequant_kivi_paged_cache(
@@ -1280,7 +1280,7 @@ class AscendKiviInt4AttentionBackendMixin:
         num_decodes = attn_metadata.num_decodes
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         num_tokens = int(actual_seq_qlen[-1])
-        block_size = self.k_quant_cache.shape[-1] * 8
+        block_size = self._get_kivi_block_size()
 
         if num_decode > 0:
             self._forward_kivi_paged_decode_attention(
