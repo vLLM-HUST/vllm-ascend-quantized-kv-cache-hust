@@ -20,6 +20,8 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q
+      - name: Re-check the INT4 port against archived patches
+        run: python scripts/check_int4_patch_parity.py
       - run: python -m build
       - name: Verify wheel contents
         run: bash scripts/verify-wheel.sh dist/*.whl
@@ -33,11 +35,15 @@ jobs:
           from vllm_ascend_quantized_kv_cache import kv_methods, __version__
           assert __version__ == '0.2.0.dev0'
           names = kv_methods.list()
-          assert names == ['int8_dynamic']
-          method = kv_methods.get('int8_dynamic', head_size=128)
-          assert method.resolve_layout().storage_dtype == 'int8'
+          assert names == ['int8_dynamic', 'kivi_int4']
+          int8 = kv_methods.get('int8_dynamic', head_size=128)
+          assert int8.resolve_layout().storage_dtype == 'int8'
+          assert int8.resolve_layout().packed_last_dim == 128
+          kivi = kv_methods.get('kivi_int4', head_size=128, group_size=64)
+          assert kivi.resolve_layout().storage_dtype == 'uint8'
+          assert kivi.resolve_layout().packed_last_dim == 64
           print('smoke OK:', names)
           "
       - name: Validate Bundle v1 manifest
         run: |
-          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend'}; assert len(p['components'])==1"
+          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend'}; assert len(p['components'])==2"

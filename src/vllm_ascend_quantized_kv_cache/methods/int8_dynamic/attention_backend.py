@@ -67,7 +67,7 @@ class AscendInt8AttentionBackendMixin:
                 isinstance(kv_cache, torch.Tensor)
                 and kv_cache.dim() > 0
                 and kv_cache.shape[0] == 2
-                or isinstance(kv_cache, (list, tuple))
+                or isinstance(kv_cache, list | tuple)
                 and len(kv_cache) >= 2
             )
         ):

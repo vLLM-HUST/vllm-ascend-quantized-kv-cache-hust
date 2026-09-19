@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-ascend-quantized-kv-cache"
-description = "Runtime-loadable INT8 KV-cache attention backend for vLLM-Ascend-HUST"
+description = "Runtime-loadable INT8 and INT4 (KIVI) KV-cache attention backends for vLLM-Ascend-HUST"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -14,10 +14,10 @@ dynamic = ["version"]
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.12"]
 
-# Runtime plugin hook. It registers the backend; --kv-cache-dtype int8 is the
-# explicit activation switch.
+# Runtime plugin hook. It registers the backends; --kv-cache-dtype int8 or
+# kivi_int4 is the explicit activation switch.
 [project.entry-points."vllm.general_plugins"]
-"vllm-ascend-int8-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+"vllm-ascend-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
 
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"

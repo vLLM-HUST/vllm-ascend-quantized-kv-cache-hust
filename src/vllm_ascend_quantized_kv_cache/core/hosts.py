@@ -2,7 +2,7 @@
 """宿主名单、宿主探测与激活入口（横切层，任何进程可导入）。
 
 当前发行只支持 vllm-ascend-hust，通过宿主 attention backend 的
-``get_impl_cls`` 分派挂载 INT8 实现。
+``get_impl_cls`` 分派挂载 INT8 与 INT4(KIVI) 实现。
 
 本模块是"哪个宿主进程能调什么"的权威出处：宿主探测（detect_host）
 与激活守卫（require_host_stack）都定义在这里，bootstrap 钩子与
@@ -40,7 +40,7 @@ def require_host_stack(what: str) -> str:
     host = detect_host()
     if host is None:
         raise RuntimeError(
-            f"{what} requests INT8 KV attention, but vllm_ascend is not "
+            f"{what} requests quantized KV attention, but vllm_ascend is not "
             "importable; install the vllm-ascend-hust host stack first"
         )
     return host

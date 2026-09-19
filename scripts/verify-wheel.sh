@@ -9,6 +9,11 @@ for required in \
   'vllm_ascend_quantized_kv_cache/_version.py' \
   'vllm_ascend_quantized_kv_cache/bootstrap.py' \
   'vllm_ascend_quantized_kv_cache/adapters/vllm_ascend_hust/backend.py' \
+  'vllm_ascend_quantized_kv_cache/methods/int8_dynamic/attention_backend.py' \
+  'vllm_ascend_quantized_kv_cache/methods/kivi_int4/semantics.py' \
+  'vllm_ascend_quantized_kv_cache/methods/kivi_int4/attention_backend.py' \
+  'vllm_ascend_quantized_kv_cache/ops/triton/kivi_pack.py' \
+  'vllm_ascend_quantized_kv_cache/ops/kivi_gather.py' \
   'vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json' \
   '.dist-info/entry_points.txt' \
   '.dist-info/METADATA'; do
@@ -18,7 +23,7 @@ for required in \
   }
 done
 
-for forbidden in 'kivi' 'fp4' 'nvfp4' 'BidKV打包与发布指南.md'; do
+for forbidden in 'fp4' 'nvfp4' 'BidKV打包与发布指南.md'; do
   if grep -qi "$forbidden" <<<"$entries"; then
     echo "FAIL: wheel contains removed/non-runtime content: $forbidden"
     exit 1
@@ -34,4 +39,4 @@ PY
 )
 grep -q 'vllm.general_plugins' <<<"$entry_file"
 grep -q 'bootstrap:register_plugins' <<<"$entry_file"
-echo "PASS: INT8 KV plugin wheel verified"
+echo "PASS: quantized KV plugin wheel verified"

@@ -14,6 +14,6 @@ torch / vllm / 任何设备模块（各方法的重模块全部惰性加载）�
 register_method —— 不需要改动任何现有方法。
 """
 
-from . import int8_dynamic  # noqa: F401  (注册副作用)
+from . import int8_dynamic, kivi_int4  # noqa: F401  (注册副作用)
 
-__all__ = ["int8_dynamic"]
+__all__ = ["int8_dynamic", "kivi_int4"]

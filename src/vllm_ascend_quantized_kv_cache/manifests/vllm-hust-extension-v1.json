@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "bundle_id": "org.vllm-hust.ascend-int8-kv-cache",
+  "bundle_id": "org.vllm-hust.ascend-quantized-kv-cache",
   "bundle_version": "0.2.0.dev0",
   "host_api_range": ">=1,<2",
   "host": {
@@ -14,6 +14,14 @@
       "execution_planes": ["worker", "device"],
       "isolation": "trusted_in_process",
       "implementation_ref": "vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend:AscendInt8KvAttentionBackend",
+      "permissions": ["device_access"]
+    },
+    {
+      "component_id": "kivi-int4-kv-attention-backend",
+      "contracts": ["vllm.attention.quantized-kv.v1"],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend:AscendKiviInt4KvAttentionBackend",
       "permissions": ["device_access"]
     }
   ]

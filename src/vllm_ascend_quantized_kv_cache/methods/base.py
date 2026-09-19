@@ -23,13 +23,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 class MethodConfig:
     """所有方法共享的几何/量化配置（不可变）。
 
-    字段是 INT8 布局计算与设备路径的通用输入。
+    字段是各方案布局计算与设备路径的通用输入。KIVI 系额外使用
+    ``group_size``（量化组大小，对应宿主 ``cache_config.kivi_group_size``）
+    与 ``residual_length``（全精度残差窗口长度，对应
+    ``cache_config.kivi_residual_length``）；其余方法忽略这两个字段。
     """
 
     head_size: int = 128  # 每个注意力头的维度 D
     num_kv_heads: int = 8  # KV 头数
     num_heads: int = 32  # Q 头数（num_heads = num_queries_per_kv * num_kv_heads）
     block_size: int = 128  # 分页缓存块大小（每块 token 数）
+    group_size: int = 128  # 量化组大小（KIVI：键按 token 分组，值按 head 维分组）
+    residual_length: int = 128  # KIVI：每请求保留全精度的残差窗口长度
 
     def validated(self) -> MethodConfig:
         """基础合法性检查（正数性、头数关系）。
@@ -48,6 +53,12 @@ class MethodConfig:
             )
         if self.block_size <= 0:
             raise ValueError(f"block_size must be positive, got {self.block_size}")
+        if self.group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {self.group_size}")
+        if self.residual_length < 0:
+            raise ValueError(
+                f"residual_length must be non-negative, got {self.residual_length}"
+            )
         return self
 
 
@@ -120,6 +131,8 @@ class KvQuantMethod:
                 "num_kv_heads",
                 "num_heads",
                 "block_size",
+                "group_size",
+                "residual_length",
             )
         }
         return payload
@@ -131,7 +144,7 @@ class KvQuantMethod:
     # -- 契约 ---------------------------------------------------------------
 
     def resolve_layout(self) -> KVCacheLayout:
-        """解析 INT8 存储布局。"""
+        """解析本方法 dtype 的存储布局（打包维度 / 存储 dtype）。"""
         return resolve_layout(self.spec.dtype, self.config.head_size)
 
     # -- 语义 ---------------------------------------------------------------

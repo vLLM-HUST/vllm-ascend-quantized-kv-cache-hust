@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""面向 vllm-ascend-hust 的 INT8 KV cache 插件 —— 统一入口。
+"""面向 vllm-ascend-hust 的量化 KV cache 插件 —— 统一入口。
 
 导入本包是"惰性"的：不加载 torch、vllm、任何设备模块，也不启动线程。
 所有重模块都在真正使用方法的语义（semantics）或宿主适配器（adapter）
@@ -12,9 +12,10 @@
     kv_methods.list()                       # 所有已注册方法
     kv_methods.list(host="vllm_ascend_hust")  # 按宿主过滤
     method = kv_methods.get("int8_dynamic", head_size=128, block_size=128)
+    method = kv_methods.get("kivi_int4", group_size=64, residual_length=64)
     method.resolve_layout()                   # -> KVCacheLayout 布局契约
     method.semantics                          # 纯语义数学（CPU 可测）
-    kv_methods.activate("int8_dynamic", host="vllm_ascend_hust")  # 插拔进宿主
+    kv_methods.activate("kivi_int4", host="vllm_ascend_hust")  # 插拔进宿主
 
 层次与调用方（详见 docs/layers.md）::
 
