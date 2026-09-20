@@ -83,7 +83,36 @@ be 0` / `maskDim 2 shall be 2048`）。插件按 `attn_metadata.attn_mask` 原�
 `ops/triton/kivi_gather_experimental.py` 在 triton-ascend 3.5 上仍然误编译
 （读出垃圾值，tile=32 时输出干脆是 0），继续**不路由**；该脚本留作日后重验。
 
-## 6. 仍未完成
+## 6. 真宿主分派核对（非桩，真实 `vllm_ascend` 类）
+
+在该容器上用真实宿主类跑一遍 `install_kv_impl_dispatch()`（`get_current_vllm_config`
+与 `enable_cp`/`enable_dcp` 按非 CP 语义打桩）：
+
+```text
+host before: AscendAttentionBackendImpl
+auto      -> AscendAttentionBackendImpl          （未量化 dtype 原样委托宿主）
+int8      -> AscendInt8KvAttentionImpl   mixin=True host_base=True
+kivi_int4 -> AscendKiviInt4KvAttentionImpl mixin=True host_base=True
+CP guard raises NotImplementedError
+restored:  AscendAttentionBackendImpl            （卸载后宿主工厂恢复）
+```
+
+结论：插件的 INT4 实现类能直接组合在该基线宿主 `AscendAttentionBackendImpl`
+之上（构造签名、mixin 覆盖、非量化 dtype 委托、CP fail-closed 均符合契约），
+此前这些只在桩类上验证过。
+
+顺带测出两条宿主环境事实，接合时会遇到：
+
+- `vllm_ascend.attention.attention_v1` 不能先于 `vllm_ascend.ops` 被导入，否则
+  触发该 revision 的循环导入（`ImportError: cannot import name 'DeviceOperator'
+  from partially initialized module 'vllm_ascend.device.device_op'`）。真实
+  serve 里平台插件先加载，因此插件的惰性导入没问题；但独立脚本必须
+  `import vllm_ascend.ops` 先。
+- 该 revision 的 `AscendAttentionBackend.get_impl_cls()` 会调 `enable_dcp()`，
+  而它要求已设置 vllm config；独立脚本需在 `set_current_vllm_config` 上下文里
+  或显式打桩该函数。
+
+## 7. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器上的宿主
   `CacheDType` 既无 `kivi_int4` 也无 `int8`（且插件锁定的宿主基线

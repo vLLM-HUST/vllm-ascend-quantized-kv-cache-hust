@@ -130,7 +130,9 @@ CPU 参考打包器替换 triton 内核后跑通的 `forward()` 全链路（整�
 复现语义参考（value `EXACT`、key `max|diff|=0`），注意力通路在玩具几何与出厂
 默认几何（head 128 / kv 8 / group 128 / block 128）下都与"对同一份 gather 结果
 直接调用 fused attention"完全一致（差异 0）；实验性融合 gather 仍误编译，保持
-不路由。
+不路由。在同一台机器上用**真实宿主类**核对过分派：`auto` 原样委托
+`AscendAttentionBackendImpl`，`int8` / `kivi_int4` 各自返回插件组合的实现类，
+context parallel 抛 `NotImplementedError`。
 
 **仍未验证的是端到端 serving**：宿主必须接受 `--kv-cache-dtype kivi_int4`
 并按上面的字节预算给每层分配两张等大缓冲，同时暴露
