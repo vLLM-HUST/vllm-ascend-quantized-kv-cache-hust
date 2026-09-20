@@ -99,6 +99,12 @@ class KiviInt4Semantics:
         Deliberately ``floor(x + 0.5)`` and not ``round``: the kernel rounds
         half up while ``torch.round`` is half-to-even, and exact .5 values are
         common on the quantisation grid.
+
+        Parity is still not bit-level at those halves: on 910B2 a value whose
+        real normalised form is exactly 7.5 comes out of the kernel's fp32
+        arithmetic a hair below (.49999973) and is stored one level lower than
+        this function returns. ``scripts/npu_probe_kivi_generate.py`` treats a
+        one-level difference at an exact half as agreement.
         """
         return torch.clamp(torch.floor((values - mn) / scale + 0.5), 0, 2**bits - 1).to(
             torch.int32
