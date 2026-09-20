@@ -146,7 +146,10 @@ def metadata(tokens, seq_lens, state, slots, block_tables, **overrides):
     return md
 
 
-def direct_fia(query, key, value, qlen, kvlen):
+def direct_fia(query, key, value, qlen, kvlen, atten_mask=None, sparse_mode=0):
+    kwargs = {}
+    if atten_mask is not None:
+        kwargs["atten_mask"] = atten_mask
     out, _ = torch_npu.npu_fused_infer_attention_score(
         query=query,
         key=key,
@@ -158,7 +161,8 @@ def direct_fia(query, key, value, qlen, kvlen):
         num_key_value_heads=KVH,
         num_heads=NUM_HEADS,
         scale=SCALE,
-        sparse_mode=0,
+        sparse_mode=sparse_mode,
+        **kwargs,
     )
     return out
 
@@ -281,6 +285,72 @@ def main() -> int:
         f"residual={RESIDUAL} tokens={PREFILL_TOKENS}",
         flush=True,
     )
+    # ---- chunked prefill: a decode row plus an all-new prompt row ============
+    prompt = GROUP
+    rows = 1 + prompt
+    seq_r = PREFILL_TOKENS + 2
+    slots = torch.cat(
+        [
+            torch.tensor([PREFILL_TOKENS + 1], dtype=torch.long, device=DEV),
+            torch.arange(2 * BLOCK, 2 * BLOCK + prompt, dtype=torch.long, device=DEV),
+        ]
+    )
+    tables = torch.tensor([[0, 1], [2, 2]], dtype=torch.long, device=DEV)
+    ck_query = torch.randn(rows, KVH, HEAD, device=DEV, dtype=torch.float16)
+    ck_key = torch.randn(rows, KVH, HEAD, device=DEV, dtype=torch.float16)
+    ck_value = torch.randn_like(ck_key)
+    ck_md = metadata(
+        rows,
+        [seq_r, prompt],
+        "ChunkedPrefill",
+        slots,
+        tables,
+        actual_seq_lengths_q=[1, rows],
+        req_ids=["r", "p"],
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_prefills=1,
+        attn_mask=mask,
+    )
+    ck_out = torch.zeros(rows, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
+    got_ck = impl.forward(
+        None, ck_query, ck_key, ck_value, (key_buf, value_buf), ck_md, ck_out
+    )
+    torch.npu.synchronize()
+
+    history_k, history_v = impl._gather_dequant_kivi_paged_cache(
+        tables[:1], [seq_r], torch.float16, ["r"]
+    )
+    ref_decode = direct_fia(
+        ck_query[:1], history_k, history_v, [1], [int(history_k.shape[0])]
+    )
+    ref_prefill = direct_fia(
+        ck_query[1:rows],
+        ck_key[1:rows],
+        ck_value[1:rows],
+        [prompt],
+        [prompt],
+        atten_mask=mask,
+        sparse_mode=3,
+    )
+    decode_diff = (got_ck[:1].float() - ref_decode.float()).abs().max().item()
+    prefill_diff = (got_ck[1:rows].float() - ref_prefill.float()).abs().max().item()
+    print(
+        f"chunked: rows={rows} (1 decode + {prompt} prompt), "
+        f"decode max|diff|={decode_diff:.6f}, prefill max|diff|={prefill_diff:.6f}",
+        flush=True,
+    )
+    if not bool(torch.isfinite(got_ck).all()):
+        failures.append("chunked output has NaN/Inf")
+    if decode_diff > 1e-3:
+        failures.append(
+            f"chunked decode rows deviate from the operator ({decode_diff})"
+        )
+    if prefill_diff > 1e-3:
+        failures.append(
+            f"chunked prefill rows deviate from the operator ({prefill_diff})"
+        )
+
     print("RESULT:", "PASS" if not failures else f"FAIL {failures}", flush=True)
     return 1 if failures else 0
 
