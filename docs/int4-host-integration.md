@@ -67,6 +67,15 @@ region_bytes = num_blocks * block_size * num_kv_heads * S
 两张缓冲字节数不等、或对不上区域预算时，插件报
 `KIVI key cache must hold N bytes` / `equal regions`，不会猜布局。
 
+上面三处宿主侧数字——`S`、存储 dtype（`torch.uint8`）、`real_page_size_bytes`
+——不再只是文档里的口头约定：
+`tests/test_kivi_int4.py::test_host_published_numbers_rebuild_the_plugin_layout`
+按宿主 `_reshape_kv_cache_tensors` 的切法（`k_shape = v_shape = kv_cache_shape[1:]`）
+造出两张等大 uint8 缓冲，断言 `page_size_bytes * num_blocks == 2 * region_bytes`、
+布局推导一致、6 个视图的 dtype/shape 正确，并写一份 scale 再从宿主缓冲的扁平
+fp32 视图读回，确认视图确实别名（alias）在宿主分配的那块内存上。宿主若改了
+`S` 的公式或页大小口径，这个测试会先失败。
+
 ## 3. 接合后如何验证
 
 ```bash

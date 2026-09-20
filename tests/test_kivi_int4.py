@@ -1218,6 +1218,66 @@ def test_byte_cache_layout_rejects_bad_buffers(break_it, match) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "head,group,block,kvh,nb",
+    [(128, 128, 128, 8, 7), (32, 8, 16, 2, 3), (64, 32, 256, 4, 2)],
+)
+def test_host_published_numbers_rebuild_the_plugin_layout(
+    head: int, group: int, block: int, kvh: int, nb: int
+) -> None:
+    """Pin the three numbers ``docs/int4-host-integration.md`` asks the host for.
+
+    The host patch publishes a cache shape whose last dim is ``S``, a uint8
+    storage dtype, and ``page_size_bytes``; vLLM then allocates one raw buffer of
+    ``page_size_bytes * num_blocks`` per layer and splits it with
+    ``k_shape = v_shape = kv_cache_shape[1:]``. If those numbers ever drift from
+    the plugin's own byte budget, binding fails at startup -- so check the
+    round trip here instead of leaving it to arithmetic in prose.
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_byte_cache_layout,
+        kivi_caches_from_byte_tensors,
+    )
+
+    layout = KiviByteCacheLayout(
+        num_blocks=nb,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    shape = (2, nb, block, kvh, layout.bytes_per_token_head)
+    page_size_bytes = 2 * block * kvh * layout.bytes_per_token_head
+
+    # one layer's raw buffer, split the way _reshape_kv_cache_tensors splits it
+    assert page_size_bytes * nb == 2 * layout.region_bytes
+    raw = torch.zeros(shape, dtype=torch.uint8)
+    key, value = raw[0], raw[1]
+
+    assert (
+        kivi_byte_cache_layout(
+            key, value, num_kv_heads=kvh, head_size=head, group_size=group
+        )
+        == layout
+    )
+    quant_k, scale_k, mn_k, quant_v, scale_v, mn_v = kivi_caches_from_byte_tensors(
+        key, value, layout
+    )
+    assert [t.dtype for t in (quant_k, scale_k, mn_k)] == [
+        torch.int32,
+        torch.float32,
+        torch.float32,
+    ]
+    assert quant_k.shape == (nb, kvh, head, block // 8)
+    assert quant_v.shape == (nb, block, kvh, head // 8)
+    # the views must live inside the host's buffer, not beside it
+    scale_k[0, 0, 0, 0] = 3.5
+    flat = raw[0].reshape(-1).view(torch.float32)
+    assert float(flat[quant_k.numel()]) == 3.5
+    assert flat.data_ptr() == raw[0].data_ptr()
+
+
 def test_forward_on_two_byte_buffers_matches_six_tuple_run(monkeypatch) -> None:
     """The host-visible 2-tensor form must behave exactly like the 6-tuple one."""
     from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
