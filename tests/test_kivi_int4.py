@@ -279,6 +279,49 @@ def test_value_flush_is_slot_at_a_time() -> None:
     assert window_slots == slots[1:].tolist()
 
 
+def test_bulk_prefill_flushes_a_full_window_that_incremental_writes_keep_exact() -> (
+    None
+):
+    """The two INT4 write paths disagree exactly at a full residual window.
+
+    Pinned because it decides what a generation looks like on device: a prompt
+    of exactly ``residual_length`` tokens is quantized by the prefill writer,
+    while the same tokens arriving one per step stay full precision until the
+    first overflow. ``scripts/npu_probe_kivi_generate.py`` applies one rule per
+    phase and fails if either half drifts.
+    """
+    tokens = 2 * GROUP  # == residual_length: the boundary case
+    key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn_like(key)
+    slots = torch.arange(tokens, dtype=torch.long)
+
+    bulk = _make_impl()
+    bulk._write_kivi_prefill_cache(key, value, slots, ["bulk"], [tokens])
+    assert len(bulk._kivi_key_launches) == 1
+    assert len(bulk._kivi_value_launches) == 1
+    flushed_keys, flush_slots = bulk._kivi_key_launches[0]
+    assert flushed_keys.shape[0] == tokens
+    assert torch.equal(flush_slots, slots)
+    # the whole prompt went to the int4 region, so no residual row exists at all
+    assert bulk._get_kivi_residual_row("bulk", create=False) is None
+
+    incremental = _make_impl()
+    for step in range(tokens):
+        incremental._write_kivi_cache(
+            key[step : step + 1],
+            value[step : step + 1],
+            slots[step : step + 1],
+            ["incr"],
+            [step + 1],
+        )
+    assert incremental._kivi_key_launches == []
+    assert incremental._kivi_value_launches == []
+    row = incremental._get_kivi_residual_row("incr", create=False)
+    assert row is not None
+    assert int(incremental.kivi_residual_key_len[row]) == tokens
+    assert int(incremental.kivi_residual_value_len[row]) == tokens
+
+
 def test_misaligned_key_flush_fails_closed_before_kernel() -> None:
     impl = _make_impl()
     # Real validation path: misaligned slots must be rejected before any
