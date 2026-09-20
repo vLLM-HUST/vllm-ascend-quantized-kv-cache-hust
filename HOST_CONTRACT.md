@@ -50,8 +50,9 @@ head_size=128 / group_size=128 下约 **3.6x**（int4 数据本身是 4x，scale
 fail closed。非量化 dtype 不应由插件拒绝，而应保持宿主原有行为。
 
 当前已验证的宿主基线为 vLLM-HUST `8a6655cf62` 和
-vLLM-Ascend-HUST `f4f49832`（仅覆盖 INT8 端到端）。INT4 的量化 dtype 字面量
-与该 dtype 下的字节缓冲分配在该基线上**尚未验证**：内核与状态机移植自 legacy
-Ascend PR #116（910B2 逐位验证过的实现），CPU 侧全测通过（含两张字节缓冲 ->
-6 视图的绑定的端到端等值测试），真机复验入口是 `scripts/npu_smoke_kivi.py`。对其他 commit 或发行版的兼容性不应仅根据
+vLLM-Ascend-HUST `f4f49832`（覆盖 INT8 端到端）。INT4 的打包内核、gather 与
+注意力通路已在 910B2 容器 `vllm-hust-cyj-21rc-cloud-container-86` 上逐位复验
+通过（记录见 `docs/validation-int4-20260920.md`），但该容器上的宿主
+`CacheDType` 既无 `kivi_int4` 也无 `int8`，因此 **INT4 端到端 serving 仍未
+验证**，需先落地上面列出的宿主改动。对其他 commit 或发行版的兼容性不应仅根据
 `host_api_range` 推断，必须重新运行集成测试。

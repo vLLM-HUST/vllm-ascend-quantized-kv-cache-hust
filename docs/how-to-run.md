@@ -77,9 +77,18 @@ VLLM_LOGGING_LEVEL=DEBUG vllm serve /path/to/model \
 PYTHONPATH=src python -m pytest -q tests/test_kivi_int4.py
 python scripts/check_int4_patch_parity.py  # 移植对账：补丁不变量是否仍在
 python scripts/npu_probe_kivi_key.py   # 键打包/反量化对拍（需 NPU + triton）
-python scripts/npu_probe_kivi_dim.py   # 值打包与融合 gather 探针
 python scripts/npu_smoke_kivi.py       # 端到端写入/注意力冒烟
+python scripts/npu_probe_kivi_attention.py   # 打包+gather+fused attention 通路
+KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
+KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 \
+  python scripts/npu_probe_kivi_attention.py   # 出厂默认几何
+python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期仍误编译）
 ```
+
+四个设备探针在 2026-09-20 的 910B2 复验结果记录在
+`validation-int4-20260920.md`。注意因果 prefill 的掩码必须用宿主
+`AttentionMaskBuilder` 给的 `int8 [2048, 2048]` split-fuse 掩码，自己拼
+`T×T` 加性掩码会被 aclnn 以 `561002` 拒掉。
 
 宿主若未按 INT4 的字节预算分配（两张等大缓冲，单张
 `num_blocks*block_size*num_kv_heads*(head_size/2 + 8*head_size/group_size)`

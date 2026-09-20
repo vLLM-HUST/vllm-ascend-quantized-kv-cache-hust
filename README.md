@@ -125,9 +125,14 @@ CPU 参考打包器替换 triton 内核后跑通的 `forward()` 全链路（整�
 断言（对该区域做 5 处变异全部被抓）。移植自 legacy Ascend PR #116
 0003-0009（该分支在 910B2 上逐位验证过打包与 gather 内核）。
 
-**本分支尚未在真机上重跑 INT4**：宿主需要接受 `--kv-cache-dtype kivi_int4`
+**910B2 设备复验已完成（2026-09-20，见
+`docs/validation-int4-20260920.md`）**：打包内核与纯 torch dequant-gather 逐位
+复现语义参考（value `EXACT`、key `max|diff|=0`），注意力通路在玩具几何与出厂
+默认几何（head 128 / kv 8 / group 128 / block 128）下都与"对同一份 gather 结果
+直接调用 fused attention"完全一致（差异 0）；实验性融合 gather 仍误编译，保持
+不路由。
+
+**仍未验证的是端到端 serving**：宿主必须接受 `--kv-cache-dtype kivi_int4`
 并按上面的字节预算给每层分配两张等大缓冲，同时暴露
 `kivi_group_size` / `kivi_residual_length` 旋钮；对不上预算时插件在绑定期
-fail-closed（见 `HOST_CONTRACT.md`）。
-`scripts/npu_smoke_kivi.py` 与 `scripts/npu_probe_kivi_*.py` 是真机复验入口，
-`scripts/check_int4_patch_parity.py` 重跑移植对账。
+fail-closed（见 `HOST_CONTRACT.md`、`docs/int4-host-integration.md`）。
