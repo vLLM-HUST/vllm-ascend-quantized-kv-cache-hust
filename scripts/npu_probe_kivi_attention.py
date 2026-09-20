@@ -50,6 +50,7 @@ RESIDUAL = int(os.environ.get("KIVI_PROBE_RESIDUAL", 32))
 NUM_HEADS = KVH
 SCALE = HEAD**-0.5
 NUM_BLOCKS = int(os.environ.get("KIVI_PROBE_BLOCKS", 4))
+MAX_SEQS = int(os.environ.get("KIVI_PROBE_SEQS", 2))
 PREFILL_TOKENS = RESIDUAL + 8  # one full key window flushes into int4 history
 
 
@@ -65,12 +66,14 @@ class _HostImplShim:
         self.vllm_config = vllm_config
 
 
-def build_impl():
+def build_impl(max_seqs: int | None = None):
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             kivi_group_size=GROUP, kivi_residual_length=RESIDUAL
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=MAX_SEQS if max_seqs is None else max_seqs
+        ),
     )
 
     class Impl(AscendKiviInt4AttentionBackendMixin, _HostImplShim):
@@ -81,16 +84,17 @@ def build_impl():
     return Impl(vllm_config)
 
 
-def byte_caches():
+def byte_caches(num_blocks: int | None = None):
+    blocks = NUM_BLOCKS if num_blocks is None else num_blocks
     layout = KiviByteCacheLayout(
-        num_blocks=NUM_BLOCKS,
+        num_blocks=blocks,
         block_size=BLOCK,
         num_kv_heads=KVH,
         head_size=HEAD,
         group_size=GROUP,
     )
     key = torch.zeros(
-        NUM_BLOCKS,
+        blocks,
         BLOCK,
         KVH,
         layout.bytes_per_token_head,
