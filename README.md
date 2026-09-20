@@ -135,7 +135,8 @@ group 128 / block 128）下都与"对同一份 gather 结果直接调用 fused a
 `actual_seq_lengths_kv` 前缀和描述）同样零差异，跨请求泄漏类变异（所有请求读
 同一行残差、切片不偏移）只有 `scripts/npu_probe_kivi_batched.py` 能抓到，它同时
 给出设备侧量化口径：int4 历史 vs fp16 缓存的注意力输出偏差 ≤0.068 倍 K/V rms、
-余弦 ≥0.990。多步生成（64~67 个 decode step、跨多次整窗 flush、真 triton 打包）
+余弦 ≥0.990，且该误差在 48→192 token 内不随上下文累积；retire 后的残差行与
+block 立刻给新请求复用（重挂载）也在这一步里对拍。多步生成（64~67 个 decode step、跨多次整窗 flush、真 triton 打包）
 也逐步对过：每一步的 gather 都符合 pinned 的 flush 调度，出厂几何上唯一的不同是
 128 行里有 1 行的某个元素落在**恰好一半**的格点上（归一化值数学上是 7.5），内核的
 fp32 中间结果是 7.49999973，于是比 `quantize_group` 低一档——这一条已写进

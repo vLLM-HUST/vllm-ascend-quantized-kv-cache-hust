@@ -16,7 +16,7 @@
 ## 1. CPU 侧（同一台机器、同一份代码）
 
 ```text
-PYTHONPATH=src python -m pytest -q        -> 85 passed
+PYTHONPATH=src python -m pytest -q        -> 86 passed
 python scripts/check_int4_patch_parity.py -> PASS（补丁不变量全部在位）
 python -m ruff check . / ruff format --check . -> All checks passed / 已格式化
 ```
@@ -193,6 +193,34 @@ prompt 没被量化（保持全精度）"都能放过（把 bulk 规则改成 in
 | 增量窗口溢出判定 `>=` 改 `>`（晚一个 token 才 flush） | 插件自己的对齐守卫先炸：`RuntimeError: KIVI key flush requires contiguous aligned token groups.`（错位的窗口不再是整组对齐） |
 
 两条都是**只有多步运行才会出现**的状态：单步探针（第 4/6 节）对它们完全无感。
+
+同一探针还补了两件事：
+
+**误差随上下文长度的趋势**（同一批 K/V 的 fp16 注意力做对照，按 K/V rms 归一）：
+
+```text
+玩具几何:  48 -> 0.0443, 64 -> 0.0351, 80 -> 0.0432, 96 -> 0.0324, 99 -> 0.0333
+出厂几何: 144 -> 0.0756, 160 -> 0.0658, 176 -> 0.0529, 192 -> 0.0533
+```
+
+也就是说在这段长度内误差**不随上下文累积**（甚至略降，因为 softmax 把历史摊薄）。
+
+**请求重挂载**：serving 里 retire 一个请求后，它的 cache block 和残差行会立刻给新
+请求用。探针因此用**被回收请求自己的 block** 重新准入一个 `residual + group/2`
+的新请求（窗口不满，必须拿到行），再逐项对拍：
+
+```text
+re-admission: req-new (history 192) holds residual row 0, retired req-0 holds None;
+              violations k=0 v=0, tie flips=1, exact tails 0.000000/0.000000
+```
+
+把"释放 finished 行"短路掉，这一步立刻炸：
+`RuntimeError: KIVI residual rows are exhausted. max_num_seqs=2, req_id=req-new.`
+但把 `_sync_kivi_residual_windows` 里的"清理不再属于本请求的槽位"短路掉，**设备
+上看不出来**——释放路径已经把整行擦干净了，这一步只是第二道防线。检查发现这条
+剪枝路径此前 CPU/设备两侧都没有任何测试覆盖，于是补了
+`test_sync_prunes_residual_slots_the_request_no_longer_owns`（把请求回滚两个
+token，断言残差窗口只剩两个槽位）；该测试是唯一能杀掉这个变异的检查。
 
 ## 8. 分组查询注意力（GQA）与 torch 兜底路径（本轮新增）
 
