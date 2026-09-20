@@ -31,6 +31,33 @@ def _require_cache_dtype(expected: str) -> None:
         )
 
 
+def _context_parallel_enabled() -> bool:
+    """Ask the host whether context parallel is on, across host revisions.
+
+    The INT8 release targeted a host with a single ``enable_cp()``; the 910B2
+    container's host checkout (vllm-ascend-hust ``17ed0571d``) dropped it in
+    favour of ``enable_dcp()`` / ``enable_pcp()``, where a bare
+    ``from ... import enable_cp`` raises ImportError.
+    """
+    from vllm_ascend.attention import utils as attention_utils
+
+    enable_cp = getattr(attention_utils, "enable_cp", None)
+    if enable_cp is not None:
+        return bool(enable_cp())
+
+    split = [
+        getattr(attention_utils, name)
+        for name in ("enable_dcp", "enable_pcp")
+        if hasattr(attention_utils, name)
+    ]
+    if not split:
+        raise RuntimeError(
+            "Cannot detect Ascend context parallel: vllm_ascend.attention.utils "
+            "exposes neither enable_cp() nor enable_dcp()/enable_pcp()."
+        )
+    return any(bool(fn()) for fn in split)
+
+
 @cache
 def _build_int8_impl_cls() -> type:
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
@@ -101,9 +128,7 @@ def install_kv_impl_dispatch() -> type:
         builder = _IMPL_BUILDERS.get(cache_dtype)
         if builder is None:
             return original_get_impl_cls()
-        from vllm_ascend.attention.utils import enable_cp
-
-        if enable_cp():
+        if _context_parallel_enabled():
             raise NotImplementedError(
                 f"Ascend KV cache {cache_dtype} does not support context parallel yet."
             )

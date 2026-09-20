@@ -203,6 +203,51 @@ def test_host_dispatch_rejects_context_parallel_for_quantized_dtypes(
         host_stack.backend.get_impl_cls()
 
 
+def test_host_dispatch_uses_split_context_parallel_helpers(
+    monkeypatch, host_stack
+) -> None:
+    """Hosts without ``enable_cp`` (vllm-ascend-hust 17ed0571d) stay usable.
+
+    That revision replaced ``enable_cp`` with ``enable_dcp``/``enable_pcp``, so
+    the guard must read the split pair instead of raising ImportError -- and
+    still reject either flavour of context parallel.
+    """
+    import vllm_ascend.attention.utils as attention_utils
+
+    import vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend as backend
+
+    class KiviImpl:
+        pass
+
+    monkeypatch.setitem(backend._IMPL_BUILDERS, "kivi_int4", lambda: KiviImpl)
+    monkeypatch.delattr(attention_utils, "enable_cp")
+    monkeypatch.setattr(attention_utils, "enable_dcp", lambda: False, raising=False)
+    monkeypatch.setattr(attention_utils, "enable_pcp", lambda: False, raising=False)
+
+    host_stack.cache_config.cache_dtype = "kivi_int4"
+    backend.install_kv_impl_dispatch()
+    assert host_stack.backend.get_impl_cls() is KiviImpl
+
+    monkeypatch.setattr(attention_utils, "enable_pcp", lambda: True)
+    with pytest.raises(NotImplementedError, match="context parallel"):
+        host_stack.backend.get_impl_cls()
+
+    host_stack.cache_config.cache_dtype = "auto"
+    assert host_stack.backend.get_impl_cls() is host_stack.host_impl
+
+
+def test_context_parallel_probe_fails_closed_without_host_helpers(
+    monkeypatch, host_stack
+) -> None:
+    import vllm_ascend.attention.utils as attention_utils
+
+    import vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend as backend
+
+    monkeypatch.delattr(attention_utils, "enable_cp")
+    with pytest.raises(RuntimeError, match="enable_dcp"):
+        backend._context_parallel_enabled()
+
+
 def test_kivi_impl_composition_turns_on_kivi_state(monkeypatch, host_stack) -> None:
     """The dispatcher's INT4 impl must self-initialise from the host config."""
     import vllm_ascend.attention.attention_v1 as attention_v1
