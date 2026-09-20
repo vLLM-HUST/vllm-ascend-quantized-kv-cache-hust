@@ -1499,3 +1499,75 @@ def test_illegal_int4_geometries_are_rejected(kwargs, match) -> None:
     ):
         with pytest.raises(ValueError, match=match):
             builder()
+
+
+def test_adapter_built_int4_impl_runs_the_pipeline(monkeypatch) -> None:
+    """The impl class the Ascend adapter composes must really work end to end.
+
+    Everything above drives a test-local stub base; this is the one place the
+    adapter's own composition (host base + mixin + state initialised from
+    ``vllm_config.cache_config``) is exercised through ``forward()``.
+    """
+    import sys
+    import types
+
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust import backend
+
+    residual = 2 * GROUP
+    tokens = residual + 1
+
+    class HostAttentionImpl(_StubBase):
+        """Stands in for the host impl the adapter mixes the mixin onto."""
+
+        def __init__(self, *args, **kwargs):
+            self.num_heads = NUM_KV_HEADS
+            self.vllm_config = SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    kivi_group_size=GROUP,
+                    kivi_residual_length=residual,
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=2),
+            )
+
+    module = types.ModuleType("vllm_ascend.attention.attention_v1")
+    module.AscendAttentionBackendImpl = HostAttentionImpl
+    monkeypatch.setitem(sys.modules, "vllm_ascend", types.ModuleType("vllm_ascend"))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention", types.ModuleType("x"))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention.attention_v1", module)
+
+    backend._build_kivi_impl_cls.cache_clear()
+    try:
+        impl = backend._build_kivi_impl_cls()()
+        assert impl.enable_kivi is True
+        assert impl.kivi_group_size == GROUP
+        assert impl.kivi_residual_length == residual
+        assert impl.kivi_max_num_seqs == 2
+
+        # the host binds caches on the first forward, so do the same here
+        key_buf, value_buf, _ = _byte_caches(num_blocks=4, block_size=BLOCK)
+        impl._bind_kivi_cache((key_buf, value_buf))
+        _install_cpu_packers(impl)
+        torch.manual_seed(57)
+        query = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        value = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+
+        got = impl.forward(
+            None, query, key, value, (key_buf, value_buf), _metadata(tokens), out
+        )
+        assert torch.isfinite(got).all() and got.abs().sum() > 0
+        assert key_buf.any() and value_buf.any()
+
+        # composing the mixin over the host base must not change behaviour: the
+        # same pipeline on a test-local stub has to give the identical result
+        local = _make_impl(residual_length=residual)
+        local.num_heads = NUM_KV_HEADS
+        _install_cpu_packers(local)
+        reference = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        local.forward(
+            None, query, key, value, _six_tuple(local), _metadata(tokens), reference
+        )
+        assert torch.equal(got, reference)
+    finally:
+        backend._build_kivi_impl_cls.cache_clear()

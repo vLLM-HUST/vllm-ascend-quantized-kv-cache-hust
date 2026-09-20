@@ -359,3 +359,44 @@ assert "torch" not in sys.modules, sorted(sys.modules)
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_shipped_dispatch_maps_each_dtype_to_its_own_mixin(monkeypatch, host_stack):
+    """The builder table itself must map each dtype to that dtype's mixin.
+
+    Per-dtype selection is checked with stub builders elsewhere; nothing else
+    pins the shipped wiring, so swapping the two entries used to pass silently.
+    Only the INT4 class is composed here: the INT8 mixin imports ``torch_npu``
+    at module scope, so it is not importable off-device (INT4 imports it
+    lazily, which is what lets these operator-boundary tests exist at all).
+    """
+    import vllm_ascend.attention.attention_v1 as attention_v1
+
+    import vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend as backend
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.attention_backend import (
+        AscendKiviInt4AttentionBackendMixin,
+    )
+
+    assert {
+        "int8": backend._build_int8_impl_cls,
+        "kivi_int4": backend._build_kivi_impl_cls,
+    } == backend._IMPL_BUILDERS
+
+    class HostAttentionImpl:
+        def forward(self, *args, **kwargs):  # the host's own entry
+            raise AssertionError("host forward must not run")
+
+        def __init__(self, *args, **kwargs):
+            self.vllm_config = None
+
+    monkeypatch.setattr(
+        attention_v1, "AscendAttentionBackendImpl", HostAttentionImpl, raising=False
+    )
+    backend._build_kivi_impl_cls.cache_clear()
+    try:
+        kivi_cls = backend._build_kivi_impl_cls()
+        assert issubclass(kivi_cls, AscendKiviInt4AttentionBackendMixin)
+        # the plugin owns the INT4 forward entry, not the host base
+        assert kivi_cls.forward is AscendKiviInt4AttentionBackendMixin.forward
+    finally:
+        backend._build_kivi_impl_cls.cache_clear()
