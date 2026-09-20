@@ -1,9 +1,14 @@
 """Dynamic per-channel INT8 semantics math."""
 
-import torch
+import pytest
 
 from vllm_ascend_quantized_kv_cache.methods.int8_dynamic.semantics import (
     Int8DynamicSemantics,
+)
+
+torch = pytest.importorskip(
+    "torch",
+    reason="CPU INT8 semantics tests require the optional torch host dependency",
 )
 
 HEAD_SIZE = 8

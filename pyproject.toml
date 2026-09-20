@@ -26,7 +26,13 @@ path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 packages = ["src/vllm_ascend_quantized_kv_cache"]
 
 [tool.hatch.build]
-exclude = ["src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md"]
+exclude = [
+  ".venv/",
+  "venv/",
+  ".release-venv/",
+  ".release-smoke/",
+  "src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

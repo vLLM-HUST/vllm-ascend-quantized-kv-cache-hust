@@ -79,9 +79,17 @@ def test_adapter_installs_host_impl_dispatch(monkeypatch) -> None:
 
 
 def test_host_dispatch_selects_plugin_only_for_int8(monkeypatch) -> None:
-    import vllm.config
-    import vllm_ascend.attention.attention_v1 as attention_v1
-    import vllm_ascend.attention.utils as attention_utils
+    vllm_config = pytest.importorskip(
+        "vllm.config", reason="host dispatch test requires the optional vLLM host"
+    )
+    attention_v1 = pytest.importorskip(
+        "vllm_ascend.attention.attention_v1",
+        reason="host dispatch test requires the optional vLLM Ascend host",
+    )
+    attention_utils = pytest.importorskip(
+        "vllm_ascend.attention.utils",
+        reason="host dispatch test requires the optional vLLM Ascend host",
+    )
 
     import vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend as backend
 
@@ -97,7 +105,7 @@ def test_host_dispatch_selects_plugin_only_for_int8(monkeypatch) -> None:
             return HostImpl
 
     config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="int8"))
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attention_utils, "enable_cp", lambda: False)
     monkeypatch.setattr(attention_v1, "AscendAttentionBackend", HostBackend)
     monkeypatch.setattr(backend, "_build_impl_cls", lambda: PluginImpl)
