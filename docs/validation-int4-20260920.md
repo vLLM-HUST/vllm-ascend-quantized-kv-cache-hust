@@ -5,9 +5,10 @@
 `git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
 空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
 
-设备套件（第 1~8 节）在 `0c61df8` 上完整跑过一遍并全部通过；其后的提交里，
-`6a1dc4b` 改了插件实现（宿主导入顺序），所以第 9 节分派核对、第 10 节安装态
-核对与 87 个 CPU 测试都在 `6a1dc4b` 上重跑通过，设备探针本身未受影响。
+设备套件（第 1~8 节）在 `0c61df8` 上完整跑过一遍并全部通过；`6a1dc4b` 只改插件
+实现（宿主导入顺序），故第 10 节分派核对、第 11 节安装态核对与 87 个 CPU 测试在
+`6a1dc4b` 重跑通过。第 9 节的多请求 chunked 批次在 `a9dd050` 的两种几何上跑通。
+插件实现自 `6a1dc4b` 起未再改动（`git diff 6a1dc4b..HEAD -- src` 为空）。
 
 | 项目 | 值 |
 |---|---|
@@ -262,7 +263,38 @@ softmax 分支）也放到设备上跑：它自己用 `_repeat_kv` 扩 q 头、�
 | 出厂几何 MHA | 0.0680 | 0.9902 |
 | 出厂几何 GQA=7 | 0.1005 | 0.9905 |
 
-## 9. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
+## 9. 一条 chunked step 里的多请求批次（`scripts/npu_probe_kivi_chunked_batch.py`，本轮新增）
+
+chunked 分支是全插件索引算术最密的地方：一个 batch 里先排 decode 行、再排若干
+prompt 行，每个 prompt 请求的 q 长度要从**累积的** `actual_seq_lengths_q` 里减掉
+decode 行数才能还原出来，融合结果再写回一个切片。此前真机上跑过的 chunked 步
+全是"1 decode + 1 prompt"，在这种形状下这套算术退化成了 no-op，错了也看不出来。
+
+现在一步带 2 个 decode（历史 41/73，出厂几何 137/265）+ 3 个长度互不相干的
+prompt（40/72/104，出厂 136/264/392）：
+
+```text
+chunked batch: rows=218 (2 decode + [40, 72, 104]), qlen=[1, 2, 42, 114, 218], seq=[41, 73, 40, 72, 104]
+  dec-0: decode row over 41 tokens, max|diff| = 0.000000
+  pre-0: prompt row of 40 tokens, max|diff| = 0.000000
+  pre-2: prompt row of 104 tokens, max|diff| = 0.000000
+  dec-0: cache 41 tokens, quantised 32/32, violations k=0 v=0
+  pre-2: cache 104 tokens, quantised 96/96, violations k=0 v=0
+chunked batch: 5 requests in one step, one-level tie flips: 0
+RESULT: PASS                     # 出厂几何同样 PASS（tie flips: 3）
+```
+
+变异对照（两个变异下旧的单请求 chunked 步都 `RESULT: PASS`）：
+
+| 变异 | 多请求批次探针 |
+|---|---|
+| prompt 长度循环只取第一个请求 | aclnn 直接拒绝批：`FusedInferAttentionScore do tiling failed, ret is -1.` |
+| 写路径忘了减 decode 行数 | 插件自己的对齐守卫先炸：`RuntimeError: KIVI key flush requires contiguous aligned token groups.`（第一个 prompt 的窗口长度变成 41，不再是整组） |
+
+顺带把"逐档比较（含平局一档）"的实现抽成 `scripts/kivi_probe_reference.py`，
+生成探针与本探针共用，不再各写一份规则。
+
+## 10. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
 
 此前这一节是一次性手工脚本的产物，改成本仓脚本后立刻暴露出一个被它掩盖的
 宿主漂移：那份手工代码自己 `enable_cp = lambda: False`，而该 revision 的宿主
@@ -310,7 +342,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
   第一次调用的结果会被永久缓存；脚本要换 CP 配置必须 `cache_clear()`。真实
   serve 里 config 固定，所以不影响。
 
-## 10. 安装态核对（`scripts/probe_installed_plugin.py`，本轮新增）
+## 11. 安装态核对（`scripts/probe_installed_plugin.py`，本轮新增）
 
 前面所有检查都在源码树上跑（`PYTHONPATH=src`）。但 vLLM 真正使用这个插件的
 方式是：**安装的发行包 + `vllm.general_plugins` entry point**。把 wheel 装到
@@ -357,7 +389,7 @@ python -m pip install --target /tmp/kivi-probe --no-deps dist/*.whl
 PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py
 ```
 
-## 11. 仍未完成
+## 12. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器宿主
   （vllm-hust `f18cf803c5`）的 `CacheDType` 是 pydantic 校验过的
@@ -372,7 +404,7 @@ PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py
     [type=literal_error, input_value='int8', input_type=str]
   ```
 
-  分派本身已在第 9 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
+  分派本身已在第 10 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
   Literal），剩下的就是 `docs/int4-host-integration.md` 那四处宿主改动。
   另外，插件 README/HOST_CONTRACT 锁定的基线 `8a6655cf62` 在这两个宿主
   checkout 的历史里都不存在（`git cat-file -t` 均报 not a valid object），
