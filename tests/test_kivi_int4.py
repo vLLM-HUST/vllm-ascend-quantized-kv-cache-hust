@@ -1343,3 +1343,159 @@ def test_kivi_slot_group_guards_agree() -> None:
         assert bool(sem.is_aligned_key_window(slots, BLOCK)) == _kernel_accepts(
             slots
         ), f"guards disagree on {label}"
+
+
+# ---------------------------------------------------------------------------
+# geometry sweep: the pack word math, the region budget and the flush cadence
+# all depend on (head, group, block, residual), so one toy size and one
+# production size is not enough coverage.
+# ---------------------------------------------------------------------------
+
+#: (head_size, num_kv_heads, group_size, block_size, residual_length)
+GEOMETRIES = [
+    (32, 2, 8, 16, 16),
+    (64, 4, 16, 32, 32),
+    (128, 8, 128, 128, 128),
+    (128, 4, 32, 64, 64),
+    (256, 2, 64, 64, 128),
+]
+
+
+@pytest.mark.parametrize(
+    "head, kvh, group, block, residual",
+    GEOMETRIES,
+    ids=[f"h{h}_g{g}_b{b}" for h, _, g, b, _ in GEOMETRIES],
+)
+def test_int4_pipeline_across_geometries(head, kvh, group, block, residual) -> None:
+    """flush -> int4 history -> gather, over the host's two byte buffers."""
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_byte_cache_layout,
+    )
+
+    # one extra key group plus a partial group: values must have evicted
+    # one slot per overflow while keys flush whole windows
+    tokens = residual + group + 8
+    pages = -(-tokens // block) + 1
+    layout = KiviByteCacheLayout(
+        num_blocks=pages,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    key_buf = torch.zeros(
+        pages, block, kvh, layout.bytes_per_token_head, dtype=torch.uint8
+    )
+    value_buf = torch.zeros_like(key_buf)
+
+    impl = _make_impl(
+        residual_length=residual,
+        head_size=head,
+        num_kv_heads=kvh,
+        group_size=group,
+        block_size=block,
+        num_blocks=pages,
+    )
+    impl.num_heads = kvh
+    _install_cpu_packers(impl)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=residual,
+            block_size=block,
+        )
+    )
+
+    torch.manual_seed(41)
+    query = torch.randn(tokens, kvh, head)
+    key = torch.randn(tokens, kvh, head)
+    value = torch.randn(tokens, kvh, head)
+    out = torch.zeros(tokens, kvh, head)
+    md = _metadata(
+        tokens,
+        block_tables=torch.arange(pages, dtype=torch.long).view(1, pages),
+        req_ids=["r"],
+    )
+    impl.forward(None, query, key, value, (key_buf, value_buf), md, out)
+
+    # keys leave the window in whole-window flushes, values one oldest slot at
+    # a time -- so the two histories cover different token ranges.
+    flushed_keys = ((tokens - 1) // residual) * residual
+    evicted_values = max(0, tokens - residual)
+    expected_k = torch.cat([sem.fake_quant_key(key[:flushed_keys]), key[flushed_keys:]])
+    expected_v = torch.cat(
+        [sem.fake_quant_value(value[:evicted_values]), value[evicted_values:]]
+    )
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        md.block_tables, [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5), f"keys at {head}/{group}"
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5), (
+        f"values at {head}/{group}"
+    )
+    # the dense fallback really wrote every row of this geometry
+    assert out.shape == (tokens, kvh, head)
+    assert torch.isfinite(out).all() and out.abs().sum() > 0
+
+    # the two host buffers really are re-derivable at this geometry
+    assert (
+        kivi_byte_cache_layout(
+            key_buf, value_buf, num_kv_heads=kvh, head_size=head, group_size=group
+        )
+        == layout
+    )
+    assert key_buf.any() and value_buf.any()
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        (
+            {
+                "head_size": 32,
+                "group_size": 12,
+                "residual_length": 24,
+                "block_size": 24,
+            },
+            "divisible by 8",
+        ),
+        (
+            {"head_size": 32, "group_size": 16, "residual_length": 16, "block_size": 8},
+            "block_size",
+        ),
+        (
+            {"head_size": 36, "group_size": 8, "residual_length": 8, "block_size": 8},
+            "head_size",
+        ),
+        (
+            {
+                "head_size": 24,
+                "group_size": 16,
+                "residual_length": 32,
+                "block_size": 32,
+            },
+            "head_size",
+        ),
+        (
+            {
+                "head_size": 32,
+                "group_size": 16,
+                "residual_length": 24,
+                "block_size": 32,
+            },
+            "residual_length",
+        ),
+    ],
+)
+def test_illegal_int4_geometries_are_rejected(kwargs, match) -> None:
+    from vllm_ascend_quantized_kv_cache import kv_methods
+
+    for builder in (
+        lambda: validate_kivi_config(MethodConfig(**kwargs)),
+        lambda: kv_methods.get("kivi_int4", **kwargs),
+    ):
+        with pytest.raises(ValueError, match=match):
+            builder()
