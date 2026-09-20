@@ -1,7 +1,7 @@
 # INT4 (KIVI) 910B2 验证记录 — 2026-09-20
 
 设备验证容器：`vllm-hust-cyj-21rc-cloud-container-86`。代码为 `feat/int4`
-分支 `b8083f3` 的干净工作树（`/root/qkv-verify-f684231`，由
+分支 `db9517c` 的干净工作树（`/root/qkv-verify-f684231`，由
 `git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
 空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
 
@@ -105,15 +105,56 @@ be 0` / `maskDim 2 shall be 2048`）。插件按 `attn_metadata.attn_mask` 原�
 
 ```text
 [head=32 tile=16]  unstored=0 wrong-stored=4095 total=4096
-[head=32 tile=32]  unstored=0 wrong-stored=4096 total=4096
-[head=128 tile=16] unstored=1730 wrong-stored=14653 total=16384
-[head=128 tile=32] unstored=0 wrong-stored=16384 total=16384
+[head=32 tile=32]  unstored=0 wrong-stored=4095 total=4096
+[head=128 tile=16] unstored=1730 wrong-stored=14654 total=16384
+[head=128 tile=32] unstored=0 wrong-stored=16381 total=16384
 ```
 
 `ops/triton/kivi_gather_experimental.py` 在 triton-ascend 3.5 上仍然误编译（读出
-垃圾值，且哪些格子是垃圾每次跑都不同），继续**不路由**；该脚本留作日后重验。
+垃圾值，且哪些格子是垃圾每次跑都不同——同一次 db9517c 复跑与 b8083f3 的记录就
+差了几格），继续**不路由**；该脚本留作日后重验。
 
-## 6. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
+## 6. 批量解码：ragged 历史 + 多 block（`scripts/npu_probe_kivi_batched.py`，本轮新增）
+
+前面的注意力检查每步最多只有一个 decode 请求（chunked 那步是 1 decode + 1
+prompt），而 serving 是多个请求一起 decode：历史长度互不相干、各自跨若干 cache
+block，批的形状只通过 `actual_seq_lengths_kv` 的**前缀和**告诉 aclnn。CPU 侧测试
+对这一点只能"记录参数"（`torch_npu` 是桩），所以多请求批量形态此前从未在硬件上
+跑过。该探针让 3~4 个请求分别 prefill 出 1/2/3/4 个已 flush 窗口的历史，再一次性
+decode：
+
+```text
+geometry: head=128 kv_heads=8 group=128 block=128 residual=128 seqs=4
+          histories=[136, 264, 392, 520] blocks=14
+batched decode: gathered (1316, 8, 128), kv lens [137, 402, 795, 1316],
+                max|diff| vs direct FIA = 0.000000
+  req-0: history 137 over 2 blocks, keys vs int4 reference max|diff| = 0.000000
+  req-1: history 265 over 3 blocks, keys vs int4 reference max|diff| = 0.000000
+  req-2: history 393 over 4 blocks, keys vs int4 reference max|diff| = 0.000000
+  req-3: history 521 over 5 blocks, keys vs int4 reference max|diff| = 0.000000
+int4 accuracy: worst |diff|/K-V rms = 0.068025, worst cosine = 0.990201
+RESULT: PASS
+```
+
+玩具几何（head 64 / kv 2 / group 32 / block 32）同样 PASS：
+`worst |diff|/K-V rms = 0.063794, worst cosine = 0.993776`。
+
+三个变异确认这一步不是空跑，且**只有批量探针能抓到**（同一变异下单请求探针
+`RESULT: PASS`）：
+
+| 变异 | 批量探针结果 |
+|---|---|
+| `actual_seq_lengths_kv` 不取前缀和（直接用每请求长度） | aclnn 直接拒绝：`error code is 561002` |
+| gather 里所有请求都读第 0 行残差窗口 | `FAIL ['req-1 gathered keys deviate (5.484375)', 'req-2 ... (5.4453125)', 'req-3 ... (5.75)', 'int4 attention correlates with fp16 only 0.9638']` |
+| 每请求切片不偏移（`dense_k[0:req_len]`） | `FAIL ['req-1 ... (7.609375)', ..., 'int4 attention deviates from fp16 by 0.5063 of K/V rms', 'int4 attention correlates with fp16 only 0.3383']` |
+
+顺带得到第一个**设备侧量化误差**口径：同一份注意力在 int4 历史 vs 全精度 fp16
+缓存下，偏差 ≤ 0.068 倍 K/V rms、余弦 ≥ 0.990（随机 K/V、无模型权重；真实
+激活上的分布仍待模型级评测）。归一化用 K/V rms 而不是注意力输出幅值——随机
+key 下 softmax 接近均匀，输出本身按 `1/sqrt(N)` 缩小，用输出做分母会把任何
+量化方案都衬得很难看（首轮就因此误报 0.48）。
+
+## 7. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
 
 此前这一节是一次性手工脚本的产物，改成本仓脚本后立刻暴露出一个被它掩盖的
 宿主漂移：那份手工代码自己 `enable_cp = lambda: False`，而该 revision 的宿主
@@ -161,7 +202,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
   第一次调用的结果会被永久缓存；脚本要换 CP 配置必须 `cache_clear()`。真实
   serve 里 config 固定，所以不影响。
 
-## 7. 仍未完成
+## 8. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器宿主
   （vllm-hust `f18cf803c5`）的 `CacheDType` 是 pydantic 校验过的
@@ -176,9 +217,12 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
     [type=literal_error, input_value='int8', input_type=str]
   ```
 
-  分派本身已在第 6 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
+  分派本身已在第 7 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
   Literal），剩下的就是 `docs/int4-host-integration.md` 那四处宿主改动。
   另外，插件 README/HOST_CONTRACT 锁定的基线 `8a6655cf62` 在这两个宿主
   checkout 的历史里都不存在（`git cat-file -t` 均报 not a valid object），
   所以接合时要以目标基线复核行号。
-- 精度（模型输出质量）与多卡 / context parallel 未覆盖。
+- **模型级精度**：设备侧目前只有第 6 节那种随机 K/V 下的量化误差口径
+  （≤0.068 倍 K/V rms、余弦 ≥0.990）；真实权重下的输出质量、perplexity
+  对比仍要在端到端跑通后测。
+- 多卡 / context parallel 未覆盖（插件侧一律 fail-closed）。

@@ -82,6 +82,7 @@ python scripts/npu_probe_kivi_attention.py   # 打包+gather+fused attention 通
 KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
 KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 \
   python scripts/npu_probe_kivi_attention.py   # 出厂默认几何
+KIVI_PROBE_SEQS=4 python scripts/npu_probe_kivi_batched.py  # 多请求 ragged 批量 decode
 python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期仍误编译）
 ```
 
@@ -91,7 +92,7 @@ python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期�
 python scripts/probe_host_dispatch.py  # 真实 AscendAttentionBackend 的 dtype -> impl
 ```
 
-四个设备探针在 2026-09-20 的 910B2 复验结果记录在
+这些设备探针（2026-09-20，HEAD `db9517c`）的复验结果记录在
 `validation-int4-20260920.md`。注意因果 prefill 的掩码必须用宿主
 `AttentionMaskBuilder` 给的 `int8 [2048, 2048]` split-fuse 掩码，自己拼
 `T×T` 加性掩码会被 aclnn 以 `561002` 拒掉。

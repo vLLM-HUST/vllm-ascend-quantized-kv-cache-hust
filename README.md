@@ -125,21 +125,27 @@ CPU 参考打包器替换 triton 内核后跑通的 `forward()` 全链路（整�
 断言（对该区域做 5 处变异全部被抓）。移植自 legacy Ascend PR #116
 0003-0009（该分支在 910B2 上逐位验证过打包与 gather 内核）。
 
-**910B2 设备复验已完成（2026-09-20，见
+**910B2 设备复验已完成（2026-09-20，HEAD `db9517c`，见
 `docs/validation-int4-20260920.md`）**：打包内核与纯 torch dequant-gather 逐位
 复现语义参考（value `EXACT`、key `max|diff|=0`），三条注意力分支（prefill /
 decode / **chunked prefill**）在玩具几何与出厂默认几何（head 128 / kv 8 /
 group 128 / block 128）下都与"对同一份 gather 结果直接调用 fused attention"
-完全一致（差异 0，且把 chunked 的输出写回区间改错只有该探针能抓到）；实验性
-融合 gather 仍误编译，保持不路由。分派本身用 `scripts/probe_host_dispatch.py`
-在**真实宿主类**上核对：`auto`/`fp8`/`float16` 原样委托
-`AscendAttentionBackendImpl`，`int8` / `kivi_int4` 各自返回插件组合的实现类，
-用真实 `decode_context_parallel_size=2` 配置时抛 `NotImplementedError`。该脚本
-同时暴露并修掉了一处宿主漂移：新宿主已把 `enable_cp()` 换成
-`enable_dcp()`/`enable_pcp()`，旧分派在真机上一选量化 dtype 就 `ImportError`。
+完全一致（差异 0，且把 chunked 的输出写回区间改错只有该探针能抓到）；多请求
+批量 decode（历史长度互不相干、各跨 2~5 个 block、只靠
+`actual_seq_lengths_kv` 前缀和描述）同样零差异，跨请求泄漏类变异（所有请求读
+同一行残差、切片不偏移）只有 `scripts/npu_probe_kivi_batched.py` 能抓到，它同时
+给出设备侧量化口径：int4 历史 vs fp16 缓存的注意力输出偏差 ≤0.068 倍 K/V rms、
+余弦 ≥0.990。实验性融合 gather 仍误编译，保持不路由。分派本身用
+`scripts/probe_host_dispatch.py` 在**真实宿主类**上核对：`auto`/`fp8`/`float16`
+原样委托 `AscendAttentionBackendImpl`，`int8` / `kivi_int4` 各自返回插件组合的
+实现类，用真实 `decode_context_parallel_size=2` 配置时抛
+`NotImplementedError`。该脚本同时暴露并修掉了一处宿主漂移：新宿主已把
+`enable_cp()` 换成 `enable_dcp()`/`enable_pcp()`，旧分派在真机上一选量化 dtype
+就 `ImportError`。
 
 **仍未验证的是端到端 serving**：该容器宿主的 `CacheDType` 是 pydantic 校验的
 `Literal`，`kivi_int4`（和 `int8`）都不在其中，CLI 层面就会被拒；宿主还需按
 上面的字节预算给每层分配两张等大缓冲，并暴露
 `kivi_group_size` / `kivi_residual_length` 旋钮；对不上预算时插件在绑定期
-fail-closed（见 `HOST_CONTRACT.md`、`docs/int4-host-integration.md`）。
+fail-closed（见 `HOST_CONTRACT.md`、`docs/int4-host-integration.md`）。模型级
+精度（真实权重下的输出质量）也要等端到端跑通后才能测。
