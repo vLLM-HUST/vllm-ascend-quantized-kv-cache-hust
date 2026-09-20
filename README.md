@@ -125,7 +125,7 @@ CPU 参考打包器替换 triton 内核后跑通的 `forward()` 全链路（整�
 断言（对该区域做 5 处变异全部被抓）。移植自 legacy Ascend PR #116
 0003-0009（该分支在 910B2 上逐位验证过打包与 gather 内核）。
 
-**910B2 设备复验已完成（2026-09-20，HEAD `db9517c`，见
+**910B2 设备复验已完成（2026-09-20，HEAD `84e5ab3`，见
 `docs/validation-int4-20260920.md`）**：打包内核与纯 torch dequant-gather 逐位
 复现语义参考（value `EXACT`、key `max|diff|=0`），三条注意力分支（prefill /
 decode / **chunked prefill**）在玩具几何与出厂默认几何（head 128 / kv 8 /
@@ -135,8 +135,12 @@ group 128 / block 128）下都与"对同一份 gather 结果直接调用 fused a
 `actual_seq_lengths_kv` 前缀和描述）同样零差异，跨请求泄漏类变异（所有请求读
 同一行残差、切片不偏移）只有 `scripts/npu_probe_kivi_batched.py` 能抓到，它同时
 给出设备侧量化口径：int4 历史 vs fp16 缓存的注意力输出偏差 ≤0.068 倍 K/V rms、
-余弦 ≥0.990。实验性融合 gather 仍误编译，保持不路由。分派本身用
-`scripts/probe_host_dispatch.py` 在**真实宿主类**上核对：`auto`/`fp8`/`float16`
+余弦 ≥0.990。两个探针还跑在 GQA 形状下（`KIVI_PROBE_GQA=7`，即 14Q/2KV 与
+56Q/8KV）——这条形状此前完全没跑过，而把 `num_key_value_heads` 报错时 MHA 毫无
+反应、GQA 立刻 NaN；纯 torch 兜底注意力（自己扩 q 头、自己拼掩码）也在设备上与
+aclnn 对过，差异只有输出 rms 的 0.005。实验性融合 gather 仍误编译，保持不路由。
+分派本身用 `scripts/probe_host_dispatch.py` 在**真实宿主类**上核对：
+`auto`/`fp8`/`float16`
 原样委托 `AscendAttentionBackendImpl`，`int8` / `kivi_int4` 各自返回插件组合的
 实现类，用真实 `decode_context_parallel_size=2` 配置时抛
 `NotImplementedError`。该脚本同时暴露并修掉了一处宿主漂移：新宿主已把

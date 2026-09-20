@@ -1,7 +1,7 @@
 # INT4 (KIVI) 910B2 验证记录 — 2026-09-20
 
 设备验证容器：`vllm-hust-cyj-21rc-cloud-container-86`。代码为 `feat/int4`
-分支 `db9517c` 的干净工作树（`/root/qkv-verify-f684231`，由
+分支 `84e5ab3` 的干净工作树（`/root/qkv-verify-f684231`，由
 `git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
 空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
 
@@ -154,7 +154,43 @@ RESULT: PASS
 key 下 softmax 接近均匀，输出本身按 `1/sqrt(N)` 缩小，用输出做分母会把任何
 量化方案都衬得很难看（首轮就因此误报 0.48）。
 
-## 7. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
+## 7. 分组查询注意力（GQA）与 torch 兜底路径（本轮新增）
+
+两个注意力探针此前把 query 也按 `num_kv_heads` 造张量，也就是只跑过 MHA；
+真实模型都是 GQA（每个 kv 头带多个 q 头）。加 `KIVI_PROBE_GQA=n` 后，
+`KIVI_PROBE_GQA=7` 给出 Llama 口径的 14Q/2KV（玩具几何）与 56Q/8KV（出厂
+几何），四种组合（单请求/批量 × 玩具/出厂）全部 `RESULT: PASS`。
+
+这条覆盖不是象征性的——把 decode 分支里的 `num_key_value_heads=self.num_kv_heads`
+改成 `self.num_heads`（等价于告诉算子"每个 kv 头只服务一个 q 头"）：
+
+```text
+-- MHA (GQA=1), batched:   RESULT: PASS      ← 旧探针完全看不见
+-- GQA=7, batched:  RESULT: FAIL ['batched decode output has NaN/Inf',
+     'int4 attention deviates from fp16 by 27.5055 of K/V rms',
+     'int4 attention correlates with fp16 only 0.0228']
+-- GQA=7, 单请求探针: RESULT: FAIL ['decode attention deviates from the
+     operator (0.95721435546875)', 'chunked decode rows deviate from the
+     operator (1004.4728393554688)']
+```
+
+同一轮把**纯 torch 兜底注意力**（宿主给出未知 attn_state 时走的逐请求
+softmax 分支）也放到设备上跑：它自己用 `_repeat_kv` 扩 q 头、自己拼因果掩码，
+和 aclnn 是两套独立实现，两者差异只有输出 rms 的 0.0014（MHA）~0.0051
+（GQA、出厂几何）。把 `_repeat_kv` 改成永不扩展后，GQA 那步直接崩在
+`The size of tensor a (14) must match the size of tensor b (2)`，MHA 依旧
+无感——再次说明只有 GQA 形状能验到这条路径的要点。
+
+量化误差口径随头布局的变化（同一批量探针，`int4` 历史 vs 全精度 fp16）：
+
+| 配置 | worst \|diff\|/K-V rms | worst cosine |
+|---|---|---|
+| 玩具几何 MHA | 0.0638 | 0.9938 |
+| 玩具几何 GQA=7 | 0.0849 | 0.9950 |
+| 出厂几何 MHA | 0.0680 | 0.9902 |
+| 出厂几何 GQA=7 | 0.1005 | 0.9905 |
+
+## 8. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
 
 此前这一节是一次性手工脚本的产物，改成本仓脚本后立刻暴露出一个被它掩盖的
 宿主漂移：那份手工代码自己 `enable_cp = lambda: False`，而该 revision 的宿主
@@ -202,7 +238,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
   第一次调用的结果会被永久缓存；脚本要换 CP 配置必须 `cache_clear()`。真实
   serve 里 config 固定，所以不影响。
 
-## 8. 仍未完成
+## 9. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器宿主
   （vllm-hust `f18cf803c5`）的 `CacheDType` 是 pydantic 校验过的
@@ -217,7 +253,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
     [type=literal_error, input_value='int8', input_type=str]
   ```
 
-  分派本身已在第 7 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
+  分派本身已在第 8 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
   Literal），剩下的就是 `docs/int4-host-integration.md` 那四处宿主改动。
   另外，插件 README/HOST_CONTRACT 锁定的基线 `8a6655cf62` 在这两个宿主
   checkout 的历史里都不存在（`git cat-file -t` 均报 not a valid object），

@@ -51,8 +51,9 @@ fail closed。非量化 dtype 不应由插件拒绝，而应保持宿主原有�
 
 当前已验证的宿主基线为 vLLM-HUST `8a6655cf62` 和
 vLLM-Ascend-HUST `f4f49832`（覆盖 INT8 端到端）。INT4 的打包内核、gather，以及
-prefill / decode / chunked prefill 三条注意力分支和**多请求 ragged 批量
-decode**（跨 block、`actual_seq_lengths_kv` 前缀和）已在 910B2 容器
+prefill / decode / chunked prefill 三条注意力分支、**多请求 ragged 批量
+decode**（跨 block、`actual_seq_lengths_kv` 前缀和）、GQA 头布局与纯 torch
+兜底路径，均已在 910B2 容器
 `vllm-hust-cyj-21rc-cloud-container-86` 上逐位复验通过（记录见
 `docs/validation-int4-20260920.md`；设备侧量化口径：int4 vs fp16 注意力偏差
 ≤0.068 倍 K/V rms、余弦 ≥0.990），分派也用 `scripts/probe_host_dispatch.py`
