@@ -36,6 +36,7 @@ import sys
 
 sys.path.insert(0, "scripts")
 
+import kivi_probe_reference as ref  # noqa: E402
 import torch  # noqa: E402
 from npu_probe_kivi_attention import (  # noqa: E402
     BLOCK,
@@ -63,9 +64,7 @@ STEPS = int(os.environ.get("KIVI_PROBE_STEPS", 2 * RESIDUAL + 3))
 PROMPT = max(GROUP, RESIDUAL // 2)
 PAGES_PER_REQ = -(-(PROMPT + STEPS + 1) // BLOCK) + 1
 NUM_BLOCKS = R * PAGES_PER_REQ  # a re-admitted request reuses freed blocks
-# fp16 dequantisation vs the triton packer's own rounding, for tokens that must
-# still be exact
-TOLERANCE = 1e-2
+TOLERANCE = ref.TOLERANCE
 # int4 attention may not exceed this multiple of the K/V rms at any history length
 ACCURACY_BOUND = 0.2
 
@@ -105,101 +104,6 @@ def main() -> int:
     def slot_at(req_idx: int, token: int) -> int:
         block = int(tables[req_idx, token // BLOCK])
         return block * BLOCK + token % BLOCK
-
-    def group_stats(x: torch.Tensor, *, along_tokens: bool):
-        """Per-element (min, step) of the reference grid, as semantics groups it.
-
-        Keys group along the token dim and values along the head dim; mirroring
-        that here is what makes a *level* comparison possible rather than a
-        fuzzy magnitude one.
-        """
-        work = x.float()
-        if along_tokens:
-            pad = (GROUP - work.shape[0] % GROUP) % GROUP
-            if pad:
-                work = torch.cat([work, work[-1:].expand(pad, *work.shape[1:])], 0)
-            grouped = work.view(-1, GROUP, *x.shape[1:])
-            mn = grouped.amin(dim=1, keepdim=True)
-            mx = grouped.amax(dim=1, keepdim=True)
-            scale = sem.group_scale(mn, mx, 4)
-            # back to one value per element, then drop the padding again
-            flat = tuple(x.shape[1:])
-            return (
-                mn.expand_as(grouped).reshape((-1, *flat))[: x.shape[0]],
-                scale.expand_as(grouped).reshape((-1, *flat))[: x.shape[0]],
-            )
-        pad = (GROUP - work.shape[-1] % GROUP) % GROUP
-        if pad:
-            work = torch.cat([work, work[..., -1:].expand(*work.shape[:-1], pad)], -1)
-        grouped = work.view(*work.shape[:-1], -1, GROUP)
-        mn = grouped.amin(dim=-1, keepdim=True)
-        mx = grouped.amax(dim=-1, keepdim=True)
-        scale = sem.group_scale(mn, mx, 4)
-        shape = tuple(x.shape)
-        return (
-            mn.expand_as(grouped).reshape(shape),
-            scale.expand_as(grouped).reshape(shape),
-        )
-
-    def prefix_check(
-        got: torch.Tensor,
-        expected: torch.Tensor,
-        exact: torch.Tensor,
-        *,
-        along_tokens: bool,
-    ) -> tuple[int, int]:
-        """Violations and tie flips in the quantised region.
-
-        An element may differ from the reference only by sitting on the
-        *adjacent* level, which happens when its normalised value is an exact
-        half -- the triton kernel and ``quantize_group`` break those in
-        opposite directions.  Such a flip is recognisable because both candidate
-        levels are equally close to the exact value.  Anything else counts,
-        in particular a token left in full precision: that is strictly closer to
-        the exact value than any level is, so the equidistance test rejects it.
-        """
-        got = got.float()
-        expected = expected.float()
-        exact = exact.float()
-        _, scale = group_stats(exact, along_tokens=along_tokens)
-        scale = scale.float()
-        diff = (got - expected).abs()
-        d_ref = (exact - expected).abs()
-        d_got = (exact - got).abs()
-        tie = (diff <= 1.05 * scale) & ((d_got - d_ref).abs() <= 0.05 * scale)
-        allowed = (diff <= 1e-3) | tie
-        return int((~allowed).sum()), int((tie & (diff > 1e-3)).sum())
-
-    def score(
-        got: torch.Tensor,
-        expected: torch.Tensor,
-        exact: torch.Tensor,
-        split: int,
-        *,
-        along_tokens: bool,
-    ):
-        """Violation count and worst deviation for the two regions.
-
-        The quantised prefix is checked level by level (see prefix_check); the
-        exact tail has no such excuse and must match to fp16 rounding.
-        """
-        worst = 0.0
-        broken = 0
-        ties = 0
-        if split:
-            diff = (got[:split] - expected[:split]).abs().amax().item()
-            worst = max(worst, diff)
-            broken_here, ties_here = prefix_check(
-                got[:split], expected[:split], exact[:split], along_tokens=along_tokens
-            )
-            broken += broken_here
-            ties += ties_here
-        if split < got.shape[0]:
-            diff = (got[split:] - expected[split:]).abs().amax().item()
-            worst = max(worst, diff)
-            if diff > TOLERANCE:
-                broken += 1
-        return worst, broken, ties
 
     def verify(
         lengths: list[int], tag: str, *, bulk: bool, only: list[int] | None = None
@@ -241,12 +145,24 @@ def main() -> int:
             got_k = dense_k[offset : offset + length]
             got_v = dense_v[offset : offset + length]
             offset += length
-            k_worst, k_broken, k_ties = score(
-                got_k, expected_k, hist_k[i][:length], flushed, along_tokens=True
+            k_worst, k_broken, k_ties = ref.score(
+                sem,
+                GROUP,
+                got_k,
+                expected_k,
+                hist_k[i][:length],
+                flushed,
+                along_tokens=True,
             )
-            v_worst, v_broken, v_ties = score(
-                got_v, expected_v, hist_v[i][:length], evicted, along_tokens=False
-            )  # noqa: E501
+            v_worst, v_broken, v_ties = ref.score(
+                sem,
+                GROUP,
+                got_v,
+                expected_v,
+                hist_v[i][:length],
+                evicted,
+                along_tokens=False,
+            )
             worst_k = max(worst_k, k_worst)
             worst_v = max(worst_v, v_worst)
             tie_flips[0] += k_ties + v_ties
@@ -519,11 +435,21 @@ def main() -> int:
             new_values[evicted:].float(),
         ]
     ).half()
-    k_bad, k_ties = prefix_check(
-        dense_k[:flushed], expect_k[:flushed], new_keys[:flushed], along_tokens=True
+    k_bad, k_ties = ref.prefix_check(
+        sem,
+        GROUP,
+        dense_k[:flushed],
+        expect_k[:flushed],
+        new_keys[:flushed],
+        along_tokens=True,
     )
-    v_bad, v_ties = prefix_check(
-        dense_v[:evicted], expect_v[:evicted], new_values[:evicted], along_tokens=False
+    v_bad, v_ties = ref.prefix_check(
+        sem,
+        GROUP,
+        dense_v[:evicted],
+        expect_v[:evicted],
+        new_values[:evicted],
+        along_tokens=False,
     )
     tail_k = float((dense_k[flushed:] - expect_k[flushed:]).abs().max())
     tail_v = float((dense_v[evicted:] - expect_v[evicted:]).abs().max())
