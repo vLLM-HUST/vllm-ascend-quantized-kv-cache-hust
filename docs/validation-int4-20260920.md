@@ -1,14 +1,26 @@
 # INT4 (KIVI) 910B2 验证记录 — 2026-09-20
 
 设备验证容器：`vllm-hust-cyj-21rc-cloud-container-86`。代码为 `feat/int4`
-分支 `6a1dc4b` 的干净工作树（`/root/qkv-verify-f684231`，由
-`git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
-空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
+分支的干净工作树（`/root/qkv-verify-f684231`，由 `git worktree add --detach`
+创建，当前 detached 在 `6146ab5`，`git status --short` 为空）。设备固定在空闲卡
+上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。逐节的 revision 归属见下文说明。
 
 设备套件（第 1~8 节）在 `0c61df8` 上完整跑过一遍并全部通过；`6a1dc4b` 只改插件
-实现（宿主导入顺序），故第 10 节分派核对、第 11 节安装态核对与 87 个 CPU 测试在
+实现（宿主导入顺序），故第 11 节分派核对、第 12 节安装态核对与 87 个 CPU 测试在
 `6a1dc4b` 重跑通过。第 9 节的多请求 chunked 批次在 `a9dd050` 的两种几何上跑通。
-插件实现自 `6a1dc4b` 起未再改动（`git diff 6a1dc4b..HEAD -- src` 为空）。
+
+最终记录修订为 `6146ab5`（相比 `6a1dc4b` 只多了 CPU 测试与文档，`src` 逐字节
+相同，`git diff 6a1dc4b..6146ab5 -- src` 为空）。在该 revision 的干净工作树上，
+除第 5 节（实验性融合 gather，结论未变、仍待宿主修复误编译）之外，把本文档
+**每一节的设备命令按原文参数重跑了一遍**，输出与记录逐位一致：第 1 节 90 个
+CPU 测试、第 2 节打包/gather 对拍、第 3 节端到端冒烟、第 4 节两种几何与第 8 节
+两种 GQA 的单请求注意力（chunked 分支 `max|diff|=0.000000`）、第 6 节批量解码、
+第 8 节表格的四行量化误差与兜底差异（0.0638/0.9938、0.0849/0.9950、0.0680/0.9902、
+0.1005/0.9905）、第 7 节两种几何的多步生成（玩具几何 67 步零违规；出厂几何 64 步、
+131 次一层 tie flip 全部在容差内）、第 9 节一步 5 请求的 chunked 批次、第 10 节
+13/15 可编译形状、第 11 节真宿主分派、第 12 节安装态（wheel 装到
+`/tmp/kivi-probe-6146ab5` 后经 `load_general_plugins()` 加载）。这些探针都在进程
+开头 `torch.manual_seed(0)`，所以复现的是**数字本身**，不只是 `RESULT: PASS`。
 
 | 项目 | 值 |
 |---|---|
@@ -21,10 +33,15 @@
 ## 1. CPU 侧（同一台机器、同一份代码）
 
 ```text
-PYTHONPATH=src python -m pytest -q        -> 87 passed
+PYTHONPATH=src python -m pytest -q        -> 90 passed
 python scripts/check_int4_patch_parity.py -> PASS（补丁不变量全部在位）
 python -m ruff check . / ruff format --check . -> All checks passed / 已格式化
 ```
+
+87→90 的增量是 `test_host_published_numbers_rebuild_the_plugin_layout`
+（3 个参数化）：它把 `docs/int4-host-integration.md` 第 1 节向宿主索取的三个数字
+（形状里的 `S`、存储 dtype `torch.uint8`、`real_page_size_bytes`）变成可执行契约，
+口径见该文档第 2 节。
 
 ## 2. 打包与 gather 内核（`scripts/npu_probe_kivi_key.py`）
 
@@ -232,7 +249,14 @@ token，断言残差窗口只剩两个槽位）；该测试是唯一能杀掉这
 两个注意力探针此前把 query 也按 `num_kv_heads` 造张量，也就是只跑过 MHA；
 真实模型都是 GQA（每个 kv 头带多个 q 头）。加 `KIVI_PROBE_GQA=n` 后，
 `KIVI_PROBE_GQA=7` 给出 Llama 口径的 14Q/2KV（玩具几何）与 56Q/8KV（出厂
-几何），四种组合（单请求/批量 × 玩具/出厂）全部 `RESULT: PASS`。
+几何），四种组合（单请求/批量 × 玩具/出厂）全部 `RESULT: PASS`。单请求那两条：
+
+```bash
+KIVI_PROBE_GQA=7 python scripts/npu_probe_kivi_attention.py
+KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
+KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 KIVI_PROBE_GQA=7 \
+  python scripts/npu_probe_kivi_attention.py
+```
 
 这条覆盖不是象征性的——把 decode 分支里的 `num_key_value_heads=self.num_kv_heads`
 改成 `self.num_heads`（等价于告诉算子"每个 kv 头只服务一个 q 头"）：
@@ -249,19 +273,34 @@ token，断言残差窗口只剩两个槽位）；该测试是唯一能杀掉这
 
 同一轮把**纯 torch 兜底注意力**（宿主给出未知 attn_state 时走的逐请求
 softmax 分支）也放到设备上跑：它自己用 `_repeat_kv` 扩 q 头、自己拼因果掩码，
-和 aclnn 是两套独立实现，两者差异只有输出 rms 的 0.0014（MHA）~0.0051
-（GQA、出厂几何）。把 `_repeat_kv` 改成永不扩展后，GQA 那步直接崩在
+和 aclnn 是两套独立实现，四组配置下两者相差不超过 aclnn 输出 rms 的 0.008（逐行
+数字见本节末尾表格最后一列）。把 `_repeat_kv` 改成永不扩展后，GQA 那步直接崩在
 `The size of tensor a (14) must match the size of tensor b (2)`，MHA 依旧
 无感——再次说明只有 GQA 形状能验到这条路径的要点。
 
-量化误差口径随头布局的变化（同一批量探针，`int4` 历史 vs 全精度 fp16）：
+量化误差口径随头布局的变化（同一批量探针，`int4` 历史 vs 全精度 fp16）。探针内部
+`torch.manual_seed(0)`，所以这四行是**可复现的确定值**而不是抽样；每条的完整命令：
 
-| 配置 | worst \|diff\|/K-V rms | worst cosine |
-|---|---|---|
-| 玩具几何 MHA | 0.0638 | 0.9938 |
-| 玩具几何 GQA=7 | 0.0849 | 0.9950 |
-| 出厂几何 MHA | 0.0680 | 0.9902 |
-| 出厂几何 GQA=7 | 0.1005 | 0.9905 |
+```bash
+KIVI_PROBE_SEQS=3 python scripts/npu_probe_kivi_batched.py                        # 玩具 MHA
+KIVI_PROBE_SEQS=3 KIVI_PROBE_GQA=7 python scripts/npu_probe_kivi_batched.py       # 玩具 GQA
+KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
+KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 KIVI_PROBE_SEQS=4 \
+  python scripts/npu_probe_kivi_batched.py                                        # 出厂 MHA
+KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
+KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 KIVI_PROBE_SEQS=4 KIVI_PROBE_GQA=7 \
+  python scripts/npu_probe_kivi_batched.py                                        # 出厂 GQA
+```
+
+| 配置 | worst \|diff\|/K-V rms | worst cosine | torch 兜底 vs aclnn |
+|---|---|---|---|
+| 玩具几何 MHA | 0.0638 | 0.9938 | 0.0014 |
+| 玩具几何 GQA=7 | 0.0849 | 0.9950 | 0.0051 |
+| 出厂几何 MHA | 0.0680 | 0.9902 | 0.0072 |
+| 出厂几何 GQA=7 | 0.1005 | 0.9905 | 0.0048 |
+
+末列是纯 torch 兜底注意力与 aclnn 结果的差，按 aclnn 输出 rms 归一——四行都在
+`0.008` 以下，即两套独立实现在硬件上互证。
 
 ## 9. 一条 chunked step 里的多请求批次（`scripts/npu_probe_kivi_chunked_batch.py`，本轮新增）
 
