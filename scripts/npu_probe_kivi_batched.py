@@ -17,12 +17,16 @@ Three things are checked per batched decode step:
    (quantised flushed window, exact residual tail) -- cross-request leakage
    fails here;
 3. the int4 output stays close to the same attention computed on the
-   *unquantized* fp16 cache, which is the device-side accuracy datapoint.
+   *unquantized* fp16 cache, which is the device-side accuracy datapoint;
+4. the pure-torch fallback attention (reached for attention states the host
+   doesn't name) agrees with the aclnn result.  It expands K/V per query head
+   itself and builds its own causal mask, so under GQA the two are independent
+   implementations of the same attention.
 
     python scripts/npu_probe_kivi_batched.py
     KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
     KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 KIVI_PROBE_SEQS=4 \
-      python scripts/npu_probe_kivi_batched.py
+    KIVI_PROBE_GQA=7 python scripts/npu_probe_kivi_batched.py
 """
 
 from __future__ import annotations
@@ -67,6 +71,10 @@ NUM_BLOCKS = sum(BLOCKS_PER_REQ)
 # both geometries: 0.068 rms ratio, cosine 0.990)
 ACCURACY_BOUND = 0.2
 COSINE_FLOOR = 0.98
+# how far the pure-torch fallback may sit from the aclnn result, as a fraction
+# of the aclnn output rms (two independent fp16 implementations of the same
+# attention)
+FALLBACK_BOUND = 0.05
 
 
 def block_ids() -> list[list[int]]:
@@ -248,6 +256,41 @@ def main() -> int:
         failures.append(f"int4 attention deviates from fp16 by {worst:.4f} of K/V rms")
     if worst_cosine < COSINE_FLOOR:
         failures.append(f"int4 attention correlates with fp16 only {worst_cosine:.4f}")
+
+    # 4) the pure-torch fallback attention, on device, cross-checked against the
+    # aclnn result above.  The fallback expands K/V per query head itself
+    # (_repeat_kv) and builds its own causal mask, so under GQA the two paths
+    # are independent implementations of the same attention.
+    fb_md = metadata(
+        R,
+        seq_lens,
+        "Unknown",
+        slots,
+        md.block_tables,
+        actual_seq_lengths_q=list(range(1, R + 1)),
+        req_ids=md.req_ids,
+        num_decodes=R,
+        num_decode_tokens=R,
+        num_prefills=0,
+    )
+    fb_out = torch.zeros(R, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
+    got_fb = impl.forward(
+        None, dec_query, dec_key, dec_value, (key_buf, value_buf), fb_md, fb_out
+    )
+    torch.npu.synchronize()
+    fb_diff = (got_fb.float() - got.float()).abs().max().item()
+    fb_scale = got.float().pow(2).mean().sqrt().item() or 1.0
+    print(
+        f"torch fallback: max|diff| vs aclnn = {fb_diff:.6f} "
+        f"(= {fb_diff / fb_scale:.4f} x aclnn output rms)",
+        flush=True,
+    )
+    if not bool(torch.isfinite(got_fb).all()):
+        failures.append("torch fallback output has NaN/Inf")
+    if fb_diff > FALLBACK_BOUND * fb_scale:
+        failures.append(
+            f"torch fallback deviates from aclnn by {fb_diff / fb_scale:.4f} of its rms"
+        )
 
     print("RESULT:", "PASS" if not failures else f"FAIL {failures}", flush=True)
     return 1 if failures else 0
