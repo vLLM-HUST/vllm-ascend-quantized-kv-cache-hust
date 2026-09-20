@@ -83,6 +83,7 @@ python scripts/npu_probe_kivi_dim.py
 python scripts/npu_smoke_kivi.py
 python scripts/npu_probe_kivi_attention.py   # prefill / decode / chunked 三分支
 KIVI_PROBE_SEQS=4 python scripts/npu_probe_kivi_batched.py  # 多请求 ragged 批量
+KIVI_PROBE_STEPS=64 python scripts/npu_probe_kivi_generate.py  # 多步生成调度
 vllm serve MODEL --kv-cache-dtype kivi_int4 --max-model-len 8192 --enforce-eager
 ```
 

@@ -37,6 +37,12 @@ triton-ascend 修复后用 `scripts/npu_probe_kivi_dim.py` 重验。
   本仓库以**内核为准**：`semantics.group_scale` / `quantize_group` 复刻内核算术，
   由 `test_reference_arithmetic_matches_pack_kernel_contract` 钉住；真机复验若
   出现逐位差异，先查这一契约是否被动过。
+- 2026-09-20 真机确实出现了逐位差异，但**不是**契约被改动：出厂几何下 128 行里有
+  1 行的某个元素，其归一化值在实数上正好是 7.5（半格点），内核的 fp32 中间结果是
+  7.49999973 因而存了 7 档，`floor(x + 0.5)` 参考给 8 档。复刻算式不足以保证平局
+  处的逐位一致——两侧浮点顺序不同就会差一档。`scripts/npu_probe_kivi_generate.py`
+  因此按"同档，或在精确平局处相邻一档（两档到原值等距）"判定一致，而不是用幅度
+  容差（幅度容差宽到能放过"整段没量化"的错误，已实测）。
 
 `attention_backend.py` 保留了上游 Huawei Technologies 版权声明，并继续
 使用 Apache-2.0。本仓库根目录的 `LICENSE` 包含完整许可证文本。

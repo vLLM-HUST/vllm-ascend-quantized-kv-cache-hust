@@ -85,6 +85,7 @@ KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 \
 KIVI_PROBE_SEQS=4 KIVI_PROBE_GQA=7 \
   python scripts/npu_probe_kivi_batched.py  # 多请求 ragged 批量 + GQA
                           # （去掉 GQA 即 MHA；探针还比对纯 torch 兜底路径）
+KIVI_PROBE_STEPS=64 python scripts/npu_probe_kivi_generate.py  # 多步生成：逐步校验 flush 调度
 python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期仍误编译）
 ```
 

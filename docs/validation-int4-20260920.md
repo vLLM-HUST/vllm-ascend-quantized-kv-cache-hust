@@ -1,7 +1,7 @@
 # INT4 (KIVI) 910B2 验证记录 — 2026-09-20
 
 设备验证容器：`vllm-hust-cyj-21rc-cloud-container-86`。代码为 `feat/int4`
-分支 `84e5ab3` 的干净工作树（`/root/qkv-verify-f684231`，由
+分支 `0c61df8` 的干净工作树（`/root/qkv-verify-f684231`，由
 `git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
 空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
 
@@ -16,7 +16,7 @@
 ## 1. CPU 侧（同一台机器、同一份代码）
 
 ```text
-PYTHONPATH=src python -m pytest -q        -> 84 passed
+PYTHONPATH=src python -m pytest -q        -> 85 passed
 python scripts/check_int4_patch_parity.py -> PASS（补丁不变量全部在位）
 python -m ruff check . / ruff format --check . -> All checks passed / 已格式化
 ```
@@ -154,7 +154,47 @@ RESULT: PASS
 key 下 softmax 接近均匀，输出本身按 `1/sqrt(N)` 缩小，用输出做分母会把任何
 量化方案都衬得很难看（首轮就因此误报 0.48）。
 
-## 7. 分组查询注意力（GQA）与 torch 兜底路径（本轮新增）
+## 7. 多步生成：逐步 flush 调度在真机上（`scripts/npu_probe_kivi_generate.py`，本轮新增）
+
+前面每一步都是"写一次、读一次"。serving 是循环：token 一个一个进来，键按整窗口
+溢出才落 int4、值按最老槽位逐个 eviction，而且这些动作发生在**真 triton 打包内核**
+之下。该探针先给 2 个请求各 prefill 一个整窗 prompt，再连续 decode，**每一步**
+都把 gather 出来的 K/V 与"按写入路径规则重算的参考"逐元素对比：
+
+```text
+geometry: head=64  kv_heads=2 group=32  block=32  residual=32  prompt=32  steps=67
+prefill: history=[32, 32] key diff=0.000000 value diff=0.000000
+step 67/67: history=99 residual rows=3/32 key diff=0.000000 value diff=0.000000
+retirement: req-0 released; survivor req-1 still exact at history 100 (keys 0.000000, values 0.000000)
+final step: req-1 history=[100] gathered (100, 2, 64), max|diff| vs direct FIA = 0.000000
+generation: 67 steps ... one-level tie flips tolerated: 0
+RESULT: PASS
+
+geometry: head=128 kv_heads=8 group=128 block=128 residual=128 prompt=128 steps=64
+prefill: history=[128, 128] key diff=0.000000 value diff=0.391602
+generation: 64 steps ... one-level tie flips tolerated: 131
+RESULT: PASS
+```
+
+出厂几何上那 0.3916 不是调度错，而是**量化格点上的四舍五入平局**：实测某元素
+（row 24 / head 7 / dim 41，值 0.542969，组 min=-2.394531、step=0.391667）的归一
+化值在实数上正好是 7.5，triton 的 fp32 中间结果落在 7.49999973，于是内核存了
+7 档、`semantics.quantize_group` 的 `floor(x+0.5)` 给 8 档。该事实已写进
+`quantize_group` 的 docstring。
+
+这一步的判据因此**不是**幅度容差：先量测试用 2×半格的容差，结果它宽到连"整段
+prompt 没被量化（保持全精度）"都能放过（把 bulk 规则改成 incremental 规则的变异
+在玩具几何只报 0.21 的差、被判通过）。改成"逐元素要么与参考同档，要么在**精确
+平局**处相差一档（两档到原值等距）"后：
+
+| 变异 | 结果 |
+|---|---|
+| bulk prefill 改成等溢出才 flush（少 flush 一整窗） | `FAIL ['prefill: req-0 keys off-grid x3453', 'prefill: req-0 values off-grid x3470', ...]`，同一变异下 CPU 侧 `test_bulk_prefill_flushes_a_full_window_that_incremental_writes_keep_exact` 也失败 |
+| 增量窗口溢出判定 `>=` 改 `>`（晚一个 token 才 flush） | 插件自己的对齐守卫先炸：`RuntimeError: KIVI key flush requires contiguous aligned token groups.`（错位的窗口不再是整组对齐） |
+
+两条都是**只有多步运行才会出现**的状态：单步探针（第 4/6 节）对它们完全无感。
+
+## 8. 分组查询注意力（GQA）与 torch 兜底路径（本轮新增）
 
 两个注意力探针此前把 query 也按 `num_kv_heads` 造张量，也就是只跑过 MHA；
 真实模型都是 GQA（每个 kv 头带多个 q 头）。加 `KIVI_PROBE_GQA=n` 后，
@@ -190,7 +230,7 @@ softmax 分支）也放到设备上跑：它自己用 `_repeat_kv` 扩 q 头、�
 | 出厂几何 MHA | 0.0680 | 0.9902 |
 | 出厂几何 GQA=7 | 0.1005 | 0.9905 |
 
-## 8. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
+## 9. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
 
 此前这一节是一次性手工脚本的产物，改成本仓脚本后立刻暴露出一个被它掩盖的
 宿主漂移：那份手工代码自己 `enable_cp = lambda: False`，而该 revision 的宿主
@@ -238,7 +278,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
   第一次调用的结果会被永久缓存；脚本要换 CP 配置必须 `cache_clear()`。真实
   serve 里 config 固定，所以不影响。
 
-## 9. 仍未完成
+## 10. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器宿主
   （vllm-hust `f18cf803c5`）的 `CacheDType` 是 pydantic 校验过的
@@ -253,7 +293,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
     [type=literal_error, input_value='int8', input_type=str]
   ```
 
-  分派本身已在第 8 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
+  分派本身已在第 9 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
   Literal），剩下的就是 `docs/int4-host-integration.md` 那四处宿主改动。
   另外，插件 README/HOST_CONTRACT 锁定的基线 `8a6655cf62` 在这两个宿主
   checkout 的历史里都不存在（`git cat-file -t` 均报 not a valid object），
