@@ -1,9 +1,13 @@
 # INT4 (KIVI) 910B2 验证记录 — 2026-09-20
 
 设备验证容器：`vllm-hust-cyj-21rc-cloud-container-86`。代码为 `feat/int4`
-分支 `0c61df8` 的干净工作树（`/root/qkv-verify-f684231`，由
+分支 `20989f0` 的干净工作树（`/root/qkv-verify-f684231`，由
 `git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
 空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
+
+下面整套（第 1~9 节）在 `0c61df8` 上完整跑过一遍并全部通过；其后的提交只动
+INT4 探针与 CPU 测试（`git diff 0c61df8..20989f0 -- src` 为空，插件实现未改），
+受影响的多步生成、批量解码与 pytest 已在 `20989f0` 重跑通过。
 
 | 项目 | 值 |
 |---|---|
