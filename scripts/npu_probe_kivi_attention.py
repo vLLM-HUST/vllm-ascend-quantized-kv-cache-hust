@@ -52,9 +52,30 @@ RESIDUAL = int(os.environ.get("KIVI_PROBE_RESIDUAL", 32))
 GQA = int(os.environ.get("KIVI_PROBE_GQA", 1))
 NUM_HEADS = KVH * GQA
 SCALE = HEAD**-0.5
-NUM_BLOCKS = int(os.environ.get("KIVI_PROBE_BLOCKS", 4))
 MAX_SEQS = int(os.environ.get("KIVI_PROBE_SEQS", 2))
 PREFILL_TOKENS = RESIDUAL + 8  # one full key window flushes into int4 history
+CHUNK_PROMPT = GROUP  # the all-new prompt row added by the chunked step
+# block bookkeeping has to follow the geometry: with residual_length >
+# block_size one request spans several blocks, and block_size !=
+# residual_length is exactly where the window/slot arithmetic can disagree
+HISTORY_TOKENS = PREFILL_TOKENS + 2
+HISTORY_BLOCKS = -(-HISTORY_TOKENS // BLOCK)
+PROMPT_BLOCKS = -(-CHUNK_PROMPT // BLOCK)
+PROMPT_BASE = HISTORY_BLOCKS  # the prompt row gets blocks of its own
+WIDTH = max(HISTORY_BLOCKS, PROMPT_BLOCKS)
+NUM_BLOCKS = max(
+    int(os.environ.get("KIVI_PROBE_BLOCKS", 4)), PROMPT_BASE + PROMPT_BLOCKS
+)
+
+
+def table(first_block: int, tokens: int) -> list[int]:
+    """Block ids for ``tokens`` consecutive tokens, padded to a common width."""
+    ids = [first_block + i for i in range(-(-tokens // BLOCK))]
+    return ids + [ids[0]] * (WIDTH - len(ids))
+
+
+def slot(row: list[int], token: int) -> int:
+    return row[token // BLOCK] * BLOCK + token % BLOCK
 
 
 class _HostImplShim:
@@ -205,7 +226,7 @@ def main() -> int:
         [PREFILL_TOKENS],
         "PrefillNoCache",
         slots,
-        torch.arange(2, dtype=torch.long, device=DEV).view(1, 2),
+        torch.tensor([table(0, PREFILL_TOKENS)], dtype=torch.long, device=DEV),
         attn_mask=mask,
     )
     got = impl.forward(
@@ -227,8 +248,11 @@ def main() -> int:
     dec_value = torch.randn_like(dec_key)
     dec_query = torch.randn(1, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     seq_len = PREFILL_TOKENS + 1
-    dec_slots = torch.tensor([PREFILL_TOKENS], dtype=torch.long, device=DEV)
-    block_tables = torch.tensor([[0, 1]], dtype=torch.long, device=DEV)
+    hist_row = table(0, HISTORY_TOKENS)
+    dec_slots = torch.tensor(
+        [slot(hist_row, PREFILL_TOKENS)], dtype=torch.long, device=DEV
+    )
+    block_tables = torch.tensor([hist_row], dtype=torch.long, device=DEV)
     dec_out = torch.zeros(1, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     dec_md = metadata(
         1,
@@ -291,20 +315,29 @@ def main() -> int:
 
     print(
         f"geometry: head={HEAD} kv_heads={KVH} q_heads={NUM_HEADS} group={GROUP} "
-        f"block={BLOCK} residual={RESIDUAL} tokens={PREFILL_TOKENS}",
+        f"block={BLOCK} residual={RESIDUAL} tokens={PREFILL_TOKENS} "
+        f"history_blocks={HISTORY_BLOCKS} prompt_base={PROMPT_BASE} "
+        f"blocks={NUM_BLOCKS}",
         flush=True,
     )
     # ---- chunked prefill: a decode row plus an all-new prompt row ============
     prompt = GROUP
     rows = 1 + prompt
     seq_r = PREFILL_TOKENS + 2
+    prompt_row = table(PROMPT_BASE, prompt)
     slots = torch.cat(
         [
-            torch.tensor([PREFILL_TOKENS + 1], dtype=torch.long, device=DEV),
-            torch.arange(2 * BLOCK, 2 * BLOCK + prompt, dtype=torch.long, device=DEV),
+            torch.tensor(
+                [slot(hist_row, PREFILL_TOKENS + 1)], dtype=torch.long, device=DEV
+            ),
+            torch.tensor(
+                [slot(prompt_row, t) for t in range(prompt)],
+                dtype=torch.long,
+                device=DEV,
+            ),
         ]
     )
-    tables = torch.tensor([[0, 1], [2, 2]], dtype=torch.long, device=DEV)
+    tables = torch.tensor([hist_row, prompt_row], dtype=torch.long, device=DEV)
     ck_query = torch.randn(rows, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     ck_key = torch.randn(rows, KVH, HEAD, device=DEV, dtype=torch.float16)
     ck_value = torch.randn_like(ck_key)
