@@ -382,9 +382,7 @@ def test_sync_prunes_residual_slots_the_request_no_longer_owns() -> None:
 
     # the scheduler rolls the request back to two tokens: slots 2 and 3 are no
     # longer part of its sequence
-    impl._sync_kivi_residual_windows(
-        torch.tensor([[0]], dtype=torch.long), [2], ["r"]
-    )
+    impl._sync_kivi_residual_windows(torch.tensor([[0]], dtype=torch.long), [2], ["r"])
     stored, tensors = impl._collect_kivi_residual_window("r", is_key=False)
     assert stored == [0, 1]
     assert tensors is not None and tensors.shape[0] == 2
