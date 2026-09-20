@@ -88,6 +88,7 @@ python scripts/npu_probe_kivi_attention.py   # prefill / decode / chunked 三分
 KIVI_PROBE_SEQS=4 python scripts/npu_probe_kivi_batched.py  # 多请求 ragged 批量
 KIVI_PROBE_STEPS=64 python scripts/npu_probe_kivi_generate.py  # 多步生成调度
 python scripts/npu_probe_kivi_chunked_batch.py  # 一步内的多请求 chunked 批次
+python scripts/npu_probe_kivi_geometry.py  # 打包内核可编译形状包络（信息性）
 vllm serve MODEL --kv-cache-dtype kivi_int4 --max-model-len 8192 --enforce-eager
 ```
 
@@ -96,6 +97,11 @@ vllm serve MODEL --kv-cache-dtype kivi_int4 --max-model-len 8192 --enforce-eager
 - **无 ACL Graph 路径**：INT4 的残差窗口簿记含 Python 控制流，移植自 legacy
   的最终状态也没有 graph 捕获分支；先以 `--enforce-eager` 运行。
 - **context parallel 明确拒绝**，与 INT8 同一口径（`HOST_CONTRACT.md`）。
+- **打包内核有可编译形状包络**：`validate_kivi_geometry` 的整除规则比内核实际能编
+  译的范围宽。910B2 实测 `group_size=128` + `block_size=256` 在 bishengir 编译期 UB
+  溢出（`ops/triton/kivi_pack.py:135`），出厂默认 128/128/128 正常。宿主定
+  `block_size` 前用 `scripts/npu_probe_kivi_geometry.py` 复测（测量表见
+  `docs/validation-int4-20260920.md` 第 10 节，目前是测量、没有公式）。
 - **gather 走纯 torch**：`ops/triton/kivi_gather_experimental.py` 在
   triton-ascend 3.5 上误编译（910B2 复现），保留但不路由。
 - 宿主自带的 `int4_per_token_head` 是**另一种** INT4 格式（每 token-head 对称

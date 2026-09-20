@@ -139,7 +139,10 @@ group 128 / block 128）下都与"对同一份 gather 结果直接调用 fused a
 block 立刻给新请求复用（重挂载）也在这一步里对拍。chunked 步也第一次以
 "2 个 decode + 3 个不等长 prompt"的批跑过：每个 prompt 请求的 q 长度要从累积的
 `actual_seq_lengths_q` 减去 decode 行数还原，1+1 的批里这套算术退化、错了也看不出来
-（`scripts/npu_probe_kivi_chunked_batch.py`）。多步生成（64~67 个 decode step、跨多次整窗 flush、真 triton 打包）
+（`scripts/npu_probe_kivi_chunked_batch.py`）。`block_size` 与 `residual_length`
+错开的几何也过；同时测出**能过校验但编不出内核**的形状（`group=128`+`block=256`
+在 910B2 上 UB 溢出；出厂默认 128/128/128 无恙，见
+`scripts/npu_probe_kivi_geometry.py` 与 `HOST_CONTRACT.md`）。多步生成（64~67 个 decode step、跨多次整窗 flush、真 triton 打包）
 也逐步对过：每一步的 gather 都符合 pinned 的 flush 调度，出厂几何上唯一的不同是
 128 行里有 1 行的某个元素落在**恰好一半**的格点上（归一化值数学上是 7.5），内核的
 fp32 中间结果是 7.49999973，于是比 `quantize_group` 低一档——这一条已写进

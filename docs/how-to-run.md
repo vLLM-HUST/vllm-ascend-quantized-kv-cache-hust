@@ -87,6 +87,7 @@ KIVI_PROBE_SEQS=4 KIVI_PROBE_GQA=7 \
                           # （去掉 GQA 即 MHA；探针还比对纯 torch 兜底路径）
 KIVI_PROBE_STEPS=64 python scripts/npu_probe_kivi_generate.py  # 多步生成：逐步校验 flush 调度
 python scripts/npu_probe_kivi_chunked_batch.py  # 一步内 2 个 decode + 3 个不等长 prompt
+python scripts/npu_probe_kivi_geometry.py  # 打包内核可编译形状包络（信息性，非门禁）
 python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期仍误编译）
 ```
 

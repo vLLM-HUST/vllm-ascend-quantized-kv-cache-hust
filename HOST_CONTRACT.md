@@ -49,6 +49,14 @@ head_size=128 / group_size=128 下约 **3.6x**（int4 数据本身是 4x，scale
 非 Ascend 宿主、缺少上述 API 或在量化 dtype 下开启 context parallel 时必须
 fail closed。非量化 dtype 不应由插件拒绝，而应保持宿主原有行为。
 
+INT4 的 `block_size` 不只是布局问题，还受打包内核的片上缓冲限制：910B2 +
+triton-ascend 3.5 实测 `group_size=128` 配 `block_size=256` 会在内核编译期 UB 溢出
+（`ub overflow, requires 1655040 bits while 1572864 bits available`，位置
+`ops/triton/kivi_pack.py:135`），而出厂默认 128/128/128 与 `64/512`、
+`head=256 + group=64 + block=256` 等形状可编译。`validate_kivi_geometry` 的整除
+规则比这更宽，宿主换 `block_size` 前请用 `scripts/npu_probe_kivi_geometry.py`
+复测（测量表见 `docs/validation-int4-20260920.md` 第 10 节；尚无可靠公式）。
+
 当前已验证的宿主基线为 vLLM-HUST `8a6655cf62` 和
 vLLM-Ascend-HUST `f4f49832`（覆盖 INT8 端到端）。INT4 的打包内核、gather，以及
 prefill / decode / chunked prefill 三条注意力分支、**多请求 ragged 批量

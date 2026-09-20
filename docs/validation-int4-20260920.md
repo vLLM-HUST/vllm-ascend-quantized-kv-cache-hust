@@ -294,7 +294,40 @@ RESULT: PASS                     # 出厂几何同样 PASS（tie flips: 3）
 顺带把"逐档比较（含平局一档）"的实现抽成 `scripts/kivi_probe_reference.py`，
 生成探针与本探针共用，不再各写一份规则。
 
-## 10. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
+## 10. 几何包络：block_size ≠ residual_length 与内核编不过的形状（本轮新增）
+
+前面所有设备跑法都是 `block_size == residual_length`——那是窗口/块算术唯一不可能
+分歧的组合。把两值错开后（`block=32/residual=64`、`block=64/residual=32`、出厂
+`block=128/residual=256`），单请求注意力、批量 ragged、多步生成三种探针**全部
+`RESULT: PASS`**；顺带暴露注意力探针自己把 block table 硬编码成两列，已在
+`6426f37` 改成按几何推导。
+
+更重要的是发现**通过 `validate_kivi_geometry` 的形状不等于跑得起来的形状**。
+`scripts/npu_probe_kivi_geometry.py` 直接调真 triton 打包内核扫了 15 个合法形状：
+
+```text
+ head  group  block  blk*head  result
+   64     32    512     32768  ok
+  128     32    512     65536  ok
+  128     64    256     32768  ok
+  128    128    128     16384  ok          ← 出厂默认
+  128    128    256     32768  FAIL ub needs 201KiB > 192KiB
+  256    128    128     32768  ok
+  256    128    256     65536  FAIL ub needs 201KiB > 192KiB
+   64     64    512     32768  ok
+  256     64    256     65536  ok
+RESULT: 13/15 shapes compile
+```
+
+两个失败都是 bishengir 的 UB（片上统一缓冲）溢出，报错位置
+`ops/triton/kivi_pack.py:135`：`ub overflow, requires 1655040 bits while
+1572864 bits available`。它们的共同点是 **group_size=128 且 block_size=256**；
+而 `group=64, block=512`、`head=256, block=256` 都能过——所以我先前提的候选规则
+`group_size * block_size <= 16384` 被 `(64, 64, 512)` 直接证伪，这里只留测量结果、
+不写公式。结论对使用的影响：**出厂默认 128/128/128 在可编译包络内**，但宿主若把
+`block_size` 配成 256 且沿用 128 的量化组，内核会在运行期编译失败。
+
+## 11. 真宿主分派核对（`scripts/probe_host_dispatch.py`，本轮脚本化）
 
 此前这一节是一次性手工脚本的产物，改成本仓脚本后立刻暴露出一个被它掩盖的
 宿主漂移：那份手工代码自己 `enable_cp = lambda: False`，而该 revision 的宿主
@@ -342,7 +375,7 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
   第一次调用的结果会被永久缓存；脚本要换 CP 配置必须 `cache_clear()`。真实
   serve 里 config 固定，所以不影响。
 
-## 11. 安装态核对（`scripts/probe_installed_plugin.py`，本轮新增）
+## 12. 安装态核对（`scripts/probe_installed_plugin.py`，本轮新增）
 
 前面所有检查都在源码树上跑（`PYTHONPATH=src`）。但 vLLM 真正使用这个插件的
 方式是：**安装的发行包 + `vllm.general_plugins` entry point**。把 wheel 装到
@@ -389,7 +422,7 @@ python -m pip install --target /tmp/kivi-probe --no-deps dist/*.whl
 PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py
 ```
 
-## 12. 仍未完成
+## 13. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器宿主
   （vllm-hust `f18cf803c5`）的 `CacheDType` 是 pydantic 校验过的
@@ -404,7 +437,7 @@ PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py
     [type=literal_error, input_value='int8', input_type=str]
   ```
 
-  分派本身已在第 10 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
+  分派本身已在第 11 节用真宿主类验通（脚本里用 `object.__setattr__` 绕过该
   Literal），剩下的就是 `docs/int4-host-integration.md` 那四处宿主改动。
   另外，插件 README/HOST_CONTRACT 锁定的基线 `8a6655cf62` 在这两个宿主
   checkout 的历史里都不存在（`git cat-file -t` 均报 not a valid object），
