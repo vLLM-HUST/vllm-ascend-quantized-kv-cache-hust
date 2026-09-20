@@ -85,6 +85,12 @@ KIVI_PROBE_BLOCK=128 KIVI_PROBE_RESIDUAL=128 \
 python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期仍误编译）
 ```
 
+分派是否真的接到宿主类，用宿主 venv 里的脚本验（不需要 NPU）：
+
+```bash
+python scripts/probe_host_dispatch.py  # 真实 AscendAttentionBackend 的 dtype -> impl
+```
+
 四个设备探针在 2026-09-20 的 910B2 复验结果记录在
 `validation-int4-20260920.md`。注意因果 prefill 的掩码必须用宿主
 `AttentionMaskBuilder` 给的 `int8 [2048, 2048]` split-fuse 掩码，自己拼

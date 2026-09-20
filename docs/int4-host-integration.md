@@ -6,12 +6,25 @@ INT4 语义与内核、以及把宿主给的两张缓冲切成 6 个视图。剩
 给**两张等大通配缓冲**，其余由插件负责。
 
 证据来自本地 checkout（非插件锁定基线，接合时需按目标基线复核）：
-`vllm-hust@ba82f2122`、`vllm-ascend-hust@b0613602f`。
+`vllm-hust@ba82f2122`、`vllm-ascend-hust@b0613602f`。910B2 容器上的宿主
+（`vllm-hust@f18cf803c5`、`vllm-ascend-hust@17ed0571d`）另有一组行号，见下表
+最后一列；两处结论一致，只是行号漂移。
+
+| 接合点 | 本地 checkout | 容器 checkout |
+|---|---|---|
+| `CacheDType` 字面量 | `vllm/config/cache.py:19`（16 个取值） | `vllm/config/cache.py:39`（18 个取值）——两边都不含 `int8`/`kivi_int4` |
+| `get_kv_cache_shape` | `vllm_ascend/attention/attention_v1.py:104` | 同文件 `:135`（两处都恒返回稠密形状、忽略 `cache_dtype_str`） |
+| 未传 `cache_dtype_str` 的调用点 | `model_runner_v1.py:4556` | 同文件 `:4784`、`:4845` |
+| CP 探测助手 | `enable_cp()`（`attention/utils.py:101`） | 只有 `enable_dcp():238` / `enable_pcp():243`，插件已同时支持（`fb046ec`） |
 
 ## 1. 宿主需要改的四处
 
-1. **CLI 字面量**：`vllm/config/cache.py:19`（`CacheDType`）增
-   `"kivi_int4"`。`_validate_cache_dtype` 只记日志、不校验额外配置，所以
+1. **CLI 字面量**：`vllm/config/cache.py`（`CacheDType`）增 `"kivi_int4"`。
+   该字段是 pydantic 校验的 `Literal`，所以容器宿主上连
+   `--kv-cache-dtype int8` 都会在构造 `CacheConfig` 时报
+   `ValidationError: Input should be 'auto', ...`（实测见
+   `docs/validation-int4-20260920.md` 第 7 节）——不加字面量根本走不到插件。
+   `_validate_cache_dtype` 只记日志、不校验额外配置，所以
    加字面量 + 下面两处映射即可，不需要运行时 hack。
 2. **量化模式与页大小**：`vllm/v1/kv_cache_interface.py:33`（`KVQuantMode`）
    增 `KIVI_INT4`，`get_kv_quant_mode:62` 加字面量分支，
@@ -61,10 +74,14 @@ region_bytes = num_blocks * block_size * num_kv_heads * S
 PYTHONPATH=src python -m pytest -q
 python scripts/check_int4_patch_parity.py     # 移植对账（补丁不变量）
 
+# 宿主 venv：dtype 字面量 -> impl 类是否接到真实 AscendAttentionBackend
+python scripts/probe_host_dispatch.py
+
 # 910B2：打包/gather 逐位 + 端到端
 python scripts/npu_probe_kivi_key.py
 python scripts/npu_probe_kivi_dim.py
 python scripts/npu_smoke_kivi.py
+python scripts/npu_probe_kivi_attention.py   # prefill / decode / chunked 三分支
 vllm serve MODEL --kv-cache-dtype kivi_int4 --max-model-len 8192 --enforce-eager
 ```
 

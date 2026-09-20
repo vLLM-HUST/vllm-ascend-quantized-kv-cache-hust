@@ -50,9 +50,13 @@ head_size=128 / group_size=128 下约 **3.6x**（int4 数据本身是 4x，scale
 fail closed。非量化 dtype 不应由插件拒绝，而应保持宿主原有行为。
 
 当前已验证的宿主基线为 vLLM-HUST `8a6655cf62` 和
-vLLM-Ascend-HUST `f4f49832`（覆盖 INT8 端到端）。INT4 的打包内核、gather 与
-注意力通路已在 910B2 容器 `vllm-hust-cyj-21rc-cloud-container-86` 上逐位复验
-通过（记录见 `docs/validation-int4-20260920.md`），但该容器上的宿主
-`CacheDType` 既无 `kivi_int4` 也无 `int8`，因此 **INT4 端到端 serving 仍未
-验证**，需先落地上面列出的宿主改动。对其他 commit 或发行版的兼容性不应仅根据
-`host_api_range` 推断，必须重新运行集成测试。
+vLLM-Ascend-HUST `f4f49832`（覆盖 INT8 端到端）。INT4 的打包内核、gather、以及
+prefill / decode / chunked prefill 三条注意力通路已在 910B2 容器
+`vllm-hust-cyj-21rc-cloud-container-86` 上逐位复验通过（记录见
+`docs/validation-int4-20260920.md`），分派也用 `scripts/probe_host_dispatch.py`
+在该容器的宿主（vLLM-HUST `f18cf803c5` / vLLM-Ascend-HUST `17ed0571d`）上核对
+通过。但 **INT4 端到端 serving 仍未验证**：该宿主 `CacheDType` 是 pydantic 校验
+的 `Literal`，既无 `kivi_int4` 也无 `int8`，CLI 阶段就会被拒，需先落地
+上面列出的宿主改动。同一宿主还把 `enable_cp()` 换成了
+`enable_dcp()`/`enable_pcp()`，插件两种形状都支持（`fb046ec`）。对其他 commit
+或发行版的兼容性不应仅根据 `host_api_range` 推断，必须重新运行集成测试。
