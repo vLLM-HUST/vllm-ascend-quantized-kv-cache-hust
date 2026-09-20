@@ -64,11 +64,6 @@ NUM_BLOCKS = R * PAGES_PER_REQ
 # fp16 dequantisation vs the triton packer's own rounding, for tokens that must
 # still be exact
 TOLERANCE = 1e-2
-# a quantised token may sit one level away from the reference: the normalised
-# value can land within ~1e-7 of an exact half (measured on 910B2: 7.49999973),
-# where the kernel's fp32 arithmetic and semantics.quantize_group round to
-# opposite levels.  One level is 2x the reference's own half-step error.
-TIE_LEVELS = 2.0
 
 
 def main() -> int:
@@ -107,27 +102,92 @@ def main() -> int:
         block = int(tables[req_idx, token // BLOCK])
         return block * BLOCK + token % BLOCK
 
-    def score(
-        got: torch.Tensor, expected: torch.Tensor, exact: torch.Tensor, split: int
-    ):
-        """Worst deviation, plus whether either region exceeded its own bound.
+    def group_stats(x: torch.Tensor, *, along_tokens: bool):
+        """Per-element (min, step) of the reference grid, as semantics groups it.
 
-        The quantised prefix may sit one level off at a rounding tie, so its
-        bound is a multiple of the reference's own half-step error; the exact
-        tail has no such excuse and must match to fp16 rounding.
+        Keys group along the token dim and values along the head dim; mirroring
+        that here is what makes a *level* comparison possible rather than a
+        fuzzy magnitude one.
+        """
+        work = x.float()
+        if along_tokens:
+            pad = (GROUP - work.shape[0] % GROUP) % GROUP
+            if pad:
+                work = torch.cat([work, work[-1:].expand(pad, *work.shape[1:])], 0)
+            grouped = work.view(-1, GROUP, *x.shape[1:])
+            mn = grouped.amin(dim=1, keepdim=True)
+            mx = grouped.amax(dim=1, keepdim=True)
+            scale = sem.group_scale(mn, mx, 4)
+            shape = tuple(x.shape)
+            return (
+                mn.expand_as(grouped).reshape(shape),
+                scale.expand_as(grouped).reshape(shape),
+            )
+        pad = (GROUP - work.shape[-1] % GROUP) % GROUP
+        if pad:
+            work = torch.cat([work, work[..., -1:].expand(*work.shape[:-1], pad)], -1)
+        grouped = work.view(*work.shape[:-1], -1, GROUP)
+        mn = grouped.amin(dim=-1, keepdim=True)
+        mx = grouped.amax(dim=-1, keepdim=True)
+        scale = sem.group_scale(mn, mx, 4)
+        shape = tuple(x.shape)
+        return mn.expand_as(grouped).reshape(shape), scale.expand_as(grouped).reshape(
+            shape
+        )
+
+    def prefix_check(
+        got: torch.Tensor,
+        expected: torch.Tensor,
+        exact: torch.Tensor,
+        *,
+        along_tokens: bool,
+    ) -> tuple[int, int]:
+        """Violations and tie flips in the quantised region.
+
+        An element may differ from the reference only by sitting on the
+        *adjacent* level, which happens when its normalised value is an exact
+        half -- the triton kernel and ``quantize_group`` break those in
+        opposite directions.  Such a flip is recognisable because both candidate
+        levels are equally close to the exact value.  Anything else counts,
+        in particular a token left in full precision: that is strictly closer to
+        the exact value than any level is, so the equidistance test rejects it.
+        """
+        got = got.float()
+        expected = expected.float()
+        exact = exact.float()
+        _, scale = group_stats(exact, along_tokens=along_tokens)
+        scale = scale.float()
+        diff = (got - expected).abs()
+        d_ref = (exact - expected).abs()
+        d_got = (exact - got).abs()
+        tie = (diff <= 1.05 * scale) & ((d_got - d_ref).abs() <= 0.05 * scale)
+        allowed = (diff <= 1e-3) | tie
+        return int((~allowed).sum()), int((tie & (diff > 1e-3)).sum())
+
+    def score(
+        got: torch.Tensor,
+        expected: torch.Tensor,
+        exact: torch.Tensor,
+        split: int,
+        *,
+        along_tokens: bool,
+    ):
+        """Violation count and worst deviation for the two regions.
+
+        The quantised prefix is checked level by level (see prefix_check); the
+        exact tail has no such excuse and must match to fp16 rounding.
         """
         worst = 0.0
         broken = 0
         ties = 0
         if split:
-            half_step = (exact[:split] - expected[:split]).abs().amax().item()
-            tol = max(TOLERANCE, TIE_LEVELS * half_step)
             diff = (got[:split] - expected[:split]).abs().amax().item()
             worst = max(worst, diff)
-            if diff > tol:
-                broken += 1
-            elif diff > TOLERANCE:
-                ties += 1
+            broken_here, ties_here = prefix_check(
+                got[:split], expected[:split], exact[:split], along_tokens=along_tokens
+            )
+            broken += broken_here
+            ties += ties_here
         if split < got.shape[0]:
             diff = (got[split:] - expected[split:]).abs().amax().item()
             worst = max(worst, diff)
@@ -176,18 +236,17 @@ def main() -> int:
             got_v = dense_v[offset : offset + length]
             offset += length
             k_worst, k_broken, k_ties = score(
-                got_k, expected_k, hist_k[i][:length], flushed
+                got_k, expected_k, hist_k[i][:length], flushed, along_tokens=True
             )
             v_worst, v_broken, v_ties = score(
-                got_v, expected_v, hist_v[i][:length], evicted
-            )
+                got_v, expected_v, hist_v[i][:length], evicted, along_tokens=False
+            )  # noqa: E501
             worst_k = max(worst_k, k_worst)
             worst_v = max(worst_v, v_worst)
             tie_flips[0] += k_ties + v_ties
-            if k_broken:
-                failures.append(f"{tag}: req-{i} keys deviate by {k_worst}")
-            if v_broken:
-                failures.append(f"{tag}: req-{i} values deviate by {v_worst}")
+            for what, count in (("keys", k_broken), ("values", v_broken)):
+                if count:
+                    failures.append(f"{tag}: req-{i} {what} off-grid x{count}")
             if length > hist_k[i].shape[0]:
                 failures.append(
                     f"{tag}: req-{i} gathered {length} > {hist_k[i].shape[0]}"
