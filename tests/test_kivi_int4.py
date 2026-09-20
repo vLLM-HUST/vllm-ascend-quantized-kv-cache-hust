@@ -1598,6 +1598,7 @@ def test_adapter_built_int4_impl_runs_the_pipeline(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "vllm_ascend", types.ModuleType("vllm_ascend"))
     monkeypatch.setitem(sys.modules, "vllm_ascend.attention", types.ModuleType("x"))
     monkeypatch.setitem(sys.modules, "vllm_ascend.attention.attention_v1", module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops", types.ModuleType("x"))
 
     backend._build_kivi_impl_cls.cache_clear()
     try:
@@ -1657,7 +1658,7 @@ def _stub_ascend_host(monkeypatch, host_impl_cls):
         monkeypatch.setitem(sys.modules, name, module)
         return module
 
-    for name in ("vllm", "vllm_ascend", "vllm_ascend.attention"):
+    for name in ("vllm", "vllm_ascend", "vllm_ascend.attention", "vllm_ascend.ops"):
         stub(name)
     vllm_config = stub("vllm.config")
     attention_v1 = stub("vllm_ascend.attention.attention_v1")

@@ -136,6 +136,7 @@ def host_stack(monkeypatch):
 
     stub("vllm_ascend")
     stub("vllm_ascend.attention")
+    stub("vllm_ascend.ops")
     attention_v1 = stub("vllm_ascend.attention.attention_v1")
     utils = stub("vllm_ascend.attention.utils")
 
@@ -246,6 +247,61 @@ def test_context_parallel_probe_fails_closed_without_host_helpers(
     monkeypatch.delattr(attention_utils, "enable_cp")
     with pytest.raises(RuntimeError, match="enable_dcp"):
         backend._context_parallel_enabled()
+
+
+def test_registration_touches_host_ops_before_the_attention_module(
+    monkeypatch, host_stack
+) -> None:
+    """``attention_v1`` cannot be the first ``vllm_ascend`` import.
+
+    On vllm-ascend-hust 17ed0571d that module re-enters ``vllm_ascend.ops``
+    through ``device_op`` and dies with ``ImportError: cannot import name
+    'DeviceOperator' from partially initialized module``, which took down plugin
+    registration when vLLM's ``load_general_plugins()`` ran before anything else
+    had touched the host. The guard therefore imports ``ops`` first; this test
+    records the order rather than trusting the comment.
+    """
+    import importlib
+    import importlib.abc
+    import importlib.machinery
+    import sys
+    import types
+
+    import vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend as backend
+
+    touched: list[str] = []
+
+    class Loader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return types.ModuleType(spec.name)
+
+        def exec_module(self, module):
+            pass
+
+    class Finder:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname != "vllm_ascend.ops":
+                return None
+            touched.append(fullname)
+            return importlib.machinery.ModuleSpec(fullname, Loader())
+
+    real_import_module = importlib.import_module
+
+    def spy(name, *args, **kwargs):
+        touched.append(name)
+        return real_import_module(name, *args, **kwargs)
+
+    # the fixture registered the ops stub; drop it so the guard has to earn it
+    sys.modules.pop("vllm_ascend.ops", None)
+    # a parent without __path__ fails submodule import before meta_path runs
+    monkeypatch.setattr(sys.modules["vllm_ascend"], "__path__", [], raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Finder(), *sys.meta_path])
+    monkeypatch.setattr(importlib, "import_module", spy)
+
+    module = backend._host_attention_v1()
+
+    assert touched == ["vllm_ascend.ops", "vllm_ascend.attention.attention_v1"]
+    assert module.AscendAttentionBackend is host_stack.backend
 
 
 def test_kivi_impl_composition_turns_on_kivi_state(monkeypatch, host_stack) -> None:

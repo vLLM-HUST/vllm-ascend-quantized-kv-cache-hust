@@ -31,6 +31,23 @@ def _require_cache_dtype(expected: str) -> None:
         )
 
 
+def _host_attention_v1():
+    """``vllm_ascend.attention.attention_v1``, regardless of import order.
+
+    On vllm-ascend-hust ``17ed0571d`` that module cannot be the *first*
+    ``vllm_ascend`` import: it goes through ``device_op`` into ``ops`` and back,
+    which raises ``ImportError: cannot import name 'DeviceOperator' from
+    partially initialized module``. Importing ``ops`` first breaks the cycle, so
+    registration works even in a process where the host's attention stack has
+    not been touched yet (``vllm.plugins.load_general_plugins()`` alone).
+    """
+    import importlib
+
+    import vllm_ascend.ops  # noqa: F401
+
+    return importlib.import_module("vllm_ascend.attention.attention_v1")
+
+
 def _context_parallel_enabled() -> bool:
     """Ask the host whether context parallel is on, across host revisions.
 
@@ -60,7 +77,7 @@ def _context_parallel_enabled() -> bool:
 
 @cache
 def _build_int8_impl_cls() -> type:
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+    AscendAttentionBackendImpl = _host_attention_v1().AscendAttentionBackendImpl
 
     from ...methods.int8_dynamic.attention_backend import (
         AscendInt8AttentionBackendMixin,
@@ -83,7 +100,7 @@ def _build_kivi_impl_cls() -> type:
     Only the ``kivi_int4`` cache dtype reaches this builder, so the literal is
     asserted by construction instead of sniffed out of the host's arguments.
     """
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+    AscendAttentionBackendImpl = _host_attention_v1().AscendAttentionBackendImpl
 
     from ...methods.kivi_int4.attention_backend import (
         AscendKiviInt4AttentionBackendMixin,
@@ -116,7 +133,8 @@ def install_kv_impl_dispatch() -> type:
     every other configuration to the original host factory.
     """
     from vllm.config import get_current_vllm_config
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+    AscendAttentionBackend = _host_attention_v1().AscendAttentionBackend
 
     if getattr(AscendAttentionBackend, _DISPATCH_MARKER, False):
         return AscendAttentionBackend
@@ -141,7 +159,7 @@ def install_kv_impl_dispatch() -> type:
 
 
 def _build_backend_cls(cache_dtype: str, class_name: str) -> type:
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+    AscendAttentionBackend = _host_attention_v1().AscendAttentionBackend
 
     class AscendKvAttentionBackend(AscendAttentionBackend):
         """Backend activated exclusively by one ``--kv-cache-dtype`` literal."""
