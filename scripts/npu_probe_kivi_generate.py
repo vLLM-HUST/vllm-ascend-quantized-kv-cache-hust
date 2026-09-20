@@ -14,12 +14,14 @@ After *every* step it compares the dequant-gathered cache against the pinned
 rule applied to the fp16 history accumulated alongside:
 
     flushed_keys   = ((total - 1) // residual_length) * residual_length
-    evicted_values = max(0, total - residual_length)
+    evicted_values = max(bulk_prefill_window, total - residual_length)
     expected       = quantise(that prefix) + keep the rest exact
 
 so a step that flushes early, late, or out of order shows up immediately.  The
-last steps also retire a request (its residual row must be freed) and cross-check
-the attention call against a direct ``npu_fused_infer_attention_score``.
+last steps also retire a request (its residual row must be freed), re-admit a
+fresh one onto that row -- a recycled row must not leak the previous request's
+full-precision tail -- and report how the int4 attention error tracks the
+history length against the same attention on the unquantized cache.
 
     python scripts/npu_probe_kivi_generate.py
     KIVI_PROBE_HEAD=128 KIVI_PROBE_KV_HEADS=8 KIVI_PROBE_GROUP=128 \
@@ -60,10 +62,12 @@ R = int(os.environ.get("KIVI_PROBE_SEQS", 2))
 STEPS = int(os.environ.get("KIVI_PROBE_STEPS", 2 * RESIDUAL + 3))
 PROMPT = max(GROUP, RESIDUAL // 2)
 PAGES_PER_REQ = -(-(PROMPT + STEPS + 1) // BLOCK) + 1
-NUM_BLOCKS = R * PAGES_PER_REQ
+NUM_BLOCKS = R * PAGES_PER_REQ  # a re-admitted request reuses freed blocks
 # fp16 dequantisation vs the triton packer's own rounding, for tokens that must
 # still be exact
 TOLERANCE = 1e-2
+# int4 attention may not exceed this multiple of the K/V rms at any history length
+ACCURACY_BOUND = 0.2
 
 
 def main() -> int:
@@ -118,10 +122,11 @@ def main() -> int:
             mn = grouped.amin(dim=1, keepdim=True)
             mx = grouped.amax(dim=1, keepdim=True)
             scale = sem.group_scale(mn, mx, 4)
-            shape = tuple(x.shape)
+            # back to one value per element, then drop the padding again
+            flat = tuple(x.shape[1:])
             return (
-                mn.expand_as(grouped).reshape(shape),
-                scale.expand_as(grouped).reshape(shape),
+                mn.expand_as(grouped).reshape((-1, *flat))[: x.shape[0]],
+                scale.expand_as(grouped).reshape((-1, *flat))[: x.shape[0]],
             )
         pad = (GROUP - work.shape[-1] % GROUP) % GROUP
         if pad:
@@ -131,8 +136,9 @@ def main() -> int:
         mx = grouped.amax(dim=-1, keepdim=True)
         scale = sem.group_scale(mn, mx, 4)
         shape = tuple(x.shape)
-        return mn.expand_as(grouped).reshape(shape), scale.expand_as(grouped).reshape(
-            shape
+        return (
+            mn.expand_as(grouped).reshape(shape),
+            scale.expand_as(grouped).reshape(shape),
         )
 
     def prefix_check(
@@ -304,7 +310,9 @@ def main() -> int:
     )
 
     # ---- decode loop: one token per request per step =========================
+    live = R - 1
     worst_loop_k = worst_loop_v = 0.0
+    trend: list[tuple[int, float]] = []
     for t in range(STEPS):
         keys = torch.randn(R, KVH, HEAD, device=DEV, dtype=torch.float16)
         kvs = torch.randn_like(keys)
@@ -337,6 +345,17 @@ def main() -> int:
         k_diff, v_diff = verify(lengths, f"step {t + 1}", bulk=False)
         worst_loop_k = max(worst_loop_k, k_diff)
         worst_loop_v = max(worst_loop_v, v_diff)
+        if (t + 1) % max(1, STEPS // 4) == 0 or t == STEPS - 1:
+            # int4 attention vs the same attention on the unquantized cache, as
+            # the history grows: this is the device-side accuracy trend.
+            exact_k = hist_k[live][: lengths[live]]
+            exact_v = hist_v[live][: lengths[live]]
+            fp16_ref = direct_fia(
+                queries[live : live + 1], exact_k, exact_v, [1], [lengths[live]]
+            )
+            kv_rms = float(exact_v.float().pow(2).mean().sqrt()) or 1.0
+            err = float((got[live : live + 1].float() - fp16_ref.float()).abs().max())
+            trend.append((lengths[live], err / kv_rms))
         if t == 0 or (t + 1) % max(1, STEPS // 5) == 0 or t == STEPS - 1:
             print(
                 f"step {t + 1}/{STEPS}: history={lengths[0]} "
@@ -347,8 +366,9 @@ def main() -> int:
             )
 
     # ---- retiring a request must free its residual row =======================
-    live = R - 1  # the retired request's history is no longer comparable: with
-    # its window released, its tail reads back as int4 history on purpose.
+    # the retired request's history is no longer comparable: with its window
+    # released, its tail reads back as int4 history on purpose, so only the
+    # survivor is verified from here on.
     keys = torch.randn(R, KVH, HEAD, device=DEV, dtype=torch.float16)
     kvs = torch.randn_like(keys)
     queries = torch.randn(R, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
@@ -429,11 +449,102 @@ def main() -> int:
         failures.append(f"generation ended off the operator ({marshalling})")
 
     print(
+        "int4 vs fp16 by history length (x K/V rms): "
+        + ", ".join(f"{length} -> {value:.4f}" for length, value in trend),
+        flush=True,
+    )
+    if trend and trend[-1][1] > ACCURACY_BOUND:
+        failures.append(f"long-context int4 error grew to {trend[-1][1]:.4f}")
+    print(
         f"generation: {STEPS} steps, worst deviation over the loop "
         f"keys={worst_loop_k:.6f} values={worst_loop_v:.6f}, "
         f"one-level tie flips tolerated: {tie_flips[0]}",
         flush=True,
     )
+    # ---- a new request must land on the freed row without stale reads =========
+    # Continuous batching reuses rows immediately: the retired row still holds
+    # req-0's slot ids and tensors, so a fresh request that gets that row must
+    # not have them surface in its own gather.
+    re_admitted = "req-new"
+    # deliberately not a whole window: this request must keep entries in the
+    # residual ring, so it has to be handed a row (a full-window prompt
+    # quantises everything and needs none, which would skip the reuse path)
+    re_prompt = RESIDUAL + GROUP // 2
+    # the allocator hands the retired request's own blocks straight back, so the
+    # newcomer writes into the slots the old request used -- exactly where a
+    # residual row that was not cleared would read another request's KV back out
+    new_tables = tables[:1].clone()
+    new_keys = torch.randn(re_prompt, KVH, HEAD, device=DEV, dtype=torch.float16)
+    new_values = torch.randn_like(new_keys)
+    new_queries = torch.randn(re_prompt, NUM_HEADS, HEAD, device=DEV).half()
+    new_slots = torch.tensor(
+        [int(new_tables[0, t // BLOCK]) * BLOCK + t % BLOCK for t in range(re_prompt)],
+        dtype=torch.long,
+        device=DEV,
+    )
+    new_md = metadata(
+        re_prompt,
+        [re_prompt],
+        "PrefillNoCache",
+        new_slots,
+        new_tables,
+        actual_seq_lengths_q=[re_prompt],
+        req_ids=[re_admitted],
+        num_prefills=1,
+        attn_mask=mask,
+    )
+    new_out = torch.zeros(re_prompt, NUM_HEADS, HEAD, device=DEV).half()
+    got_new = impl.forward(
+        None,
+        new_queries,
+        new_keys,
+        new_values,
+        (key_buf, value_buf),
+        new_md,
+        new_out,
+    )
+    torch.npu.synchronize()
+    row_new = impl._get_kivi_residual_row(re_admitted, create=False)
+    dense_k, dense_v = impl._gather_dequant_kivi_paged_cache(
+        new_tables, [re_prompt], torch.float16, [re_admitted]
+    )
+    flushed = (re_prompt // RESIDUAL) * RESIDUAL
+    evicted = max((re_prompt // RESIDUAL) * RESIDUAL, re_prompt - RESIDUAL)
+    expect_k = torch.cat(
+        [sem.fake_quant_key(new_keys[:flushed].float()), new_keys[flushed:].float()]
+    ).half()
+    expect_v = torch.cat(
+        [
+            sem.fake_quant_value(new_values[:evicted].float()),
+            new_values[evicted:].float(),
+        ]
+    ).half()
+    k_bad, k_ties = prefix_check(
+        dense_k[:flushed], expect_k[:flushed], new_keys[:flushed], along_tokens=True
+    )
+    v_bad, v_ties = prefix_check(
+        dense_v[:evicted], expect_v[:evicted], new_values[:evicted], along_tokens=False
+    )
+    tail_k = float((dense_k[flushed:] - expect_k[flushed:]).abs().max())
+    tail_v = float((dense_v[evicted:] - expect_v[evicted:]).abs().max())
+    print(
+        f"re-admission: {re_admitted} (history {re_prompt}) holds residual row "
+        f"{row_new}, retired {retiring} holds "
+        f"{impl._get_kivi_residual_row(retiring, create=False)}; violations "
+        f"k={k_bad} v={v_bad}, tie flips={k_ties + v_ties}, exact tails "
+        f"{tail_k:.6f}/{tail_v:.6f}",
+        flush=True,
+    )
+    if row_new is None:
+        failures.append("re-admitted request got no residual row")
+    if not bool(torch.isfinite(got_new).all()):
+        failures.append("re-admitted request produced NaN/Inf")
+    if k_bad or v_bad or tail_k > TOLERANCE or tail_v > TOLERANCE:
+        failures.append(
+            f"re-admitted request reads stale or wrong rows (k={k_bad}/{tail_k}, "
+            f"v={v_bad}/{tail_v})"
+        )
+
     print("RESULT:", "PASS" if not failures else f"FAIL {failures}", flush=True)
     return 1 if failures else 0
 

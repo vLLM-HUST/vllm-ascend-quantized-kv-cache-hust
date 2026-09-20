@@ -369,6 +369,29 @@ def test_sync_windows_releases_finished_and_keeps_live() -> None:
     assert impl._get_kivi_residual_row("live", create=False) is not None
 
 
+def test_sync_prunes_residual_slots_the_request_no_longer_owns() -> None:
+    """A rolled-back request must not keep full-precision entries for slots it
+    no longer owns, or its next gather splices them back into the sequence."""
+    impl = _make_impl(residual_length=2 * GROUP)
+    value = torch.randn(4, NUM_KV_HEADS, HEAD_SIZE)
+    impl._store_kivi_residual_entries(
+        value, torch.tensor([0, 1, 2, 3]), req_key="r", is_key=False
+    )
+    stored, _ = impl._collect_kivi_residual_window("r", is_key=False)
+    assert stored == [0, 1, 2, 3]
+
+    # the scheduler rolls the request back to two tokens: slots 2 and 3 are no
+    # longer part of its sequence
+    impl._sync_kivi_residual_windows(
+        torch.tensor([[0]], dtype=torch.long), [2], ["r"]
+    )
+    stored, tensors = impl._collect_kivi_residual_window("r", is_key=False)
+    assert stored == [0, 1]
+    assert tensors is not None and tensors.shape[0] == 2
+    # the request itself keeps its row -- only the stale slots go
+    assert impl._get_kivi_residual_row("r", create=False) is not None
+
+
 def test_bind_kivi_cache_rejects_bad_layouts() -> None:
     impl = _make_impl()
     with pytest.raises(RuntimeError, match="6-tuple"):
