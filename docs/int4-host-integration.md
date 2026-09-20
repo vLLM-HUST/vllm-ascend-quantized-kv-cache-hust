@@ -76,6 +76,9 @@ python scripts/check_int4_patch_parity.py     # 移植对账（补丁不变量�
 
 # 宿主 venv：dtype 字面量 -> impl 类是否接到真实 AscendAttentionBackend
 python scripts/probe_host_dispatch.py
+# 安装态：wheel + entry point 经 vllm.plugins.load_general_plugins() 自动注册
+python -m pip install --target /tmp/kivi-probe --no-deps dist/*.whl
+PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py
 
 # 910B2：打包/gather 逐位 + 端到端
 python scripts/npu_probe_kivi_key.py

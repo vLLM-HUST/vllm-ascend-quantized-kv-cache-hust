@@ -1,13 +1,13 @@
 # INT4 (KIVI) 910B2 验证记录 — 2026-09-20
 
 设备验证容器：`vllm-hust-cyj-21rc-cloud-container-86`。代码为 `feat/int4`
-分支 `20989f0` 的干净工作树（`/root/qkv-verify-f684231`，由
+分支 `6a1dc4b` 的干净工作树（`/root/qkv-verify-f684231`，由
 `git worktree add --detach` 创建，`git status --short` 为空）。设备固定在
 空闲卡上运行：`ASCEND_RT_VISIBLE_DEVICES=4`。
 
-下面整套（第 1~9 节）在 `0c61df8` 上完整跑过一遍并全部通过；其后的提交只动
-INT4 探针与 CPU 测试（`git diff 0c61df8..20989f0 -- src` 为空，插件实现未改），
-受影响的多步生成、批量解码与 pytest 已在 `20989f0` 重跑通过。
+设备套件（第 1~8 节）在 `0c61df8` 上完整跑过一遍并全部通过；其后的提交里，
+`6a1dc4b` 改了插件实现（宿主导入顺序），所以第 9 节分派核对、第 10 节安装态
+核对与 87 个 CPU 测试都在 `6a1dc4b` 上重跑通过，设备探针本身未受影响。
 
 | 项目 | 值 |
 |---|---|
@@ -20,7 +20,7 @@ INT4 探针与 CPU 测试（`git diff 0c61df8..20989f0 -- src` 为空，插件�
 ## 1. CPU 侧（同一台机器、同一份代码）
 
 ```text
-PYTHONPATH=src python -m pytest -q        -> 86 passed
+PYTHONPATH=src python -m pytest -q        -> 87 passed
 python scripts/check_int4_patch_parity.py -> PASS（补丁不变量全部在位）
 python -m ruff check . / ruff format --check . -> All checks passed / 已格式化
 ```
@@ -310,7 +310,54 @@ fail-closed、重复安装不改选），`int8`/`kivi_int4` 两个 mixin 都在�
   第一次调用的结果会被永久缓存；脚本要换 CP 配置必须 `cache_clear()`。真实
   serve 里 config 固定，所以不影响。
 
-## 10. 仍未完成
+## 10. 安装态核对（`scripts/probe_installed_plugin.py`，本轮新增）
+
+前面所有检查都在源码树上跑（`PYTHONPATH=src`）。但 vLLM 真正使用这个插件的
+方式是：**安装的发行包 + `vllm.general_plugins` entry point**。把 wheel 装到
+源码树之外、只通过 vLLM 自己的加载器跑一遍，当场暴露一个会拦住启动的缺陷：
+
+```text
+entry point: vllm_ascend_quantized_kv_cache.bootstrap:register_plugins
+  File "/tmp/kivi-probe/.../adapters/vllm_ascend_hust/register.py", line 43, in register
+    host_backend = install_kv_impl_dispatch()
+  File "/root/vllm/vllm-ascend-hust/vllm_ascend/ops/fused_moe/moe_mlp.py", line 22, in <module>
+ImportError: cannot import name 'DeviceOperator' from partially initialized module
+             'vllm_ascend.device.device_op' (most likely due to a circular import)
+```
+
+原因：插件的注册在"宿主 attention 栈还没被碰过"的进程里第一次 import
+`vllm_ascend.attention.attention_v1`，而该 revision 的这个模块会经
+`device_op` 反向 import `vllm_ascend.ops`，只有自己先被 import 过才不炸。
+第 9 节的手工/脚本检查都先 `import vllm_ascend.ops`，所以把这个坑遮住了——
+又是"探针替被测对象做了准备工作"的典型（见 `PROVENANCE.md` 之外的教训）。
+**INT8 也一样中招**（`60cd123` 起就是这个写法），所以这个修复对已发布的
+INT8 路径同样是必需的。
+
+修好后（注册改走 `_host_attention_v1()`：先 `import vllm_ascend.ops`，再用
+`importlib.import_module` 取模块，并由 CPU 测试盯住这个顺序）：
+
+```text
+entry point: vllm_ascend_quantized_kv_cache.bootstrap:register_plugins  (dist vllm-ascend-quantized-kv-cache)
+[vllm-ascend-quantized-kv] registered quantized KV attention backends; enable one of them with --kv-cache-dtype int8_dynamic, kivi_int4
+[vllm-hust-knorm] runtime patches registered; activate with VLLM_KNORM_ENABLED=1 ...
+package loaded from: /tmp/kivi-probe/vllm_ascend_quantized_kv_cache/__init__.py
+auto       -> AscendAttentionBackendImpl     ok
+int8       -> AscendInt8KvAttentionImpl      ok
+kivi_int4  -> AscendKiviInt4KvAttentionImpl  ok
+RESULT: PASS
+```
+
+顺带确认两件事：插件与这台机器上另一个 vLLM 插件（`vllm-hust-knorm`）在同一次
+`load_general_plugins()` 里和平共存；注册的包确实来自安装目录而不是仓库
+`src`（脚本会检查并拒绝源码树导入）。复现：
+
+```bash
+python -m build --wheel
+python -m pip install --target /tmp/kivi-probe --no-deps dist/*.whl
+PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py
+```
+
+## 11. 仍未完成
 
 - **端到端 `vllm serve --kv-cache-dtype kivi_int4`**：该容器宿主
   （vllm-hust `f18cf803c5`）的 `CacheDType` 是 pydantic 校验过的

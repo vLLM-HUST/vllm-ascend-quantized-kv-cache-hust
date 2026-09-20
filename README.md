@@ -152,6 +152,13 @@ aclnn 对过，差异只有输出 rms 的 0.005。实验性融合 gather 仍误�
 `enable_cp()` 换成 `enable_dcp()`/`enable_pcp()`，旧分派在真机上一选量化 dtype
 就 `ImportError`。
 
+**安装态也验过**：把 wheel 装到源码树之外，只用 vLLM 自己的
+`load_general_plugins()` 触发 entry point，插件正常挂上并交出 INT4 实现类
+（`scripts/probe_installed_plugin.py`）。这一步顺带修掉一个会拦住启动的缺陷：
+注册路径在宿主的 attention 栈尚未导入时直接 import `attention_v1`，会撞上该
+宿主 revision 的循环导入（`ImportError: cannot import name 'DeviceOperator'`），
+**已发布的 INT8 路径同样中招**，修复见 `6a1dc4b`。
+
 **仍未验证的是端到端 serving**：该容器宿主的 `CacheDType` 是 pydantic 校验的
 `Literal`，`kivi_int4`（和 `int8`）都不在其中，CLI 层面就会被拒；宿主还需按
 上面的字节预算给每层分配两张等大缓冲，并暴露

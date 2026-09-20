@@ -93,6 +93,8 @@ python scripts/npu_probe_kivi_dim.py   # 实验性融合 gather 探针（预期�
 
 ```bash
 python scripts/probe_host_dispatch.py  # 真实 AscendAttentionBackend 的 dtype -> impl
+python -m pip install --target /tmp/kivi-probe --no-deps dist/*.whl
+PYTHONPATH=/tmp/kivi-probe python scripts/probe_installed_plugin.py  # 安装态
 ```
 
 这些设备探针（2026-09-20，HEAD `84e5ab3`）的复验结果记录在
