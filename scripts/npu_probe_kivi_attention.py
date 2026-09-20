@@ -47,7 +47,10 @@ KVH = int(os.environ.get("KIVI_PROBE_KV_HEADS", 2))
 GROUP = int(os.environ.get("KIVI_PROBE_GROUP", 32))
 BLOCK = int(os.environ.get("KIVI_PROBE_BLOCK", 32))
 RESIDUAL = int(os.environ.get("KIVI_PROBE_RESIDUAL", 32))
-NUM_HEADS = KVH
+# real models are grouped-query: every kv head serves several query heads.
+# KIVI_PROBE_GQA=7 gives the Llama-style 28Q/4KV split.
+GQA = int(os.environ.get("KIVI_PROBE_GQA", 1))
+NUM_HEADS = KVH * GQA
 SCALE = HEAD**-0.5
 NUM_BLOCKS = int(os.environ.get("KIVI_PROBE_BLOCKS", 4))
 MAX_SEQS = int(os.environ.get("KIVI_PROBE_SEQS", 2))
@@ -60,7 +63,7 @@ class _HostImplShim:
     def __init__(self, vllm_config):
         self.num_heads = NUM_HEADS
         self.num_kv_heads = KVH
-        self.num_queries_per_kv = 1
+        self.num_queries_per_kv = GQA
         self.head_size = HEAD
         self.scale = SCALE
         self.vllm_config = vllm_config
@@ -191,7 +194,9 @@ def main() -> int:
     # ---- prefill (PrefillNoCache): packs via the triton kernels, attends dense
     pre_key = torch.randn(PREFILL_TOKENS, KVH, HEAD, device=DEV, dtype=torch.float16)
     pre_value = torch.randn_like(pre_key)
-    pre_query = torch.randn_like(pre_key)
+    pre_query = torch.randn(
+        PREFILL_TOKENS, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16
+    )
     slots = torch.arange(PREFILL_TOKENS, dtype=torch.long, device=DEV)
     out = torch.zeros(PREFILL_TOKENS, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     mask = host_causal_mask()
@@ -220,7 +225,7 @@ def main() -> int:
     # ---- decode: the plugin gathers history + residual, then calls FIA once
     dec_key = torch.randn(1, KVH, HEAD, device=DEV, dtype=torch.float16)
     dec_value = torch.randn_like(dec_key)
-    dec_query = torch.randn_like(dec_key)
+    dec_query = torch.randn(1, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     seq_len = PREFILL_TOKENS + 1
     dec_slots = torch.tensor([PREFILL_TOKENS], dtype=torch.long, device=DEV)
     block_tables = torch.tensor([[0, 1]], dtype=torch.long, device=DEV)
@@ -285,8 +290,8 @@ def main() -> int:
             )
 
     print(
-        f"geometry: head={HEAD} kv_heads={KVH} group={GROUP} block={BLOCK} "
-        f"residual={RESIDUAL} tokens={PREFILL_TOKENS}",
+        f"geometry: head={HEAD} kv_heads={KVH} q_heads={NUM_HEADS} group={GROUP} "
+        f"block={BLOCK} residual={RESIDUAL} tokens={PREFILL_TOKENS}",
         flush=True,
     )
     # ---- chunked prefill: a decode row plus an all-new prompt row ============
@@ -300,7 +305,7 @@ def main() -> int:
         ]
     )
     tables = torch.tensor([[0, 1], [2, 2]], dtype=torch.long, device=DEV)
-    ck_query = torch.randn(rows, KVH, HEAD, device=DEV, dtype=torch.float16)
+    ck_query = torch.randn(rows, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     ck_key = torch.randn(rows, KVH, HEAD, device=DEV, dtype=torch.float16)
     ck_value = torch.randn_like(ck_key)
     ck_md = metadata(

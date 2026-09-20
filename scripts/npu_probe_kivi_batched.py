@@ -106,8 +106,9 @@ def main() -> int:
     failures: list[str] = []
 
     print(
-        f"geometry: head={HEAD} kv_heads={KVH} group={GROUP} block={BLOCK} "
-        f"residual={RESIDUAL} seqs={R} histories={LENS} blocks={NUM_BLOCKS}",
+        f"geometry: head={HEAD} kv_heads={KVH} q_heads={NUM_HEADS} group={GROUP} "
+        f"block={BLOCK} residual={RESIDUAL} seqs={R} histories={LENS} "
+        f"blocks={NUM_BLOCKS}",
         flush=True,
     )
 
@@ -116,7 +117,9 @@ def main() -> int:
     for i, length in enumerate(LENS):
         pre_key = torch.randn(length, KVH, HEAD, device=DEV, dtype=torch.float16)
         pre_value = torch.randn_like(pre_key)
-        pre_query = torch.randn_like(pre_key)
+        pre_query = torch.randn(
+            length, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16
+        )
         slots = torch.tensor(
             [slot_for(tables[i], t) for t in range(length)],
             dtype=torch.long,
@@ -144,7 +147,7 @@ def main() -> int:
     seq_lens = [length + 1 for length in LENS]
     dec_key = torch.randn(R, KVH, HEAD, device=DEV, dtype=torch.float16)
     dec_value = torch.randn_like(dec_key)
-    dec_query = torch.randn_like(dec_key)
+    dec_query = torch.randn(R, NUM_HEADS, HEAD, device=DEV, dtype=torch.float16)
     slots = torch.tensor(
         [slot_for(tables[i], LENS[i]) for i in range(R)],
         dtype=torch.long,
