@@ -1571,3 +1571,142 @@ def test_adapter_built_int4_impl_runs_the_pipeline(monkeypatch) -> None:
         assert torch.equal(got, reference)
     finally:
         backend._build_kivi_impl_cls.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# one flow: kv_methods.activate -> host dispatch -> composed impl -> cache
+# binding -> forward, plus the negative case where the host hands over a
+# dense cache it never re-sized for int4.
+# ---------------------------------------------------------------------------
+
+
+def _stub_ascend_host(monkeypatch, host_impl_cls):
+    """Install the host surfaces the plugin's activation pipeline touches."""
+    import importlib.machinery
+    import sys
+    import types
+    from types import SimpleNamespace as NS
+
+    def stub(name):
+        module = types.ModuleType(name)
+        module.__spec__ = importlib.machinery.ModuleSpec(name, None)
+        monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    for name in ("vllm", "vllm_ascend", "vllm_ascend.attention"):
+        stub(name)
+    vllm_config = stub("vllm.config")
+    attention_v1 = stub("vllm_ascend.attention.attention_v1")
+    utils = stub("vllm_ascend.attention.utils")
+
+    cache_config = NS(
+        cache_dtype="kivi_int4", kivi_group_size=GROUP, kivi_residual_length=2 * GROUP
+    )
+    vllm_config.get_current_vllm_config = lambda: NS(
+        cache_config=cache_config, scheduler_config=NS(max_num_seqs=2)
+    )
+    utils.enable_cp = lambda: False
+
+    class HostBackend:
+        @staticmethod
+        def get_impl_cls():
+            return host_impl_cls
+
+    attention_v1.AscendAttentionBackend = HostBackend
+    attention_v1.AscendAttentionBackendImpl = host_impl_cls
+    return HostBackend, cache_config
+
+
+def test_activate_dispatch_binds_and_runs_the_int4_impl(monkeypatch) -> None:
+    from vllm_ascend_quantized_kv_cache import kv_methods
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust import backend
+
+    residual = 2 * GROUP
+
+    class HostAttentionImpl(_StubBase):
+        def __init__(self, *args, **kwargs):
+            self.num_heads = NUM_KV_HEADS
+            self.vllm_config = SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    kivi_group_size=GROUP, kivi_residual_length=residual
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=2),
+            )
+
+    host_backend, cache_config = _stub_ascend_host(monkeypatch, HostAttentionImpl)
+    backend._build_kivi_impl_cls.cache_clear()
+    try:
+        info = kv_methods.activate("kivi_int4", host="vllm_ascend_hust")
+        assert info["cache_dtype_literal"] == "kivi_int4"
+        assert "--kv-cache-dtype kivi_int4" in info["usage"]
+
+        impl_cls = host_backend.get_impl_cls()
+        assert impl_cls is not HostAttentionImpl
+        assert issubclass(impl_cls, ab.AscendKiviInt4AttentionBackendMixin)
+
+        cache_config.cache_dtype = "auto"
+        assert host_backend.get_impl_cls() is HostAttentionImpl
+        cache_config.cache_dtype = "kivi_int4"
+
+        impl = host_backend.get_impl_cls()()
+        assert impl.enable_kivi is True
+        assert impl.kivi_group_size == GROUP
+        assert impl.kivi_residual_length == residual
+
+        key_buf, value_buf, _ = _byte_caches(num_blocks=4, block_size=BLOCK)
+        impl._bind_kivi_cache((key_buf, value_buf))
+        _install_cpu_packers(impl)
+
+        tokens = residual + 1
+        torch.manual_seed(71)
+        out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        got = impl.forward(
+            None,
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            (key_buf, value_buf),
+            _metadata(tokens),
+            out,
+        )
+        assert torch.isfinite(got).all() and got.abs().sum() > 0
+        assert key_buf.any() and value_buf.any()
+    finally:
+        backend._build_kivi_impl_cls.cache_clear()
+
+
+def test_dense_host_cache_is_refused_not_misviewed(monkeypatch) -> None:
+    """A cache the host never re-sized for int4 must fail loudly.
+
+    The plugin views two byte buffers as the int4 history. If a host accepts
+    the ``kivi_int4`` literal but still allocates the dense ``(block, heads,
+    head_size)`` fp16 pair, the byte totals must not line up -- otherwise the
+    pack kernels would silently scribble over a wrongly-sized region.
+    """
+    impl = _make_impl(residual_length=2 * GROUP)
+    dense_key = torch.zeros(4, BLOCK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+    dense_value = torch.zeros_like(dense_key)
+
+    with pytest.raises(RuntimeError, match="must hold|whole number of pages"):
+        impl._bind_kivi_cache((dense_key, dense_value))
+    assert impl.k_quant_cache.shape[-1] == BLOCK // 8  # previous binding untouched
+
+
+def test_byte_view_entry_rejects_buffers_that_do_not_fit() -> None:
+    """The public view entry checks both sides, not just the inferred layout.
+
+    A view over a too-small buffer would let the pack kernels write past the
+    allocation, so the byte check has to hold even when a caller supplies a
+    layout that matches the key side only.
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        kivi_caches_from_byte_tensors,
+    )
+
+    key_buf, value_buf, layout = _byte_caches(num_blocks=4, block_size=BLOCK)
+    short_value = value_buf[:-1]
+
+    with pytest.raises(RuntimeError, match="value cache must hold"):
+        kivi_caches_from_byte_tensors(key_buf, short_value, layout)
+    with pytest.raises(RuntimeError, match="key cache must hold"):
+        kivi_caches_from_byte_tensors(key_buf[:-1], value_buf, layout)
