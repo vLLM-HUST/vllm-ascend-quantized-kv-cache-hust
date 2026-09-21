@@ -6,4 +6,4 @@ Bundle 指南要求静态 manifest 里的 ``bundle_version`` 与
 manifest、测试断言）都引用它。
 """
 
-__version__ = "0.2.0rc1"
+__version__ = "0.2.0rc2"
