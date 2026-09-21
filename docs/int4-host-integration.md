@@ -62,11 +62,15 @@ customize_spec(FullAttentionSpec(block=128, kvh=8, head=128, uint8, KIVI_INT4))
 - `vllm_ascend/attention/attention_v1.py` 原本没 import `KVQuantMode`，按量化模式
   分支时要补。
 
-端到端生成（`scripts/npu_e2e_kivi_generate.py`，宿主副本 + 安装态 wheel）在
-`kv_cache_dtype="kivi_int4"` 下已通过 `CacheConfig` 校验并由 entry point 完成插件
-注册（日志：`registered quantized KV attention backends; ... kivi_int4`）；
-逐 token 的输出与 fp16 对照仍在这次运行中，结论以
-`docs/validation-int4-20260920.md` 后续修订为准。
+端到端生成（`scripts/npu_e2e_kivi_generate.py`，宿主副本 + 安装态 wheel）目前
+推进到：`kv_cache_dtype="kivi_int4"` 通过 `CacheConfig` 校验、entry point 完成插件
+注册（日志 `registered quantized KV attention backends; ... kivi_int4`）、模型权重
+加载并拉起 EngineCore。**尚未跑通的部分与 INT4 无关**：EngineCore 子进程报
+`ModuleNotFoundError: No module named 'acl'`，而**同样的 fp16 对照运行报同一个错**，
+即副本用 `PYTHONPATH` 遮蔽宿主安装包后，Ascend 运行时绑定在 fork 出的子进程里丢了；
+要在副本上跑完端到端，需要把 `acl` 所在目录一并传给子进程（或在宿主副本上用
+`pip install -e` 重装而非 PYTHONPATH 遮蔽）。逐 token 输出与 fp16 的对照结论等这一步
+补齐后再写进 `docs/validation-int4-20260920.md`。
 
 好消息是分配器已经天然给两张等大缓冲：`_reshape_kv_cache_tensors`
 （`model_runner_v1.py:4562-4567`）用 `k_shape = kv_cache_shape[1:]`、
