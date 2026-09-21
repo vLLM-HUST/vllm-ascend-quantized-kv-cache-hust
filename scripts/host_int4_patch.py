@@ -145,7 +145,8 @@ def edits(vllm: Path, ascend: Path) -> list[tuple[Path, str, str]]:
         ),
         (
             attn,
-            "from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec\n",
+            "from vllm.v1.kv_cache_interface import "
+            "AttentionSpec, CrossAttentionSpec\n",
             "from vllm.v1.kv_cache_interface import (\n"
             "    AttentionSpec,\n"
             "    CrossAttentionSpec,\n"
