@@ -39,4 +39,4 @@ jobs:
           "
       - name: Validate Bundle v1 manifest
         run: |
-          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend'}; assert len(p['components'])==1"
+          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend-hust'}; assert len(p['components'])==1"

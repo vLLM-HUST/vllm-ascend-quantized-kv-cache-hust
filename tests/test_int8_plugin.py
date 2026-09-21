@@ -128,7 +128,7 @@ def test_bundle_v1_contains_only_int8_backend() -> None:
     )
     payload = json.loads(manifest_path.read_text())
     assert payload["schema_version"] == "1.0"
-    assert payload["host"] == {"provider": "vllm", "name": "vllm-ascend"}
+    assert payload["host"] == {"provider": "vllm", "name": "vllm-ascend-hust"}
     assert len(payload["components"]) == 1
     component = payload["components"][0]
     assert component["component_id"] == "int8-kv-attention-backend"

@@ -5,7 +5,7 @@
   "host_api_range": ">=1,<2",
   "host": {
     "provider": "vllm",
-    "name": "vllm-ascend"
+    "name": "vllm-ascend-hust"
   },
   "components": [
     {
