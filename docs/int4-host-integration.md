@@ -41,6 +41,33 @@ INT4 语义与内核、以及把宿主给的两张缓冲切成 6 个视图。剩
    同时 `vllm_ascend/worker/model_runner_v1.py:4556` 调用该函数时**没有传
    `cache_dtype_str`**，要把 spec/配置里的 dtype 传下去，否则分支永远不生效。
 
+这四处改动已写成可重复执行的脚本 `scripts/host_int4_patch.py`，并在本容器宿主的
+一份**副本**（`/tmp/host4-int4`，原 checkout 未改动）上落地验证：
+
+```text
+AscendAttentionBackend.get_kv_cache_shape(7, 128, 8, 128, "kivi_int4")
+  -> (2, 7, 128, 8, 72)            # S=72，与第 2 节公式一致
+customize_spec(FullAttentionSpec(block=128, kvh=8, head=128, uint8, KIVI_INT4))
+  .page_size_bytes -> 147456 == 2 * 128 * 8 * 72   # 与 CPU 契约测试同一口径
+```
+
+副本上另外踩到三个细节，接合时要一并处理：
+
+- 该 revision 的通用 reshape 路径有**两处**调用 `get_kv_cache_shape`（hybrid
+  block 分支与普通分支），两处都要补 `cache_dtype_str`；只补一处时，出厂几何实际
+  走到的那一处仍返回稠密形状。
+- 辅助常量/函数必须放在**被装饰的类之外**（`@register_backend(...)` 之上）。写在
+  类体内、但缩进回到模块级，`py_compile` 仍然通过，类却被静默截断，症状是
+  `AscendAttentionBackend has no attribute 'get_kv_cache_shape'`。
+- `vllm_ascend/attention/attention_v1.py` 原本没 import `KVQuantMode`，按量化模式
+  分支时要补。
+
+端到端生成（`scripts/npu_e2e_kivi_generate.py`，宿主副本 + 安装态 wheel）在
+`kv_cache_dtype="kivi_int4"` 下已通过 `CacheConfig` 校验并由 entry point 完成插件
+注册（日志：`registered quantized KV attention backends; ... kivi_int4`）；
+逐 token 的输出与 fp16 对照仍在这次运行中，结论以
+`docs/validation-int4-20260920.md` 后续修订为准。
+
 好消息是分配器已经天然给两张等大缓冲：`_reshape_kv_cache_tensors`
 （`model_runner_v1.py:4562-4567`）用 `k_shape = kv_cache_shape[1:]`、
 `v_shape = k_shape`，与 INT4 要求的"两侧字节数相等"完全一致。
