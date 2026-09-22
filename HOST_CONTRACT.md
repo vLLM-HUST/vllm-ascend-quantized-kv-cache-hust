@@ -4,7 +4,7 @@
 的推理进程中。Manifest 宿主标识固定为：
 
 ```json
-{"host": {"provider": "vllm", "name": "vllm-ascend"}}
+{"host": {"provider": "vllm", "name": "vllm-ascend-hust"}}
 ```
 
 它依赖三个现有宿主表面：

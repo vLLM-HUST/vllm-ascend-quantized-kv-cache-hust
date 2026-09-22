@@ -19,6 +19,12 @@ test = ["pytest>=8", "ruff>=0.12"]
 [project.entry-points."vllm.general_plugins"]
 "vllm-ascend-int8-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
 
+# Static discovery hook for vLLM-HUST Extension Manager.  Discovery reads the
+# manifest without importing this package; runtime registration remains on the
+# official vLLM general-plugin hook above.
+[project.entry-points."vllm_hust.extension_bundles"]
+"org.vllm-hust.ascend-int8-kv-cache" = "vllm_ascend_quantized_kv_cache.extension_manager_manifest"
+
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 

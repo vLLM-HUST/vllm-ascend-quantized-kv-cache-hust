@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import tomllib
 
 import pytest
 
@@ -133,6 +134,40 @@ def test_bundle_v1_contains_only_int8_backend() -> None:
     component = payload["components"][0]
     assert component["component_id"] == "int8-kv-attention-backend"
     assert component["implementation_ref"].endswith(":AscendInt8KvAttentionBackend")
+
+
+def test_extension_manager_bundle_is_static_and_preserves_runtime_hook() -> None:
+    project_root = Path(__file__).parents[1]
+    pyproject = tomllib.loads((project_root / "pyproject.toml").read_text())
+    entry_points = pyproject["project"]["entry-points"]
+
+    assert entry_points["vllm.general_plugins"] == {
+        "vllm-ascend-int8-kv-cache": (
+            "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+        )
+    }
+    assert entry_points["vllm_hust.extension_bundles"] == {
+        "org.vllm-hust.ascend-int8-kv-cache": (
+            "vllm_ascend_quantized_kv_cache.extension_manager_manifest"
+        )
+    }
+
+    manifest_path = (
+        project_root
+        / "src/vllm_ascend_quantized_kv_cache/extension_manager_manifest/"
+        "vllm-hust-extension-v0.2.json"
+    )
+    payload = json.loads(manifest_path.read_text())
+    assert payload["schema_version"] == "0.2-experimental"
+    assert payload["extension_id"] == "org.vllm-hust.ascend-int8-kv-cache"
+    assert payload["kind"] == "in_process_plugin"
+    assert payload["activation"]["entry_points"] == [
+        {
+            "group": "vllm.general_plugins",
+            "name": "vllm-ascend-int8-kv-cache",
+        }
+    ]
+    assert payload["activation"]["additional_config"] == {}
 
 
 def test_runtime_backend_uses_migrated_host_implementation() -> None:

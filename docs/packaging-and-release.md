@@ -17,9 +17,16 @@ python -m pip install --no-deps dist/*.whl
 python -c 'from importlib.resources import files; print(files("vllm_ascend_quantized_kv_cache").joinpath("manifests", "vllm-hust-extension-v1.json"))'
 ```
 
-部署时 Python 包必须安装到运行 `vllm` 的同一个环境。Bundle v1 静态准入
-需要时，通过 `VLLM_EXTENSION_MANIFESTS` 显式传入 manifest 绝对路径；
-不要依赖自定义 bundle entry point 扫描。
+部署时 Python 包必须安装到运行 `vllm` 的同一个环境。直接启动时由
+`vllm.general_plugins` 注册运行时后端。Extension Manager 部署时，wheel 的
+`vllm_hust.extension_bundles` entry point 供 Manager 无导入地发现
+`extension_manager_manifest/vllm-hust-extension-v0.2.json`；该发现入口不会
+自行启用 INT8 后端。该目录与保留 v1 manifest 的 `manifests/` 分离，因为
+Manager 要求每个发现入口只对应一份 manifest。
+
+当前 Extension Manager 的 vLLM Provider 不会自动添加
+`--kv-cache-dtype int8`，因此在 Provider 支持该选项前，Manager 启动命令仍须
+显式包含该参数。
 
 ## 发布到 PyPI
 
