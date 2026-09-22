@@ -12,7 +12,11 @@ dependencies = []
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "ruff>=0.12"]
+test = [
+  "pytest>=8",
+  "ruff>=0.12",
+  "tomli>=2; python_version < '3.11'",
+]
 
 # Runtime plugin hook. It registers the backend; --kv-cache-dtype int8 is the
 # explicit activation switch.
