@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-import tomllib
 
 import pytest
+import tomllib
 
 from vllm_ascend_quantized_kv_cache import (
     KVQuantMode,
@@ -153,8 +153,7 @@ def test_extension_manager_bundle_is_static_and_preserves_runtime_hook() -> None
     }
 
     manifest_path = (
-        project_root
-        / "src/vllm_ascend_quantized_kv_cache/extension_manager_manifest/"
+        project_root / "src/vllm_ascend_quantized_kv_cache/extension_manager_manifest/"
         "vllm-hust-extension-v0.2.json"
     )
     payload = json.loads(manifest_path.read_text())
