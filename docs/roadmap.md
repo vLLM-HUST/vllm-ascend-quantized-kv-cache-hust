@@ -10,7 +10,7 @@
 | 方案 | 做到哪一步 | 差什么 |
 |---|---|---|
 | `int8_dynamic` | 代码全有，命令行可用 | 没在引擎里端到端跑过 |
-| `kivi_int4` | 最扎实：910B2 上 13 节设备验证全过，Qwen3.5-35B-A3B 形状有专项测试 | 端到端 serve 没跑；真实模型精度没测 |
+| `kivi_int4` | 最扎实：910B2 上 13 节设备验证全过，Qwen3.5-35B-A3B 形状有专项测试；**端到端 serve 已跑通**（2026-10-03，稠密模型实测，KV 并发 3.56x 兑现，见 [serving-verification-20261003.md](serving-verification-20261003.md)） | decode 吞吐待融合读路径；真实模型精度待测 |
 | `fp8_per_token_head` | dtype 解析、布局、CPU 参考数学、写入内核都有（本周完成） | 读路径没写；没上机；命令行没接 |
 | 四个纯格式 | 只在 dev 分支 | — |
 
@@ -70,12 +70,11 @@ Palu 的 SVD——和我们"不读 checkpoint、免校准"的定位冲突）；
 ## 4. 接下来值得做的（按这个顺序）
 
 **第 0 步：把两个能用的方案补完（基线，先做）**
-在打榜服务器上跑 int4 端到端 serve（对照 fp16），然后测模型级精度。
-- 验收：serve 起得来、逐 token 输出和 fp16 对比无乱码、长上下文
-  精度有数。跑长上下文评测前先确认绕开 FIA 掩码 bug #15503
-  （KV 位置 512 之后掩码静默失效，不排除它数字全不可信）。
-- 注意：serve 要 `--enforce-eager` + 不开 chunked prefill + 关前缀
-  缓存；引擎启动超时要调大 `VLLM_ENGINE_READY_TIMEOUT_S`。
+✅ 端到端 serve 已跑通（2026-10-03，稠密模型：int8 49 tok/s、
+kivi_int4 4.3 tok/s、KV 并发 2.0x/3.56x 精确兑现，细节见
+[serving-verification-20261003.md](serving-verification-20261003.md)）。
+剩两件：Qwen3.5 上的真实数字（卡在宿主树落后两拍，见该文档 §4）、
+模型级精度评测。跑长上下文评测前先确认绕开 FIA 掩码 bug #15503。
 
 **第 1 步：fp8_per_token_head 补完**
 写读路径（注意力带 per-token-head scale 读缓存）→ 910B2 上机比对

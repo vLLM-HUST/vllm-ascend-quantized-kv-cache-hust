@@ -11,7 +11,7 @@ KV cache 是长上下文推理的显存大头（128k 上下文的 70B 模型，f
 | 方案 | 一句话 | 压缩 | 代码 | 910B2 验证 | 命令行可选 |
 |---|---|---|---|---|---|
 | [`int8_dynamic`](schemes/int8-dynamic.md) | 每通道动态 scale 的 int8 | 2x | ✅ | 选实现对过，引擎内没端到端跑过 | ✅ `int8` |
-| [`kivi_int4`](schemes/kivi-int4.md) | 近期 token 保 fp16，更早压 int4 | ~3.6x | ✅ | ✅ 13 节设备记录 | ✅ `kivi_int4`（缺端到端 serve） |
+| [`kivi_int4`](schemes/kivi-int4.md) | 近期 token 保 fp16，更早压 int4 | ~3.6x | ✅ | ✅ 13 节设备记录；端到端 serve 已跑通（[实测](serving-verification-20261003.md)） | ✅ `kivi_int4` |
 | [`fp8_per_token_head`](schemes/fp8-per-token-head.md) | 每 (token, head) 一个 scale 的 E4M3 | 1.94x | 写入内核有，读路径没有 | ❌ | ❌ |
 | [四个纯格式](schemes/packed-formats.md) | 只声明格式，不算 | 2–3.6x | 只在 dev 分支 | ❌ | ❌ |
 
