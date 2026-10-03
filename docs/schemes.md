@@ -1,7 +1,7 @@
-# 量化 KV cache：模块含义与六个方案的差异
+# 量化 KV cache：模块含义与七个方案的差异
 
 本文回答三个问题：这个模块**是干什么的**（§1）、KV cache 量化的
-**基本原理**（§2）、六个方案的**语义差异与选型**（§3–§5）。
+**基本原理**（§2）、七个方案的**语义差异与选型**（§3–§5）。
 运行方法见 [how-to-run.md](how-to-run.md)，NPU 实现细节见
 [npu-implementation.md](npu-implementation.md)。
 
@@ -30,7 +30,7 @@ fp4 块微缩（4.5 bit/元素，~3.6x），
 - **不是**离线模型权重量化，也不是 Adaptive Quantized KV observer 项目
   （见 README 的技术所有权声明）。
 - **是**一个方案库 + 宿主适配层：把 legacy 分支里验证过的量化实现
-  （出处见 [../PROVENANCE.md](../PROVENANCE.md)）整理成六个自注册
+  （出处见 [../PROVENANCE.md](../PROVENANCE.md)）整理成七个自注册
   "方案"，统一暴露三层能力：
   1. **契约**（`resolve_layout`）：dtype 字符串 → 存储布局
      （存储 dtype / 打包维度），全库唯一裁决处 `dtypes.py`；
@@ -66,13 +66,15 @@ fp4 块微缩（4.5 bit/元素，~3.6x），
 | `nvfp4` | uint8 | 72（64B 数据+8B scale） | 4.5 bit/元素 | **~3.6x** |
 | `fp8_e4m3` | uint8 | 128 | 8 bit | **2x** |
 
-## 3. 六个方案分述
+## 3. 七个方案分述
 
-六个方法分两个家族：**有状态家族**（int8_dynamic、kivi_int4，自带完整
+七个方法分两个家族：**有状态家族**（int8_dynamic、kivi_int4，自带完整
 NPU attention 前向实现）与 **格式方法家族**（packed format：int4_packed、
 fp4_e2m1、fp8_e4m3、
 nvfp4，语义类只负责存储 dtype 与 scale 元数据，量化计算由宿主
-attention backend 内核执行）。
+attention backend 内核执行）。第七个方案 `fp8_per_token_head`（2026-10
+起脚手架）归有状态家族：契约、字节布局、CPU 参考语义与 store 内核
+已落地，读通路与适配器未移植，CLI 不可选（见 §4 总表行与 §4.1 排序）。
 
 ### 3.1 `int8_dynamic` — 动态 per-channel INT8
 
@@ -114,7 +116,7 @@ attention backend 内核执行）。
   dequant-gather（**刻意不走**上游融合 gather 内核，原因见
   [npu-implementation.md](npu-implementation.md) §3.3）。
 - **适合**：追求 4x 级节省且能接受残差窗口精度兜底的长上下文场景；
-  这是六个方案里工程状态机最复杂的一个（残差 ring buffer、flush
+  这是有状态方案里工程状态机最复杂的一个（残差 ring buffer、flush
   状态机、请求行分配，见 npu-implementation.md §4）。
 
 ### 3.3 格式方法家族：`int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4`
@@ -166,6 +168,7 @@ attention backend 内核执行）。
 |---|---|---|---|---|---|---|---|
 | `int8_dynamic` | 2x | per-channel (head,dim) | 动态（首 prefill amax，之后固定） | 有状态 | torch_npu fused attention 在线 antiquant | scheme + impl 手术 | CUSTOM backend，字面量 `int8_per_token_head` |
 | `kivi_int4` | 4x（历史区）+ fp16 残差 | 键 per-token-group / 值 per-head-dim-group，非对称 | 动态（flush 时算） | 有状态 | triton-ascend pack + torch gather | scheme + impl 手术 | CUSTOM backend，字面量 `int4_per_token_head` |
+| `fp8_per_token_head` | 1.94x（head 128：256B→132B） | per (token, head) | 动态（写入时 amax/448，逐 token 更新） | 有状态（store 内核；读通路未移植） | triton-ascend store 已移植、**未上机验证** | **不可选**（契约/布局/CPU 语义已立，适配器缺位 fail-closed） | 原生字面量（triton 后端） |
 | `int4_packed` | 4x | per-token-head | 动态（backend 内） | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_INT4`） | CUSTOM backend，字面量 `int4_per_token_head` |
 | `fp4_e2m1` | ~3.6x | 16 元素块 | 块内 fp8 指数 scale（随数据走） | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_FP4_E2M1`） | **不可用**（无 dtype 字面量，fail-closed） |
 | `fp8_e4m3` | 2x | per-tensor | 静态或动态 | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_FP8_E4M3`） | CUSTOM backend，字面量 `fp8_e4m3` |
@@ -177,7 +180,31 @@ attention backend 内核执行）。
 宿主环境，属宿主集成路线图项。vllm-hust 的 CUSTOM backend 适配器是
 接口就绪的脚手架。
 
+### 4.1 在 Ascend 910B2 上的落地排序（2026-10-03）
+
+判据先行（详见 [kvquant-schemes-beyond-int8-int4.md](kvquant-schemes-beyond-int8-int4.md)
+§7.3/§9.3）：注意力内核吃不到低比特时，一切压缩都**只是容量收益、不是
+带宽收益**；per-token-head 的 triton 路线不需要任何厂商新算子，是成本
+最低的增量；旋转类不融合内核就是带宽净损失，**不融合就不合并**。
+
+| 序 | 方案 | 当前状态（feat/int4） | 下一步 | 为什么在这个位置 |
+|---|---|---|---|---|
+| 0 | `int8_dynamic` / `kivi_int4` | 已路由；int4 缺端到端 serve | 910B2 端到端验证 + 模型级精度 | 两个已验证的基线，后续排序都相对它们 |
+| 1 | `fp8_per_token_head` | 契约 + 布局 + CPU 参考 + store 内核已落（未上机、未路由） | 设备对拍 + 编译包络 → FIA 读通路 → 接线 | 宿主 triton 后端原生声明，零厂商算子；scale 逐 token 更新，补 int8_dynamic "scale 陈旧"短板 |
+| 2 | `int8_per_token_head` | 未立项（`IS_INT_QUANT` 分支已随 store 内核带入） | fp8 验证后近乎免费地开变体 | 同一内核、同一布局（S=head+4），边际成本最低 |
+| 3 | TurboQuant（`turboquant_4bit_nc` 口径） | 宿主有完整实现 + 纯 triton 内核；NPU 侧未做 | 对齐上游 #15198/#15821 认领，先按代码 `slot_size` 反推字节口径 | 4bit 之下最现实的台阶（旋转 + 16 级 LUT 与 int4 反量化同构）；**按容量记收益**（GPU 口径吞吐只有 BF16 的 66–80%） |
+| 4 | `kivi_int4` + 融合 RHT 旋转 | 未立项；宿主有 `single_rht` 参考 | SAW-INT4 式块对角 Hadamard 融进 pack 内核 + Q 侧配对旋转 | 显著降组内离群、往 3bit/2bit 推的必经之路；**融合不进内核就不做** |
+| 5 | GEAR 式稀疏修正 | 未立项 | 先只做离群稀疏修正（不做低秩 matmul，避免读路径增流） | KIVI flush 时误差本来就可得，是"下一个便宜的加法" |
+| — | `nvfp4` / fp4 系、FP8 attention、MXFP8/HiF8 KV | 契约 fail-closed | 等 950 代际硬件能力位 | A2 系无 FP8 注意力能力（#8102）；NVFP4 锁 Blackwell |
+| — | 格码（QTIP 系）、熵编码、加性 VQ | 不排期 | — | 判定为不可服务化：串行解码 / 数据相关 / 重写注意力内层循环 |
+
+排序表里的外部数字（TurboQuant 压缩/PPL、OSCAR 口径等）在自建
+benchmark 之前只当口径参考，不当结论（出处与核验状态见调研文档）。
+
 ## 5. 怎么选
+
+> 今天能选的只有两个已路由方案（§4.1 序 0）；序 1–5 是落地排序，不是
+> 现状。下述经验法则按此口径读。
 
 - **只想省一半显存、要最快跑通**：`int8_dynamic`。粒度细、无需打包、
   fused attention 原生支持 antiquant。
