@@ -22,12 +22,16 @@ from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.register import (
     BACKEND_CLASS_PATH_BY_DTYPE,
 )
 
-PUBLISHED_METHODS = ["int8_dynamic", "kivi_int4"]
+# 发现层（registry）的全部已知方法：含设备路径未接线的脚手架
+# （fp8_per_token_head 的契约/CPU 参考已立，triton 内核与适配器未移植）。
+KNOWN_METHODS = ["fp8_per_token_head", "int8_dynamic", "kivi_int4"]
+# 可路由方法（bootstrap.REGISTERED_METHODS）：adapter 已接线、dtype 可选。
+ROUTABLE_METHODS = ["int8_dynamic", "kivi_int4"]
 
 
 def test_published_methods_and_dtypes() -> None:
-    assert kv_methods.list() == PUBLISHED_METHODS
-    assert kv_methods.list(host="vllm_ascend_hust") == PUBLISHED_METHODS
+    assert kv_methods.list() == KNOWN_METHODS
+    assert kv_methods.list(host="vllm_ascend_hust") == KNOWN_METHODS
     assert kv_methods.describe("int8_dynamic")["dtype"] == "int8"
     assert kv_methods.describe("kivi_int4")["dtype"] == "kivi_int4"
     with pytest.raises(ValueError, match="unknown quantized KV method"):
@@ -84,11 +88,11 @@ def test_bootstrap_registers_every_quantized_kv_backend(monkeypatch) -> None:
             calls.append((name, host)) or {"backend_class_path": "unused"}
         ),
     )
-    assert bootstrap.register_plugins() == PUBLISHED_METHODS
-    assert calls == [(name, "vllm_ascend_hust") for name in PUBLISHED_METHODS]
+    assert bootstrap.register_plugins() == ROUTABLE_METHODS
+    assert calls == [(name, "vllm_ascend_hust") for name in ROUTABLE_METHODS]
 
 
-@pytest.mark.parametrize("method_name", PUBLISHED_METHODS)
+@pytest.mark.parametrize("method_name", ROUTABLE_METHODS)
 def test_adapter_installs_host_impl_dispatch(method_name: str, monkeypatch) -> None:
     import vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend as backend
 
