@@ -34,12 +34,16 @@ fp4 块微缩（4.5 bit/元素，~3.6x），
   "方案"，统一暴露三层能力：
   1. **契约**（`resolve_layout`）：dtype 字符串 → 存储布局
      （存储 dtype / 打包维度），全库唯一裁决处 `dtypes.py`；
-  2. **语义**（`sol.semantics`）：纯 torch 数学（scale 计算、打包/解包、
-     窗口簿记），CPU 可单测，同时是 NPU 内核的数值参考；
-  3. **宿主适配**（`sol.host_adapter(host)`）：把方案插进
-     vllm-ascend-hust 或 vllm-hust 的注册表。
+  2. **语义**（`methods/<方案>/semantics.py`）：纯 torch 数学
+     （scale 计算、打包/解包、窗口簿记），CPU 可单测，同时是 NPU
+     内核的数值参考；
+  3. **宿主适配**（`method.host_adapter(host)`，经
+     `adapters/vllm_ascend_hust`）：把方案插进宿主的
+     `get_impl_cls` 分派。
 - **设备边界**：内核层（triton-ascend / torch_npu）只在 Ascend NPU 上
   执行；任何设备路径在非 NPU 环境 fail-closed 并给出明确报错。
+- **各方案在本仓库（feat/int4 分支）的实际落地深度见 §4.2**——本文
+  §3 描述的是方案语义本身，不等于代码已在本树落地。
 
 ## 2. 原理速览：KV cache 量化在量化什么
 
@@ -121,6 +125,12 @@ attention backend 内核执行）。第七个方案 `fp8_per_token_head`（2026-
 
 ### 3.3 格式方法家族：`int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4`
 
+> **落地位置注意**：这四个方案的代码在 **dev 分支**（旧包名
+> `sol.*`），**feat/int4 树上不存在**——`src/` 下没有
+> `PackedFormatSemantics`，`dtypes.py` 也解析不了这四个 dtype
+> （见 §4.2 落地表）。本节描述的是 dev 分支的方案语义，供对照与
+> 回移参考。
+
 - **出处**：ascend#160/0001（+0004/0005/0007 gating 语境）。
 - **共同结构**：每个格式语义类（`PackedFormatSemantics` 子类）只有四个类级元数据
   （`scheme_key` / `cache_dtype` / `storage_torch_dtype_name` /
@@ -200,6 +210,38 @@ attention backend 内核执行）。第七个方案 `fp8_per_token_head`（2026-
 
 排序表里的外部数字（TurboQuant 压缩/PPL、OSCAR 口径等）在自建
 benchmark 之前只当口径参考，不当结论（出处与核验状态见调研文档）。
+
+### 4.2 本仓库落地情况（分支 feat/int4，2026-10-03）
+
+状态分层口径：**契约**（`dtypes.py` 能解析该 dtype）→ **语义/布局层**
+（纯 torch，CPU 可测）→ **内核**（triton-ascend / torch_npu）→
+**设备验证**（910B2 实测记录）→ **路由**（进
+`bootstrap.REGISTERED_METHODS`，CLI 的 `--kv-cache-dtype` 可选）。
+
+| 方案 | 契约 | 语义/布局层 | 内核 | 设备验证 | 路由 | 测试 |
+|---|---|---|---|---|---|---|
+| `int8_dynamic` | ✅ `int8` | ✅ `methods/int8_dynamic/semantics.py` | torch_npu FIA 在线 antiquant（decode/chunked/prefill 三前向分支，`attention_backend.py`） | 分派在真宿主验证（[validation-int4-20260920.md](validation-int4-20260920.md) §11）；前向分支为端口保真度，**端到端待宿主联调** | ✅ | `test_int8_dynamic.py`（2）+ `test_plugin.py` 公共路径 |
+| `kivi_int4` | ✅ `kivi_int4` | ✅ `methods/kivi_int4/{semantics,geometry,byte_cache}.py` | triton-ascend pack（`ops/triton/kivi_pack.py`）+ 纯 torch dequant-gather（`ops/kivi_gather.py`） | ✅ 13 节设备记录（[validation-int4-20260920.md](validation-int4-20260920.md)，`6146ab5` 全节逐位重放）；**端到端 serve 未跑** | ✅ | `test_kivi_int4.py`（48，含 Qwen3.5-35B-A3B 几何契约） |
+| `fp8_per_token_head` | ✅ `fp8_per_token_head` | ✅ `methods/fp8_per_token_head/{semantics,byte_cache}.py` | store：`ops/triton/per_token_head_store.py`（宿主 CUDA 参考 1:1 移植）；**FIA 读通路未移植** | ❌ 未上机（探针待答：fp8 指针 store 支持、编译包络） | ❌ 未路由（适配器缺位，`host_adapter` 抛 "no adapter wired"） | `test_fp8_per_token_head.py`（15：契约/布局/语义/内核校验器与启动契约） |
+| `int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4` | ❌ 本树不可解析 | ❌ 本树无代码（dev 分支，见 §3.3） | — | — | ❌ | — |
+
+落地物补充（不落在上表单元格里的横切件）：
+
+- **分派与注册**：`adapters/vllm_ascend_hust/backend.py`
+  （`get_impl_cls` 按 cache_dtype 分派、CP 一律 fail-closed、
+  未量化 dtype 原样委托宿主）——真宿主分派核对与安装态（wheel +
+  entry point 经 `load_general_plugins()`）都在 validation 记录
+  §11/§12 验过；`bootstrap.py` 是 `vllm.general_plugins` 入口，
+  注册 ≠ 启用。
+- **内核辅助**：`ops/kivi_layout.py`（打包内核的布局校验器，CPU 可测）；
+  `ops/triton/kivi_gather_experimental.py`（triton-ascend 3.5 误编译，
+  保留但**不路由**，validation 记录 §5）。
+- **复现口径**：`PYTHONPATH=src python -m pytest -q` → 108 passed
+  （2026-10-03，HEAD `873a015` 之后）；宿主补丁脚本
+  `scripts/host_int4_patch.py` 与对账 `scripts/check_int4_patch_parity.py`。
+- **未完成清单**（与 §4.1 排序衔接）：int4 端到端 serve、模型级精度、
+  fp8 读通路 + 设备验证、ACL Graph 路径（int4/int8 均无捕获分支，
+  先 `--enforce-eager`）。
 
 ## 5. 怎么选
 
