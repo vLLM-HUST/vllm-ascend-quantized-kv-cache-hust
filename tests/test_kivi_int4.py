@@ -1399,6 +1399,104 @@ def test_forward_at_production_geometry_on_byte_buffers() -> None:
     assert 3.5 < layout.compression_vs_fp16() < 3.7
 
 
+def test_forward_at_qwen35_geometry_on_byte_buffers() -> None:
+    """head 256 / kv 1 per rank / GQA 8:1 -- Qwen3.5-35B-A3B under TP=2.
+
+    The shipped-default test above pins 128/8; this pins the leaderboard
+    model's geometry (config: 16 q heads, 2 kv heads, head_dim 256, so TP=2
+    serves 8 q / 1 kv heads per rank).  head_size % group_size == 0 holds
+    (256 % 128), the pack kernel measured compilable at (256, 128, 128) on
+    910B2, and S grows to 144 B/token/head/side while the 3.56x compression
+    ratio stays put (the scale/min terms amortise the same way).
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_caches_from_byte_tensors,
+    )
+
+    head, kvh, block, group = 256, 1, 128, 128
+    residual = 128
+    num_blocks = 3
+    tokens = residual + 1
+    num_heads = 8 * kvh  # per-rank GQA: 8 query heads share 1 kv head
+
+    layout = KiviByteCacheLayout(
+        num_blocks=num_blocks,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    assert layout.bytes_per_token_head == 144  # 128 int4 + 2x8 scale/min
+    key_buf = torch.zeros(
+        num_blocks, block, kvh, layout.bytes_per_token_head, dtype=torch.uint8
+    )
+    value_buf = torch.zeros_like(key_buf)
+    assert key_buf.numel() == layout.region_bytes
+
+    impl = _make_impl(
+        residual_length=residual,
+        head_size=head,
+        num_kv_heads=kvh,
+        group_size=group,
+        block_size=block,
+        num_blocks=num_blocks,
+    )
+    impl.num_heads = num_heads
+    impl.num_queries_per_kv = num_heads // kvh
+    _install_cpu_packers(impl)
+
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=residual,
+            block_size=block,
+        )
+    )
+    torch.manual_seed(35)
+    query = torch.randn(tokens, num_heads, head)
+    key = torch.randn(tokens, kvh, head)
+    value = torch.randn(tokens, kvh, head)
+    out = torch.zeros(tokens, num_heads, head)
+
+    md = _metadata(
+        tokens,
+        block_tables=torch.tensor([[0, 1]], dtype=torch.long),
+        req_ids=["r"],
+    )
+    impl.forward(None, query, key, value, (key_buf, value_buf), md, out)
+    assert out.shape == (tokens, num_heads, head) and torch.isfinite(out).all()
+
+    k_quant, k_scale, k_mn, v_quant, v_scale, v_mn = kivi_caches_from_byte_tensors(
+        key_buf, value_buf, layout
+    )
+    assert k_quant.shape == (num_blocks, kvh, head, block // 8)
+    assert k_scale.shape == (num_blocks, kvh, head, 1)  # one group per block
+    assert v_quant.shape == (num_blocks, block, kvh, head // 8)
+    assert v_scale.shape == (num_blocks, block, kvh, head // group)  # 2 head groups
+
+    # 128 keys flushed as a single aligned group into block 0, token 128 stayed
+    # exact; values evict only the oldest slot.  The GQA ratio only widens the
+    # query, so the expected K/V are identical to the kvh-sized reference.
+    expected_k = torch.cat([sem.fake_quant_key(key[:residual]), key[residual:]])
+    expected_v = torch.cat([sem.fake_quant_value(value[:1]), value[1:]])
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        torch.tensor([[0, 1]], dtype=torch.long), [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5)
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5)
+
+    # the two equal host regions: same S on both sides at this asymmetric
+    # geometry (key scales per (head,dim), value scales per head group).
+    assert layout.key_bytes == layout.value_bytes == layout.region_bytes
+    assert layout.compression_vs_fp16() == pytest.approx(
+        2 * head / layout.bytes_per_token_head, rel=1e-9
+    )
+    assert 3.5 < layout.compression_vs_fp16() < 3.7
+
+
 # ---------------------------------------------------------------------------
 # kernel-boundary validators (moved out of the triton module so CPU tests can
 # reach them) and their agreement with the state machine's own gate.
