@@ -461,30 +461,6 @@ class AscendKiviInt4AttentionBackendMixin:
             lane_of_slot[slot] = tail
             row_lane_slot[tail] = slot
 
-    def _lookup_kivi_residual_tensor(
-        self,
-        slot: int,
-        *,
-        req_key: str,
-        is_key: bool,
-        target_dtype: Any,
-        target_device: Any | None = None,
-    ) -> torch.Tensor | None:
-        slot_ids, cache = self._get_kivi_residual_buffers(is_key=is_key)
-        row_idx = self._get_kivi_residual_row(req_key, create=False)
-        if row_idx is None:
-            return None
-        slot_row = slot_ids[row_idx]
-        match = (slot_row == slot).nonzero(as_tuple=False)
-        if match.numel() == 0:
-            return None
-
-        lane = int(match[0].item())
-        tensor = cache[row_idx, lane]
-        if target_device is None:
-            target_device = tensor.device
-        return tensor.to(device=target_device, dtype=target_dtype)
-
     def _gather_kivi_residual_tensors(
         self, slots: list[int], *, req_key: str, is_key: bool
     ) -> torch.Tensor:
@@ -833,22 +809,6 @@ class AscendKiviInt4AttentionBackendMixin:
         else:
             self._write_kivi_value_quant_cache(tensors, slot_tensor)
         self._clear_kivi_residual_entries(slots, req_key=req_key, is_key=is_key)
-
-    def _flush_kivi_key_batches(self, req_key: str, window_slots: list[int]) -> None:
-        while len(window_slots) >= self.kivi_residual_length:
-            flush_slots = window_slots[: self.kivi_residual_length]
-            if not self._is_aligned_kivi_key_window(flush_slots):
-                break
-            self._flush_kivi_slots(flush_slots, req_key=req_key, is_key=True)
-            del window_slots[: self.kivi_residual_length]
-
-    def _flush_kivi_value_batches(self, req_key: str, window_slots: list[int]) -> None:
-        if len(window_slots) < self.kivi_residual_length:
-            return
-
-        flush_slots = window_slots[:1]
-        self._flush_kivi_slots(flush_slots, req_key=req_key, is_key=False)
-        del window_slots[:1]
 
     def _sync_kivi_residual_windows(
         self,
