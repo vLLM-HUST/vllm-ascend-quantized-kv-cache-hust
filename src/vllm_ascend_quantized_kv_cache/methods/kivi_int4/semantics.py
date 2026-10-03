@@ -229,18 +229,26 @@ class KiviInt4Semantics:
 
         绝对槽位 = block_id * block_size + 块内偏移；这是残差窗口与
         分页缓存之间的"地址簿"。
+
+        向量化实现：每请求一次 gather + 一次 ``tolist()``，替代逐位置
+        ``.item()``（真机上那是一次 host-device 同步，serving 每步会对
+        全部历史长度执行一遍）。负 block_id（未分配块）产生的槽位必为
+        负数（``-block + (block-1) = -1`` 是上界），所以 ``>= 0`` 过滤与
+        逐位置版``if block_id >= 0``完全等价。
         """
         block_table = block_table.to(torch.long)
+        max_len = max((int(s) for s in seq_lens), default=0)
+        if max_len == 0:
+            return [[] for _ in seq_lens]
+        positions = torch.arange(max_len)
+        slots = (
+            block_table[:, positions // block_size] * block_size
+            + positions % block_size
+        )
         ordered_slots: list[list[int]] = []
         for req_idx, seq_len in enumerate(seq_lens):
-            req_slots: list[int] = []
-            for pos in range(int(seq_len)):
-                block_pos = pos // block_size
-                block_offset = pos % block_size
-                block_id = int(block_table[req_idx, block_pos].item())
-                if block_id >= 0:
-                    req_slots.append(block_id * block_size + block_offset)
-            ordered_slots.append(req_slots)
+            row = slots[req_idx, : int(seq_len)]
+            ordered_slots.append(row[row >= 0].tolist())
         return ordered_slots
 
     def is_aligned_key_window(self, window_slots: list[int], block_size: int) -> bool:

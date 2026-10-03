@@ -138,6 +138,48 @@ def test_is_aligned_key_window() -> None:
     assert not sem.is_aligned_key_window(crossing, block_size)
 
 
+def test_ordered_slots_matches_per_position_reference() -> None:
+    """The vectorized slot expansion must equal the naive per-position walk.
+
+    Random tables include unallocated (-1) blocks and hole rows; the -1
+    case is the subtle one: a negative block id can never alias a valid
+    absolute slot (block * block_size + offset <= -1), so the ``>= 0``
+    filter is exactly the old ``if block_id >= 0``.
+    """
+    torch.manual_seed(11)
+
+    def reference(block_table, seq_lens, block_size):
+        out = []
+        for req_idx, seq_len in enumerate(seq_lens):
+            slots = []
+            for pos in range(int(seq_len)):
+                block_id = int(block_table[req_idx, pos // block_size].item())
+                if block_id >= 0:
+                    slots.append(block_id * block_size + pos % block_size)
+            out.append(slots)
+        return out
+
+    for trial in range(8):
+        batch, cols, block = 5, 6, 32
+        table = torch.randint(0, 40, (batch, cols))
+        table[torch.rand_like(table.float()) < 0.25] = -1  # unallocated blocks
+        table[2, :] = -1  # a request whose whole table is holes
+        lens = [[0, 7, 3 * block + 11, 1, 6 * block], [block], [1], [0, 0, 0]][
+            trial % 4
+        ]
+        want = reference(table, lens, block)
+        got = KiviInt4Semantics.ordered_slots(table, lens, block)
+        assert got == want, f"trial {trial}: {got} != {want}"
+
+    assert (
+        KiviInt4Semantics.ordered_slots(torch.zeros(0, 2, dtype=torch.long), [], 32)
+        == []
+    )
+    assert KiviInt4Semantics.ordered_slots(
+        torch.tensor([[3, 4]], dtype=torch.long), [0], 32
+    ) == [[]]
+
+
 def test_build_causal_mask_shape_and_values() -> None:
     sem = KiviInt4Semantics(
         MethodConfig(
@@ -263,6 +305,40 @@ def test_store_entries_and_key_flush_whole_window() -> None:
     assert torch.equal(flush_slots, slots)
     window_slots, tensors = impl._collect_kivi_residual_window("r", is_key=True)
     assert window_slots == [32] and tensors is not None
+
+
+def test_store_mixed_overwrite_and_value_eviction_keeps_order() -> None:
+    """In-place overwrite of a held slot while the window is full.
+
+    The mirror-based store must reproduce the sequential semantics: the
+    overwrite does not evict anything, the new slot evicts exactly one
+    (the oldest) value lane, and the overwritten lane survives.
+    """
+    impl = _make_impl(residual_length=2 * GROUP)
+    value = torch.randn(2 * GROUP, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.arange(2 * GROUP, dtype=torch.long)
+    impl._store_kivi_residual_entries(value, slots, req_key="r", is_key=False)
+    assert [len(launch) for launch in impl._kivi_value_launches] == []
+
+    # slot 5 already lives in the window; slot 2*GROUP is new and must
+    # evict slot 0 (FIFO), not touch slot 5's lane.
+    batch_values = torch.randn(2, NUM_KV_HEADS, HEAD_SIZE)
+    batch_slots = torch.tensor([5, 2 * GROUP], dtype=torch.long)
+    impl._store_kivi_residual_entries(
+        batch_values, batch_slots, req_key="r", is_key=False
+    )
+    assert len(impl._kivi_value_launches) == 1
+    flushed, flush_slots = impl._kivi_value_launches[0]
+    assert flushed.shape[0] == 1 and flush_slots.tolist() == [0]
+
+    window_slots, tensors = impl._collect_kivi_residual_window("r", is_key=False)
+    assert window_slots == list(range(1, 2 * GROUP + 1))
+    assert tensors is not None
+    # slot 5's lane holds the overwrite (last write wins), slot 2*GROUP the
+    # fresh append; every other lane keeps its original value.
+    assert torch.allclose(tensors[4], batch_values[0])
+    assert torch.allclose(tensors[-1], batch_values[1])
+    assert torch.allclose(tensors[0], value[1])
 
 
 def test_value_flush_is_slot_at_a_time() -> None:

@@ -100,7 +100,18 @@ class AscendKiviInt4AttentionBackendMixin:
         )
 
     def _kivi_sem(self) -> KiviInt4Semantics:
-        return KiviInt4Semantics(self)
+        """按几何 memoize 的语义对象：稳态下不再每步重建+重校验。
+
+        测试会在构造后改写 head_size/group_size 等属性，所以以属性
+        三元组为键，几何变了就重建。
+        """
+        geometry = (self.head_size, self.kivi_group_size, self.kivi_residual_length)
+        memo = getattr(self, "_kivi_sem_memo", None)
+        if memo is not None and memo[0] == geometry:
+            return memo[1]
+        sem = KiviInt4Semantics(self)
+        self._kivi_sem_memo = (geometry, sem)
+        return sem
 
     def _check_kivi_cache_bound(self) -> None:
         if (
@@ -402,8 +413,13 @@ class AscendKiviInt4AttentionBackendMixin:
     ) -> None:
         """向请求的残差环形行追加 token；写满则先 flush 前缀再写入。
 
-        逐槽处理：命中已有 lane 就原地覆盖；否则走环形尾写入，
-        写入前 while 循环保证有空间（键挤整窗、值挤一个）。
+        逐槽语义保持不变：命中已有 lane 就原地覆盖；否则走环形尾写入，
+        写入前 while 循环保证有空间（键挤整窗、值挤一个）。实现上把
+        slot->lane 查找镜像到 Python（每次调用一次 ``tolist()``），不再
+        逐 token 发 ``(row == slot).nonzero().item()``——真机上那是每
+        token 两次 host-device 同步，128 个残差 token 的 prefill 就是
+        256 次。写回与 flush 的先后保持逐槽版原序，被 flush 驱逐的
+        lane 同步从镜像摘除。
         """
         if values.numel() == 0 or slots.numel() == 0:
             return
@@ -415,25 +431,35 @@ class AscendKiviInt4AttentionBackendMixin:
         row_idx = self._get_kivi_residual_row(req_key, create=True)
         assert row_idx is not None
 
-        for idx in range(int(slots.shape[0])):
-            slot = int(slots[idx].item())
-            match = (slot_ids[row_idx] == slot).nonzero(as_tuple=False)
-            if match.numel() > 0:
-                lane = int(match[0].item())
+        row_lane_slot = [
+            int(slot) if slot >= 0 else None for slot in slot_ids[row_idx].tolist()
+        ]
+        lane_of_slot = {
+            slot: lane for lane, slot in enumerate(row_lane_slot) if slot is not None
+        }
+        cap = self.kivi_residual_length
+
+        for idx, slot in enumerate(slots.tolist()):
+            lane = lane_of_slot.get(slot)
+            if lane is not None:
                 cache[row_idx, lane] = values[idx]
                 continue
 
-            while lengths[row_idx] >= self.kivi_residual_length:
-                self._flush_kivi_residual_prefix(
-                    req_key,
-                    is_key=is_key,
-                    count=self.kivi_residual_length if is_key else 1,
-                )
+            while lengths[row_idx] >= cap:
+                count = cap if is_key else 1
+                for evicted in self._get_kivi_residual_lanes(row_idx, is_key=is_key)[
+                    :count
+                ]:
+                    lane_of_slot.pop(row_lane_slot[evicted], None)
+                    row_lane_slot[evicted] = None
+                self._flush_kivi_residual_prefix(req_key, is_key=is_key, count=count)
 
-            tail = (starts[row_idx] + lengths[row_idx]) % self.kivi_residual_length
+            tail = (starts[row_idx] + lengths[row_idx]) % cap
             slot_ids[row_idx, tail] = slot
             cache[row_idx, tail] = values[idx]
             lengths[row_idx] += 1
+            lane_of_slot[slot] = tail
+            row_lane_slot[tail] = slot
 
     def _lookup_kivi_residual_tensor(
         self,
@@ -462,26 +488,38 @@ class AscendKiviInt4AttentionBackendMixin:
     def _gather_kivi_residual_tensors(
         self, slots: list[int], *, req_key: str, is_key: bool
     ) -> torch.Tensor:
+        """按槽位顺序从残差行收集张量（flush 的输入）。
+
+        向量化实现：一次布尔矩阵匹配 + 一次 ``index_select``，替代逐
+        槽位的 ``(row == slot).nonzero().item()``。flush 的槽位列表互不
+        重复，匹配矩阵每行至多一个 True，不存在并列歧义。
+        """
         if not slots:
             raise RuntimeError("KIVI residual gather expects a non-empty slot list.")
 
-        target_dtype = self.k_scale_cache.dtype if is_key else self.v_scale_cache.dtype
-        tensors = []
         cache_name = "key" if is_key else "value"
-        for slot in slots:
-            tensor = self._lookup_kivi_residual_tensor(
-                int(slot),
-                req_key=req_key,
-                is_key=is_key,
-                target_dtype=target_dtype,
+        slot_ids, cache = self._get_kivi_residual_buffers(is_key=is_key)
+        row_idx = self._get_kivi_residual_row(req_key, create=False)
+        if row_idx is None:
+            raise RuntimeError(
+                f"KIVI {cache_name} residual tensor for slot {int(slots[0])} is "
+                "missing before flush."
             )
-            if tensor is None:
-                raise RuntimeError(
-                    f"KIVI {cache_name} residual tensor for slot {slot} is "
-                    "missing before flush."
-                )
-            tensors.append(tensor)
-        return torch.stack(tensors, dim=0)
+
+        slots_t = torch.tensor(slots, dtype=torch.long, device=cache.device)
+        hits = slot_ids[row_idx].unsqueeze(0) == slots_t.unsqueeze(1)
+        found, lanes = hits.max(dim=1)
+        if not bool(found.all()):
+            missing = [
+                int(slot)
+                for slot, ok in zip(slots, found.tolist(), strict=True)
+                if not ok
+            ]
+            raise RuntimeError(
+                f"KIVI {cache_name} residual tensor for slot {missing[0]} is "
+                "missing before flush."
+            )
+        return cache[row_idx].index_select(0, lanes.to(torch.long))
 
     def _has_kivi_residual_entry(
         self, slot: int, *, req_key: str, is_key: bool
