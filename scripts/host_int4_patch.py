@@ -16,6 +16,11 @@ if the host has moved on.
     python scripts/host_int4_patch.py ... --reverse   # undo
 
 Verified against vllm-hust ``f18cf803c5`` and vllm-ascend-hust ``17ed0571d``.
+Two further edits (4b: KIVI page size in FullAttentionSpec.real_page_size_bytes,
+4c: the head_size_v hijack in _reshape_kv_cache_tensors) were measured on the
+real 910B2 serving path on 2026-10-03 against vllm-hust ``ba82f2122`` /
+vllm-ascend-hust ``b0613602f`` -- trees patched by the older revision of this
+script carry those two applied by hand.
 """
 
 from __future__ import annotations
@@ -165,6 +170,53 @@ def edits(vllm: Path, ascend: Path) -> list[tuple[Path, str, str]]:
             "                num_head_slots=2,\n"
             "                state_content_bytes=spec.num_kv_heads * per_head,\n"
             "            )\n" + PLANE_LINE,
+        ),
+        # 4b. FullAttentionSpec overrides real_page_size_bytes with a combined
+        #     K+V last dim (head_size + head_size_v, dense bytes).  Without a
+        #     KIVI branch the page stays dense, the pool splits into two equal
+        #     DENSE halves, and the plugin's S-sized views fail with
+        #     "shape '[N, 128, 1, 72]' is invalid".  Measured on 910B2
+        #     2026-10-03 (serving verification).
+        (
+            iface,
+            """        elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            last_dim = self.head_size // 2 + self.head_size_v // 2
+        else:
+            last_dim = self.head_size + self.head_size_v""",
+            """        elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            last_dim = self.head_size // 2 + self.head_size_v // 2
+        elif self.kv_quant_mode == KVQuantMode.KIVI_INT4:
+            # KIVI: both regions are S bytes per token per head (int4 payload
+            # plus amortised fp32 scale/min); the plugin splits the two equal
+            # host buffers into its six views.  Same env knob as attention_v1.
+            import os
+
+            group = int(os.environ.get("VLLM_KIVI_GROUP_SIZE", "128"))
+            side = self.head_size // 2 + 8 * self.head_size // group
+            last_dim = side + side
+        else:
+            last_dim = self.head_size + self.head_size_v""",
+        ),
+        # 4c. FullAttentionSpec always carries a head_size_v attribute (defaults
+        #     to None), so the bare hasattr hijacked V to the dense head even for
+        #     kivi_int4, whose two regions must stay equal.  Measured on 910B2
+        #     2026-10-03 (serving verification).
+        (
+            ascend,
+            """                        k_shape = kv_cache_shape[1:]
+                        if hasattr(current_kv_cache_spec, "head_size_v"):
+                            v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)""",  # noqa: E501
+            """                        k_shape = kv_cache_shape[1:]
+                        # qkv-verify 2026-10-03: FullAttentionSpec always has a
+                        # head_size_v attribute (defaults to None), so the bare
+                        # hasattr hijacked V to the dense head even for
+                        # kivi_int4, whose two regions must stay equal.
+                        if (
+                            hasattr(current_kv_cache_spec, "head_size_v")
+                            and current_kv_cache_spec.head_size_v is not None
+                            and self.vllm_config.cache_config.cache_dtype != "kivi_int4"
+                        ):
+                            v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)""",  # noqa: E501
         ),
         (runner, shape_call, shape_call_with_dtype),
         (runner, hybrid_call, hybrid_call_with_dtype),
