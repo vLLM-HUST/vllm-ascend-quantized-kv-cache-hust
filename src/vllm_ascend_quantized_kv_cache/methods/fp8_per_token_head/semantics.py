@@ -9,14 +9,15 @@ checkpoint"定位，但粒度细到 (token, head) 且带 E4M3 的浮点动态范
 int8_dynamic 的 scale 只在首个 prefill 算一次（会陈旧），这里每个
 token 写入时独立计算。
 
-数值口径（本插件的 CPU 参考实现，将来 triton-ascend 内核的对拍基准）::
+数值口径（本插件的 CPU 参考实现，``ops.triton.per_token_head_store``
+内核的对拍基准，与宿主 triton 内核逐步同构）::
 
     scale = max(|x|) / 448            # 448 = E4M3fn 最大正规数
+    scale = max(scale, 1e-6)          # 与宿主内核同一下限，防全零槽位
     q     = e4m3(clamp(x / scale, -448, 448))
     x̂     = float(q) * scale
 
-scale 下限取 fp32 最小正规数，防全零 (token, head) 除零；clamp 在
-cast 之前，规避 torch fp8 cast 对超范围的 NaN 行为。
+clamp 在 cast 之前，规避 torch fp8 cast 对超范围的 NaN 行为。
 """
 
 from __future__ import annotations
@@ -26,7 +27,10 @@ from typing import Any
 import torch
 
 _E4M3_MAX = 448.0
-_SCALE_FLOOR = torch.finfo(torch.float32).tiny
+# 与宿主 triton 内核同口径的下限（triton_reshape_and_cache_flash.py：
+# ``tl.maximum(absmax / QUANT_MAX, 1e-6)``）。必须逐位一致，否则这份
+# CPU 参考与内核对拍时全零 (token, head) 槽位的 scale 会差 1e6 倍。
+_SCALE_FLOOR = 1e-6
 
 
 class Fp8PerTokenHeadSemantics:

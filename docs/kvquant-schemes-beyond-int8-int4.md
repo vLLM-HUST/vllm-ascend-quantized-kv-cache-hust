@@ -866,12 +866,25 @@ cd ../vllm-ascend-hust && grep -rhoE "torch\.ops\.npu\.npu_[a-z0-9_]*(quant|mx)[
   `bootstrap.REGISTERED_METHODS` 不含它——设备路径落地前
   `--kv-cache-dtype fp8_per_token_head` 不可选，`host_adapter` 抛
   "no adapter wired"。
-- 后续（按投入产出排序）：①triton-ascend store 内核（对拍本语义）→
-  ②形状包络测量（复用第 10 节的 910B2 方法）→ ③FIA 读通路
-  （per-token-head scale 反量化进注意力）→ ④接线注册 + 真宿主分派核对。
+- **store 内核已移植（同日第二轮）**：`ops/triton/per_token_head_store.py`
+  1:1 移植宿主 `triton_reshape_and_cache_flash.py` 的
+  `_reshape_cache_per_token_head`（每 (token, head) 一个程序、
+  absmax/448 scale 下限 1e-6、clamp 后按张量 dtype store cast；int8
+  参数表随内核带入、路径未启用）。校验器是普通函数、triton 惰性导入，
+  CPU 测试不需要 triton；jit 函数进程内只构建一次（防编译缓存失效）。
+  语义层的 scale 下限同步从 fp32 tiny 改成 1e-6 与宿主逐位同口径。
+  **未上机验证、未路由**——设备探针要回答的两件事：①triton-ascend
+  对 fp8 指针 store cast 的支持（不支持则在本模块内换手工 E4M3 位型
+  编码）；②(2D grid, HEAD_SIZE_PADDED=256, num_warps) 的编译包络。
+- 后续（按投入产出排序）：①910B2 设备对拍（内核 vs 本语义 CPU 参考）
+  与包络测量（复用第 10 节方法）→ ②FIA 读通路（per-token-head scale
+  反量化进注意力；宿主 triton_attn 的 per-token-head 读路径是参考）
+  → ③接线注册 + 真宿主分派核对 → ④int8_per_token_head 变体
+  （IS_INT_QUANT 分支已在内核里）。
 - 同轮（2026-10-03）还完成了 kivi_int4 热路径去同步化：
   `ordered_slots` / 残差 store / 残差 gather 的逐 token
   host-device 同步全部向量化（真机 serving 每步原本付
   O(sum(seq_len)) 次同步），顺序语义由逐位置参考实现对拍钉死。
 
-提交：`d432a92`（perf 去同步化）、`eb3a54f`（fp8_per_token_head 脚手架）。
+提交：`d432a92`（perf 去同步化）、`eb3a54f`（fp8_per_token_head 脚手架）、
+store 内核移植 + 死代码清理（见 git log 同日提交）。
