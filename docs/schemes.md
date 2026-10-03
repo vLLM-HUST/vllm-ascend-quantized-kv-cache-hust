@@ -1,8 +1,9 @@
-# 量化 KV cache：模块含义与七个方案的差异
+# 量化 KV cache：这个仓库有什么、七个方案差在哪
 
 本文回答三个问题：这个模块**是干什么的**（§1）、KV cache 量化的
-**基本原理**（§2）、七个方案的**语义差异与选型**（§3–§5）。
-运行方法见 [how-to-run.md](how-to-run.md)，NPU 实现细节见
+**基本原理**（§2）、七个方案的**差异和怎么选**（§3–§5）。现在仓库
+里到底有哪些代码、做到哪一步了，直接看 §4.2。运行方法见
+[how-to-run.md](how-to-run.md)，NPU 实现细节见
 [npu-implementation.md](npu-implementation.md)。
 
 ## 1. 这个模块是干什么的
@@ -29,39 +30,40 @@ fp4 块微缩（4.5 bit/元素，~3.6x），
 
 - **不是**离线模型权重量化，也不是 Adaptive Quantized KV observer 项目
   （见 README 的技术所有权声明）。
-- **是**一个方案库 + 宿主适配层：把 legacy 分支里验证过的量化实现
-  （出处见 [../PROVENANCE.md](../PROVENANCE.md)）整理成七个自注册
-  "方案"，统一暴露三层能力：
-  1. **契约**（`resolve_layout`）：dtype 字符串 → 存储布局
-     （存储 dtype / 打包维度），全库唯一裁决处 `dtypes.py`；
-  2. **语义**（`methods/<方案>/semantics.py`）：纯 torch 数学
-     （scale 计算、打包/解包、窗口簿记），CPU 可单测，同时是 NPU
-     内核的数值参考；
-  3. **宿主适配**（`method.host_adapter(host)`，经
-     `adapters/vllm_ascend_hust`）：把方案插进宿主的
-     `get_impl_cls` 分派。
-- **设备边界**：内核层（triton-ascend / torch_npu）只在 Ascend NPU 上
-  执行；任何设备路径在非 NPU 环境 fail-closed 并给出明确报错。
-- **各方案在本仓库（feat/int4 分支）的实际落地深度见 §4.2**——本文
-  §3 描述的是方案语义本身，不等于代码已在本树落地。
+- **是**一个方案库 + 一层宿主胶水：把老分支里验证过的量化实现
+  （出处见 [../PROVENANCE.md](../PROVENANCE.md)）整理成几个能独立启用
+  的"方案"。每个方案给三样东西：
+  1. **dtype 解析**：`int8`、`kivi_int4` 这些字符串实际存成什么格式
+     （uint8 还是 int8、每头压到多少字节），全库只有 `dtypes.py` 一处
+     说了算；
+  2. **量化数学**：scale 怎么算、怎么打包解包、残差窗口怎么记账——
+     纯 torch 实现，CPU 上就能测，同时也是 NPU 内核的对照答案；
+  3. **装进宿主**：挂在宿主"按 cache_dtype 选 attention 实现"的那个
+     入口上（`adapters/vllm_ascend_hust`），不量化时宿主行为一点不变。
+- **设备边界**：triton / torch_npu 内核只在 Ascend NPU 上执行；在
+  没有 NPU 的环境里跑设备路径会直接报错，不会猜。
+- **每个方案现在做到哪一步**（有没有代码、在 910B2 上验没验过、
+  命令行能不能选）：见 §4.2。本文 §3 讲的是方案本身的设计，
+  不代表代码都已经在这个分支上。
 
 ## 2. 原理速览：KV cache 量化在量化什么
 
-注意力计算需要的是浮点 K/V。量化方案要回答四个问题：
+注意力计算需要的是浮点 K/V。一个量化方案要回答四个问题：
 
-1. **粒度**：一组数值共享一个 scale（per-tensor / per-channel /
-   per-token-head / per-16-元素块）？粒度越细精度越好、开销越大。
-2. **scale 来源**：静态（checkpoint 里带）还是动态（在线 amax）？
-3. **存储格式**：int8 / int4 / fp8_e4m3 / fp4_e2m1；4bit 要两两打包进
-   一个字节（uint8 存储）。
-4. **注意力在哪一步反量化**：写入前量化、读取后反量化成稠密再算注意力
-   （dequant-gather），还是直接把 scale 喂给 fused attention 算子
-   （在线 antiquant，本库 NPU 路径的做法）。
+1. **粒度**：多少个数共享一个 scale（整个张量一个 / 每个通道一个 /
+   每 token 每头一个 / 每 16 个元素一个）？粒度越细精度越好、
+   开销越大。
+2. **scale 哪来**：静态（checkpoint 里带着）还是动态（写入时现场算）？
+3. **存成什么格式**：int8 / int4 / fp8_e4m3 / fp4_e2m1；4bit 要两个
+   挤进一个字节（uint8 存储）。
+4. **在哪一步变回浮点**：写入前量化、读取后解压成稠密再算注意力
+   （dequant-gather），还是把 scale 直接喂给 fused attention 算子、
+   让它在内核里边解压边算（在线 antiquant，本库 int8 路径的做法）。
 
-**打包维度**由契约层 `resolve_layout(dtype, head_size)` 给出
+每个 dtype 实际存成什么，由 `dtypes.py` 的 `resolve_layout` 说了算
 （head_size=128 时）：
 
-| dtype | storage_dtype | packed_last_dim | 有效位宽 | 相对 fp16 |
+| dtype | 存储成 | 每头最后一维 | 有效位宽 | 相对 fp16 |
 |---|---|---|---|---|
 | `int8_per_token_head` | int8 | 128 | 8 bit | **2x** |
 | `kivi_int4` | uint8 | 64 | 4 bit（历史区） | **4x**（残差区 fp16） |
@@ -72,75 +74,76 @@ fp4 块微缩（4.5 bit/元素，~3.6x），
 
 ## 3. 七个方案分述
 
-七个方法分两个家族：**有状态家族**（int8_dynamic、kivi_int4，自带完整
-NPU attention 前向实现）与 **格式方法家族**（packed format：int4_packed、
-fp4_e2m1、fp8_e4m3、
-nvfp4，语义类只负责存储 dtype 与 scale 元数据，量化计算由宿主
-attention backend 内核执行）。第七个方案 `fp8_per_token_head`（2026-10
-起脚手架）归有状态家族：契约、字节布局、CPU 参考语义与 store 内核
-已落地，读通路与适配器未移植，CLI 不可选（见 §4 总表行与 §4.1 排序）。
+七个方法分两类：**自己管状态的**（int8_dynamic、kivi_int4、
+fp8_per_token_head——插件里有完整的 attention 前向实现，缓存怎么写、
+怎么读、请求怎么记账都自己管）和 **只定格式的**（int4_packed、
+fp4_e2m1、fp8_e4m3、nvfp4——只声明存储 dtype 和 scale 放哪，
+量化计算由宿主 attention 内核做）。
+fp8_per_token_head 是 2026-10 新起的：dtype 解析、字节布局、CPU 参考
+数学和写入内核已经有了，读路径和宿主接线还没有，命令行还选不了
+（§4.2 有细节）。
 
 ### 3.1 `int8_dynamic` — 动态 per-channel INT8
 
-- **出处**：ascend#116/0001。dtype 契约键：`int8_per_token_head`。
-- **语义**：首次 prefill 时沿 token 维（dim=0）取 amax，每个
+- **出处**：ascend#116/0001。dtype 字符串：`int8`（宿主字面量
+  `int8_per_token_head`）。
+- **怎么做**：第一次 prefill 时沿 token 维取一次绝对值最大值，每个
   (kv_head, head_dim) 通道得到一个 scale，`inv_scale = 127/amax`，
-  零偏移恒为 0（对称量化）；`clamp(round(x·inv_scale), -128, 127)`。
-  scale 之后固定不变（在线 amax 只算一次）。
-- **NPU 路径**：不做打包（真 int8 存储，2x）。注意力走
+  对称量化（零偏移恒为 0）；`clamp(round(x·inv_scale), -128, 127)`。
+  scale 算一次之后就不变了。
+- **NPU 上怎么跑**：不做打包（真 int8 存储，2x）。注意力走
   `npu_fused_infer_attention_score` 在线 antiquant：decode 用 BNSD 布局
-  直接读分页 int8 缓存并携带 antiquant_scale；prefill/chunked-prefill
-  用 TND 布局，必要时把分页缓存 gather 反量化成稠密（见
+  直接读分页 int8 缓存并带上 scale；prefill/chunked-prefill 用 TND
+  布局，必要时把分页缓存 gather 解压成稠密再算（见
   [npu-implementation.md](npu-implementation.md) §3.2）。
-- **约束**：head_size 是 8 的倍数。
-- **适合**：想要最稳、最简单的 2x 节省；fused attention 直接支持
-  antiquant，无需自定义解包内核。
+- **限制**：head_size 是 8 的倍数。
+- **适合**：想要最稳、最简单的 2x 节省；fused attention 原生支持，
+  不用自己写解包内核。
 
 ### 3.2 `kivi_int4` — KIVI：int4 历史区 + 全精度残差窗口
 
-- **出处**：ascend#116/0003–0013（最终状态）。dtype 契约键：`kivi_int4`。
-- **核心思想**（KIVI 论文思路）：键对**位置**敏感、值对**通道**敏感，
-  且越新的 token 越重要。于是每个请求的缓存分两个区域：
+- **出处**：ascend#116/0003–0013（最终状态）。dtype 字符串：
+  `kivi_int4`。
+- **核心想法**（KIVI 论文思路）：键对**位置**敏感、值对**通道**敏感，
+  而且越新的 token 越重要。所以每个请求的缓存分两块：
   - **残差窗口**：最近 `residual_length` 个 token 保持全精度（每请求
-    一行 ring buffer）；
+    一行环形缓冲）；
   - **历史区**：更早的 token 量化成 int4 打进分页缓存——**键**按
-    token 组（每 `group_size` 个连续 token 一组，组内逐 (head, dim)
-    求 min/max，非对称 [mn, scale] 量化）；**值**按 head 维组
-    （每个 token 的 head_dim 按 group_size 分组）。
-  键窗口写满后**整组 flush** 进历史区；注意力时把历史区 gather 出来
-  反量化成稠密，与全精度残差尾部拼接后走 TND fused attention。
-- **约束**（`validate_kivi_geometry`，全部 fail-closed）：
+    token 分组（每 `group_size` 个连续 token 一组，组内逐 (head, dim)
+    求 min/max，非对称量化）；**值**按 head 维分组（每个 token 的
+    head_dim 按 group_size 分组）。
+  键窗口写满后**一整组**写进历史区；算注意力时把历史区 gather 出来
+  解压成稠密，拼上全精度残差尾部后走 TND fused attention。
+- **几何限制**（不满足直接报错）：
   `group_size % 8 == 0`（int32 打包 1 word = 8 lane）、
-  `residual_length % group_size == 0`（整组 flush）、
-  `head_size % 8 == 0`、`head_size % group_size == 0`（值按 head 维分组）、
-  `block_size % group_size == 0`（flush 对齐检查）。
-  两组旋钮对应宿主 `cache_config.kivi_group_size` /
+  `residual_length % group_size == 0`（整组写进历史区）、
+  `head_size % 8 == 0`、`head_size % group_size == 0`（值按 head 维
+  分组）、`block_size % group_size == 0`。
+  两个旋钮对应宿主 `cache_config.kivi_group_size` /
   `kivi_residual_length`（默认 128/128）。
-- **NPU 路径**：triton-ascend 打包内核（910B2 逐位验证）+ 纯 torch
-  dequant-gather（**刻意不走**上游融合 gather 内核，原因见
-  [npu-implementation.md](npu-implementation.md) §3.3）。
-- **适合**：追求 4x 级节省且能接受残差窗口精度兜底的长上下文场景；
-  这是有状态方案里工程状态机最复杂的一个（残差 ring buffer、flush
-  状态机、请求行分配，见 npu-implementation.md §4）。
+- **NPU 上怎么跑**：triton-ascend 打包内核（910B2 上和 CPU 参考逐位
+  比过）+ 纯 torch 的 dequant-gather（**故意不用**上游的融合 gather
+  内核，原因见 [npu-implementation.md](npu-implementation.md) §3.3）。
+- **适合**：追求 4x 级节省、能接受残差窗口兜底的长上下文；这是七件
+  里状态最复杂的一个（环形缓冲、flush 时机、请求行分配，见
+  npu-implementation.md §4）。
 
-### 3.3 格式方法家族：`int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4`
+### 3.3 只定格式的四个：`int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4`
 
-> **落地位置注意**：这四个方案的代码在 **dev 分支**（旧包名
-> `sol.*`），**feat/int4 树上不存在**——`src/` 下没有
-> `PackedFormatSemantics`，`dtypes.py` 也解析不了这四个 dtype
-> （见 §4.2 落地表）。本节描述的是 dev 分支的方案语义，供对照与
-> 回移参考。
+> **注意：这四个在 dev 分支上**（那时包还叫 `sol.*`）。现在这个分支
+> （feat/int4）的代码里没有它们——`src/` 下搜不到
+> `PackedFormatSemantics`，`dtypes.py` 也不认这四个 dtype（§4.2 的表
+> 里有）。这一节留着对照用。
 
 - **出处**：ascend#160/0001（+0004/0005/0007 gating 语境）。
-- **共同结构**：每个格式语义类（`PackedFormatSemantics` 子类）只有四个类级元数据
-  （`scheme_key` / `cache_dtype` / `storage_torch_dtype_name` /
-  `uses_scales`）+ 三个行为：
-  `create_weights`（在 attention layer 上挂存储 dtype 与可选 scale 参数）、
-  `process_weights_after_loading`（scale 整理）、`apply`（**永远抛
-  RuntimeError**——量化发生在 attention backend 内核里，apply 被调用
-  说明接线错了，fail-closed）。
-- 注册键命名空间化为 `VLLM_HUST_KV_*`，避免与宿主在树 scheme 撞键
-  （宿主注册表重复键直接抛错）。
+- **共同结构**：每个格式一个语义类，只有四个元数据（名字 / dtype /
+  存储 torch dtype / 带不带 scale）+ 三个行为：
+  `create_weights`（在 attention layer 上挂存储 dtype 和可选 scale
+  参数）、`process_weights_after_loading`（整理 scale）、`apply`
+  （**永远抛 RuntimeError**——量化应该发生在 attention 内核里，
+  这个方法被调到说明接线接错了）。
+- 注册键带 `VLLM_HUST_KV_` 前缀，避免和宿主自带的 scheme 撞名
+  （宿主注册表重名直接抛错）。
 
 | 方案 | scheme_key | 存储 | scale | 语义 |
 |---|---|---|---|---|
@@ -149,112 +152,109 @@ attention backend 内核执行）。第七个方案 `fp8_per_token_head`（2026-
 | `fp8_e4m3` | `VLLM_HUST_KV_FP8_E4M3` | float8_e4m3fn | per-tensor，layer 上挂参数 | 支持静态（checkpoint）与动态两种 scale 来源 |
 | `nvfp4` | `VLLM_HUST_KV_NVFP4` | uint8 | **不挂** layer scale（fp8 块 scale 随数据走） | fp4 数据 + 每 16 元素 1 个 fp8 scale |
 
-四者的差异本质是**量化粒度与数值格式**：
+四者的差别就是**粒度和数值格式**：
 
-- `int4_packed`：整数格式，per-token-head 粒度，粒度最细的一档；
-- `fp8_e4m3`：浮点格式，per-tensor 粒度最粗，但 fp8 对动态范围友好，
-  实现最简单；
-- `fp4_e2m1`（MXFP4）与 `nvfp4`：都是 4bit 浮点 + 16 元素块 scale，
-  压缩率最高；差别在块 scale 的编码约定（MXFP4 用 fp8 指数 scale、
-  NVFP4 用 fp8 块 scale，打包布局也不同：fp4_e2m1 每块
-  `8B 数据 + 1B scale` 交错，nvfp4 是数据 half + scale half 分离，
-  见 `dtypes.fp4_e2m1_packed_dim` / `nvfp4_packed_dim`）。
-- **宿主支持注意**：`fp4_e2m1` 在 vllm-hust 上**没有可协商的
-  CacheDType 字面量**，适配器 fail-closed 拒绝（加字面量是宿主路线图
-  项，不是运行时 hack，见 [integration.md](integration.md) §3.2）。
+- `int4_packed`：整数格式，per-token-head 粒度，最细的一档；
+- `fp8_e4m3`：浮点格式，per-tensor 粒度最粗，但浮点天生不怕动态
+  范围，实现最简单；
+- `fp4_e2m1`（MXFP4）和 `nvfp4`：都是 4bit 浮点 + 16 元素块 scale，
+  压缩最高；区别在块 scale 怎么编（MXFP4 用 fp8 指数 scale、NVFP4
+  用普通 fp8 scale），打包布局也不同：fp4_e2m1 每块
+  `8B 数据 + 1B scale` 交错，nvfp4 是数据一半 + scale 一半分开，
+  见 `dtypes.fp4_e2m1_packed_dim` / `nvfp4_packed_dim`。
+- **宿主注意**：`fp4_e2m1` 在 vllm-hust 上**没有对应的 CacheDType
+  字面量**，选了会被直接拒绝（加字面量要走宿主路线图，不是运行时
+  hack，见 [integration.md](integration.md) §3.2）。
 
-### 3.4 与两个有状态方案的本质区别
+### 3.4 两类方案的本质区别
 
-| | 有状态家族（int8_dynamic / kivi_int4） | 格式方法家族（packed format） |
+| | 自己管状态的（int8_dynamic / kivi_int4 / fp8_per_token_head） | 只定格式的（packed 四件套） |
 |---|---|---|
-| 方法库提供什么 | 完整 NPU attention 前向实现（attention mixin：存储路径 + 计算路径 + 状态机） | 只提供格式语义类（存储 dtype + scale 参数） |
-| 量化计算在哪 | 方案自己的 mixin（torch_npu / triton-ascend，惰性导入） | 宿主 attention backend 内核 |
-| 挂载方式 | 注册 scheme 后由 `create_weights` 做 C8 式 `layer.impl.__class__` 类手术 | 注册 scheme 即完成 |
-| 本库测试覆盖 | 语义层 CPU 全测；内核 910B2 逐位验证 | 格式语义类行为 CPU stub 全测 |
+| 插件提供什么 | 完整的 NPU attention 前向实现（存缓存、算注意力、管请求状态） | 只声明存储 dtype + scale 放哪 |
+| 量化计算在哪 | 方案自己的代码（torch_npu / triton-ascend，用到才 import） | 宿主 attention 内核 |
+| 怎么挂上去 | 注册后改 attention layer 的实现类（C8 式类手术） | 注册即完成 |
+| 测试覆盖 | 语义层 CPU 全测；内核 910B2 逐位验证 | 格式语义类 CPU stub 全测 |
 
 ## 4. 横向对比总表
 
-| 方案 | 有效压缩 | 量化粒度 | scale 来源 | 有状态/无状态 | NPU 内核 | vllm-ascend-hust | vllm-hust |
+| 方案 | 压缩比 | 量化粒度 | scale 来源 | 有无状态 | NPU 内核 | vllm-ascend-hust | vllm-hust |
 |---|---|---|---|---|---|---|---|
-| `int8_dynamic` | 2x | per-channel (head,dim) | 动态（首 prefill amax，之后固定） | 有状态 | torch_npu fused attention 在线 antiquant | scheme + impl 手术 | CUSTOM backend，字面量 `int8_per_token_head` |
-| `kivi_int4` | 4x（历史区）+ fp16 残差 | 键 per-token-group / 值 per-head-dim-group，非对称 | 动态（flush 时算） | 有状态 | triton-ascend pack + torch gather | scheme + impl 手术 | CUSTOM backend，字面量 `int4_per_token_head` |
-| `fp8_per_token_head` | 1.94x（head 128：256B→132B） | per (token, head) | 动态（写入时 amax/448，逐 token 更新） | 有状态（store 内核；读通路未移植） | triton-ascend store 已移植、**未上机验证** | **不可选**（契约/布局/CPU 语义已立，适配器缺位 fail-closed） | 原生字面量（triton 后端） |
-| `int4_packed` | 4x | per-token-head | 动态（backend 内） | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_INT4`） | CUSTOM backend，字面量 `int4_per_token_head` |
-| `fp4_e2m1` | ~3.6x | 16 元素块 | 块内 fp8 指数 scale（随数据走） | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_FP4_E2M1`） | **不可用**（无 dtype 字面量，fail-closed） |
-| `fp8_e4m3` | 2x | per-tensor | 静态或动态 | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_FP8_E4M3`） | CUSTOM backend，字面量 `fp8_e4m3` |
-| `nvfp4` | ~3.6x | 16 元素块 | 块内 fp8 scale（随数据走） | 无状态 | backend 内核侧 | scheme（`VLLM_HUST_KV_NVFP4`） | CUSTOM backend，字面量 `nvfp4` |
+| `int8_dynamic` | 2x | 每通道 (head,dim) | 动态（首 prefill 算一次，之后不变） | 有 | torch_npu fused attention 在线 antiquant | scheme + 改实现类 | CUSTOM backend，字面量 `int8_per_token_head` |
+| `kivi_int4` | 4x（历史区）+ fp16 残差 | 键按 token 组 / 值按 head 维组，非对称 | 动态（写历史区时算） | 有 | triton-ascend pack + torch gather | scheme + 改实现类 | CUSTOM backend，字面量 `int4_per_token_head` |
+| `fp8_per_token_head` | 1.94x（head 128：256B→132B） | 每 (token, head) | 动态（每 token 写入时算 amax/448） | 有 | 写入内核已写好、**没上机验过**；读路径没写 | **选不了**（没接命令行，选了直接报错） | 宿主自带字面量（triton 后端） |
+| `int4_packed` | 4x | per-token-head | 动态（backend 内） | 无 | backend 内核侧 | scheme（`VLLM_HUST_KV_INT4`） | CUSTOM backend，字面量 `int4_per_token_head` |
+| `fp4_e2m1` | ~3.6x | 16 元素块 | 块内 fp8 指数 scale（随数据走） | 无 | backend 内核侧 | scheme（`VLLM_HUST_KV_FP4_E2M1`） | **不可用**（没有 dtype 字面量） |
+| `fp8_e4m3` | 2x | per-tensor | 静态或动态 | 无 | backend 内核侧 | scheme（`VLLM_HUST_KV_FP8_E4M3`） | CUSTOM backend，字面量 `fp8_e4m3` |
+| `nvfp4` | ~3.6x | 16 元素块 | 块内 fp8 scale（随数据走） | 无 | backend 内核侧 | scheme（`VLLM_HUST_KV_NVFP4`） | CUSTOM backend，字面量 `nvfp4` |
 
-成熟度口径（截至 0.2.0.dev0）：**语义层**全部方案 CPU 测试覆盖
-（`pytest -q` 全绿）；**设备执行**只验证到端口保真度（pack/gather 在
-910B2 上对照 CPU 参考逐位通过）；**端到端 serving** 需要 Ascend NPU
-宿主环境，属宿主集成路线图项。vllm-hust 的 CUSTOM backend 适配器是
-接口就绪的脚手架。
+### 4.1 接下来做哪个：按性价比排序（2026-10-03）
 
-### 4.1 在 Ascend 910B2 上的落地排序（2026-10-03）
+先说三条判断标准（详细论证在
+[kvquant-schemes-beyond-int8-int4.md](kvquant-schemes-beyond-int8-int4.md)
+§7.3/§9.3）：注意力算子读不了低比特时，压缩**只省显存、不省带宽**；
+per-token-head 这条路走 triton，不需要等厂商出新算子，是成本最低的
+增量；旋转（Hadamard）必须做进内核里才有意义，做不进去反而更慢，
+**做不进去就不做**。
 
-判据先行（详见 [kvquant-schemes-beyond-int8-int4.md](kvquant-schemes-beyond-int8-int4.md)
-§7.3/§9.3）：注意力内核吃不到低比特时，一切压缩都**只是容量收益、不是
-带宽收益**；per-token-head 的 triton 路线不需要任何厂商新算子，是成本
-最低的增量；旋转类不融合内核就是带宽净损失，**不融合就不合并**。
-
-| 序 | 方案 | 当前状态（feat/int4） | 下一步 | 为什么在这个位置 |
+| # | 方案 | 现在的状态（feat/int4） | 下一步 | 为什么排这个位置 |
 |---|---|---|---|---|
-| 0 | `int8_dynamic` / `kivi_int4` | 已路由；int4 缺端到端 serve | 910B2 端到端验证 + 模型级精度 | 两个已验证的基线，后续排序都相对它们 |
-| 1 | `fp8_per_token_head` | 契约 + 布局 + CPU 参考 + store 内核已落（未上机、未路由） | 设备对拍 + 编译包络 → FIA 读通路 → 接线 | 宿主 triton 后端原生声明，零厂商算子；scale 逐 token 更新，补 int8_dynamic "scale 陈旧"短板 |
-| 2 | `int8_per_token_head` | 未立项（`IS_INT_QUANT` 分支已随 store 内核带入） | fp8 验证后近乎免费地开变体 | 同一内核、同一布局（S=head+4），边际成本最低 |
-| 3 | TurboQuant（`turboquant_4bit_nc` 口径） | 宿主有完整实现 + 纯 triton 内核；NPU 侧未做 | 对齐上游 #15198/#15821 认领，先按代码 `slot_size` 反推字节口径 | 4bit 之下最现实的台阶（旋转 + 16 级 LUT 与 int4 反量化同构）；**按容量记收益**（GPU 口径吞吐只有 BF16 的 66–80%） |
-| 4 | `kivi_int4` + 融合 RHT 旋转 | 未立项；宿主有 `single_rht` 参考 | SAW-INT4 式块对角 Hadamard 融进 pack 内核 + Q 侧配对旋转 | 显著降组内离群、往 3bit/2bit 推的必经之路；**融合不进内核就不做** |
-| 5 | GEAR 式稀疏修正 | 未立项 | 先只做离群稀疏修正（不做低秩 matmul，避免读路径增流） | KIVI flush 时误差本来就可得，是"下一个便宜的加法" |
-| — | `nvfp4` / fp4 系、FP8 attention、MXFP8/HiF8 KV | 契约 fail-closed | 等 950 代际硬件能力位 | A2 系无 FP8 注意力能力（#8102）；NVFP4 锁 Blackwell |
-| — | 格码（QTIP 系）、熵编码、加性 VQ | 不排期 | — | 判定为不可服务化：串行解码 / 数据相关 / 重写注意力内层循环 |
+| 0 | `int8_dynamic` / `kivi_int4` | 命令行能用；int4 还差端到端 serve | 910B2 端到端验证 + 真实模型精度 | 两个已经验证过的基线，后面的排序都相对它们 |
+| 1 | `fp8_per_token_head` | dtype 解析、布局、CPU 参考数学、写入内核都有了（没上机、没接命令行） | 上机比对 + 测内核能编译哪些形状 → 写读路径 → 接命令行 | 宿主 triton 后端本来就声明了这个 dtype，一个厂商算子都不用等；scale 逐 token 更新，正好补 int8_dynamic "scale 用一次旧的"这个短板 |
+| 2 | `int8_per_token_head` | 还没开始（int8 的分支已经写在写入内核里了） | fp8 验证完之后顺手开 | 同一个内核、同一种布局（每 token 每头 S=head+4），几乎不要钱 |
+| 3 | TurboQuant（对准 `turboquant_4bit_nc`） | 宿主有完整实现和纯 triton 内核；NPU 这边没人做 | 去 vllm-ascend 的 #15198/#15821 两个 issue 下认领，别自己另起一套回不了上游的 | 4bit 往下最现实的一级（Hadamard 旋转 + 16 级查找表，和 int4 解包是同一种指令形态）；**只省显存**——GPU 上实测吞吐只有 BF16 的 66–80% |
+| 4 | `kivi_int4` + 旋转融进内核 | 还没开始；宿主里有 `single_rht` 可以参考 | 学 SAW-INT4 的块对角 Hadamard，融进 pack 内核，Q 侧做配套旋转 | 显著压组内离群值，是往 3bit/2bit 推的必经之路；**融不进内核就不做** |
+| 5 | GEAR 式误差修正 | 还没开始 | 先只做离群值的稀疏修正（不做低秩矩阵乘，读路径不多跑流量） | KIVI 写历史区时误差本来就摆在手上，是"下一个便宜的加法" |
+| — | `nvfp4` / fp4 系、FP8 attention、MXFP8/HiF8 | 保持报错 | 等 950 代硬件 | 这代 910B2 没有 FP8 注意力能力（#8102）；NVFP4 是 Blackwell 专属 |
+| — | 格码（QTIP 那类）、熵编码、加性 VQ | 不做 | — | 解码串行、依赖数据内容、要重写注意力内层循环，服务化不现实 |
 
-排序表里的外部数字（TurboQuant 压缩/PPL、OSCAR 口径等）在自建
-benchmark 之前只当口径参考，不当结论（出处与核验状态见调研文档）。
+表里的外部数字（TurboQuant 的压缩比/PPL、OSCAR 的数字等）在我们自己
+跑出 benchmark 之前只当参考，不当结论（每个数字从哪来、核没核实过，
+见调研文档）。
 
-### 4.2 本仓库落地情况（分支 feat/int4，2026-10-03）
+### 4.2 现在仓库里到底有什么（feat/int4 分支，2026-10-03）
 
-状态分层口径：**契约**（`dtypes.py` 能解析该 dtype）→ **语义/布局层**
-（纯 torch，CPU 可测）→ **内核**（triton-ascend / torch_npu）→
-**设备验证**（910B2 实测记录）→ **路由**（进
-`bootstrap.REGISTERED_METHODS`，CLI 的 `--kv-cache-dtype` 可选）。
+判断一个方案做到了哪一步，看五样：`dtypes.py` 认不认这个 dtype
+字符串；量化数学写了没有（CPU 上能跑的纯 torch 版）；内核写了没有；
+在 910B2 上验过没有；`--kv-cache-dtype` 能不能真的选它。
 
-| 方案 | 契约 | 语义/布局层 | 内核 | 设备验证 | 路由 | 测试 |
+| 方案 | dtype 解析 | 量化数学 | 内核 | 上机验证 | 命令行 | 测试 |
 |---|---|---|---|---|---|---|
-| `int8_dynamic` | ✅ `int8` | ✅ `methods/int8_dynamic/semantics.py` | torch_npu FIA 在线 antiquant（decode/chunked/prefill 三前向分支，`attention_backend.py`） | 分派在真宿主验证（[validation-int4-20260920.md](validation-int4-20260920.md) §11）；前向分支为端口保真度，**端到端待宿主联调** | ✅ | `test_int8_dynamic.py`（2）+ `test_plugin.py` 公共路径 |
-| `kivi_int4` | ✅ `kivi_int4` | ✅ `methods/kivi_int4/{semantics,geometry,byte_cache}.py` | triton-ascend pack（`ops/triton/kivi_pack.py`）+ 纯 torch dequant-gather（`ops/kivi_gather.py`） | ✅ 13 节设备记录（[validation-int4-20260920.md](validation-int4-20260920.md)，`6146ab5` 全节逐位重放）；**端到端 serve 未跑** | ✅ | `test_kivi_int4.py`（48，含 Qwen3.5-35B-A3B 几何契约） |
-| `fp8_per_token_head` | ✅ `fp8_per_token_head` | ✅ `methods/fp8_per_token_head/{semantics,byte_cache}.py` | store：`ops/triton/per_token_head_store.py`（宿主 CUDA 参考 1:1 移植）；**FIA 读通路未移植** | ❌ 未上机（探针待答：fp8 指针 store 支持、编译包络） | ❌ 未路由（适配器缺位，`host_adapter` 抛 "no adapter wired"） | `test_fp8_per_token_head.py`（15：契约/布局/语义/内核校验器与启动契约） |
-| `int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4` | ❌ 本树不可解析 | ❌ 本树无代码（dev 分支，见 §3.3） | — | — | ❌ | — |
+| `int8_dynamic` | ✅ `int8` | ✅ `methods/int8_dynamic/semantics.py` | torch_npu FIA 在线 antiquant（decode/chunked/prefill 三条前向分支，`attention_backend.py`） | 选实现那步在真宿主上验过（[validation-int4-20260920.md](validation-int4-20260920.md) §11）；前向分支代码是从老实现原样搬的，**没在引擎里端到端跑过** | ✅ | `test_int8_dynamic.py`（2）+ `test_plugin.py` 公共部分 |
+| `kivi_int4` | ✅ `kivi_int4` | ✅ `methods/kivi_int4/{semantics,geometry,byte_cache}.py` | triton-ascend 打包内核（`ops/triton/kivi_pack.py`）+ 纯 torch dequant-gather（`ops/kivi_gather.py`） | ✅ 13 节设备记录（[validation-int4-20260920.md](validation-int4-20260920.md)，`6146ab5` 上每节原样重跑、数字逐位一致）；**端到端 serve 没跑过** | ✅ | `test_kivi_int4.py`（48 个，含 Qwen3.5-35B-A3B 形状的专项测试） |
+| `fp8_per_token_head` | ✅ `fp8_per_token_head` | ✅ `methods/fp8_per_token_head/{semantics,byte_cache}.py` | 写入内核 `ops/triton/per_token_head_store.py`（照宿主的 CUDA 参考一行行搬的）；**读路径没写** | ❌ 没上过机（上机要回答两件事：triton-ascend 支不支持往 fp8 指针写、这个内核形状编不编得过） | ❌ 没接（选了会报 "no adapter wired"） | `test_fp8_per_token_head.py`（15 个：dtype 解析/布局/数学/内核参数检查） |
+| `int4_packed` / `fp4_e2m1` / `fp8_e4m3` / `nvfp4` | ❌ 本树不认 | ❌ 本树没代码（在 dev 分支，见 §3.3） | — | — | ❌ | — |
 
-落地物补充（不落在上表单元格里的横切件）：
+表之外还有几块相关的代码：
 
-- **分派与注册**：`adapters/vllm_ascend_hust/backend.py`
-  （`get_impl_cls` 按 cache_dtype 分派、CP 一律 fail-closed、
-  未量化 dtype 原样委托宿主）——真宿主分派核对与安装态（wheel +
-  entry point 经 `load_general_plugins()`）都在 validation 记录
-  §11/§12 验过；`bootstrap.py` 是 `vllm.general_plugins` 入口，
-  注册 ≠ 启用。
-- **内核辅助**：`ops/kivi_layout.py`（打包内核的布局校验器，CPU 可测）；
-  `ops/triton/kivi_gather_experimental.py`（triton-ascend 3.5 误编译，
-  保留但**不路由**，validation 记录 §5）。
-- **复现口径**：`PYTHONPATH=src python -m pytest -q` → 108 passed
-  （2026-10-03，HEAD `873a015` 之后）；宿主补丁脚本
-  `scripts/host_int4_patch.py` 与对账 `scripts/check_int4_patch_parity.py`。
-- **未完成清单**（与 §4.1 排序衔接）：int4 端到端 serve、模型级精度、
-  fp8 读通路 + 设备验证、ACL Graph 路径（int4/int8 均无捕获分支，
-  先 `--enforce-eager`）。
+- **选实现和注册**：`adapters/vllm_ascend_hust/backend.py`——按
+  cache_dtype 选实现类、开了 context parallel 就报错、没量化的 dtype
+  原样交还宿主。真宿主上选实现对过，wheel 装好走 vLLM 自己的插件
+  加载也对过（validation 记录 §11/§12）。`bootstrap.py` 是
+  `vllm.general_plugins` 的入口——**注册不等于启用**，还要命令行
+  传 dtype 才生效。
+- **内核的配套检查**：`ops/kivi_layout.py`（打包内核的形状/对齐检查，
+  CPU 可测）；`ops/triton/kivi_gather_experimental.py`（在
+  triton-ascend 3.5 上编译出错，留着但不用，validation 记录 §5）。
+- **怎么复现**：`PYTHONPATH=src python -m pytest -q` → 108 passed
+  （2026-10-03）；宿主要改的四个地方在
+  `scripts/host_int4_patch.py`（可一键打/还原），改动是否还成立跑
+  `scripts/check_int4_patch_parity.py`。
+- **还没做完的事**（和 §4.1 的排序对得上）：int4 的端到端 serve、
+  真实模型精度、fp8 的读路径和上机验证、ACL Graph（int4/int8 都没有
+  捕获分支，先 `--enforce-eager`）。
 
 ## 5. 怎么选
 
-> 今天能选的只有两个已路由方案（§4.1 序 0）；序 1–5 是落地排序，不是
-> 现状。下述经验法则按此口径读。
+> 今天真正能选的只有两个：`int8_dynamic` 和 `kivi_int4`。§4.1 表里
+> #1 往后是计划，不是现状。
 
-- **只想省一半显存、要最快跑通**：`int8_dynamic`。粒度细、无需打包、
-  fused attention 原生支持 antiquant。
-- **长上下文、追求 4x**：`kivi_int4`。残差窗口兜住近期 token 精度，
-  历史区 int4；代价是配置约束多、状态机复杂。
-- **在 vllm-ascend-hust 上做 scheme 级集成实验**：packed 四件套
-  （`int4_packed` / `fp8_e4m3` / `nvfp4` / `fp4_e2m1`）。它们只定义存储契约，
-  计算走宿主 backend，适合先打通注册/分发链路。
-- **精度优先级**（经验法则，需按模型实测）：per-channel INT8 ≈
-  fp8_e4m3（带动态 scale）> KIVI INT4 > 纯 INT4 > fp4/nvfp4 系。
-  上线前务必用目标模型跑精度回归。
+- **只想省一半显存、要最快跑通**：`int8_dynamic`。粒度细、不用打包、
+  fused attention 原生支持。
+- **长上下文、追求 4x**：`kivi_int4`。残差窗口保住近期 token 的精度，
+  历史区 int4；代价是几何限制多、状态最复杂。
+- **想在 vllm-ascend-hust 上试 scheme 级集成**：packed 四件套
+  （`int4_packed` / `fp8_e4m3` / `nvfp4` / `fp4_e2m1`）——但注意它们
+  在 dev 分支上。它们只定义存储格式，计算走宿主 backend，适合先把
+  注册/分发链路打通。
+- **精度排序**（经验法则，上线前务必用目标模型实测）：per-channel
+  INT8 ≈ fp8_e4m3（带动态 scale）> KIVI INT4 > 纯 INT4 > fp4/nvfp4 系。
