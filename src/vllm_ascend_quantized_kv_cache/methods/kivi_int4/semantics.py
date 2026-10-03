@@ -240,7 +240,7 @@ class KiviInt4Semantics:
         max_len = max((int(s) for s in seq_lens), default=0)
         if max_len == 0:
             return [[] for _ in seq_lens]
-        positions = torch.arange(max_len)
+        positions = torch.arange(max_len, device=block_table.device)
         slots = (
             block_table[:, positions // block_size] * block_size
             + positions % block_size
