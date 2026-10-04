@@ -10,7 +10,7 @@
 | 方案 | 做到哪一步 | 差什么 |
 |---|---|---|
 | `int8_dynamic` | 代码全有，命令行可用 | 没在引擎里端到端跑过 |
-| `kivi_int4` | 最扎实：910B2 上 13 节设备验证全过，Qwen3.5-35B-A3B 形状有专项测试；**端到端 serve 已跑通**（2026-10-03，稠密模型实测，KV 并发 3.56x 兑现，见 [serving-verification-20261003.md](serving-verification-20261003.md)） | decode 吞吐待融合读路径；真实模型精度待测 |
+| `kivi_int4` | 最扎实：910B2 上 13 节设备验证全过，Qwen3.5-35B-A3B 形状有专项测试；**端到端 serve 已跑通**（稠密模型 3.56x 兑现；Qwen3.5 也跑通，见 [serving-verification-20261003.md](serving-verification-20261003.md)） | decode 吞吐待融合读路径；Qwen3.5 的 GDN 层走纯 torch 兜底（模型适配，非量化问题） |
 | `fp8_per_token_head` | dtype 解析、布局、CPU 参考数学、写入内核都有（本周完成） | 读路径没写；没上机；命令行没接 |
 | 四个纯格式 | 只在 dev 分支 | — |
 
