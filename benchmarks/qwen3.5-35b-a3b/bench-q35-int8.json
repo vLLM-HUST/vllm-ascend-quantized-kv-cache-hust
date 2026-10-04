@@ -1,0 +1,78 @@
+{
+ "summary": {
+  "label": "q35-int8",
+  "requests": 8,
+  "wall_s": 446.51,
+  "completion_tokens": 1024,
+  "throughput_tok_s": 2.3,
+  "latency_mean_s": 445.73,
+  "latency_max_s": 446.502,
+  "single_latency_s": 85.949,
+  "http_ok": true
+ },
+ "batch": [
+  {
+   "prompt": "The capital of France is",
+   "latency_s": 446.502,
+   "completion_tokens": 128,
+   "prompt_tokens": 15,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:** The user is asking a simple factual question: \"The capital of France is\".\n2.  **Identify the Core Question:** What is the capital city of France?\n3.  **Retrieve Knowledge:** Access knowledge about geography and world capitals.\n4.  **Retrieve Fact:** The capital of France is Paris.\n5.  **Formulate the Answer:** State the answer clearly and concisely.\n6.  **Final Output:** \"Paris.\" or \"The capital of France is Paris.\"\n\nDecision: Keep it direct and helpful. \""
+  },
+  {
+   "prompt": "List three prime numbers greater than ten:",
+   "latency_s": 440.327,
+   "completion_tokens": 128,
+   "prompt_tokens": 18,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: List three prime numbers.\n    *   Constraint: The numbers must be greater than 10.\n\n2.  **Define \"Prime Number\":** A natural number greater than 1 that has no positive divisors other than 1 and itself.\n\n3.  **Identify Prime Numbers greater than 10:**\n    *   11 (Prime)\n    *   12 (Not prime, divisible by 2, 3, 4, 6)\n    *   13"
+  },
+  {
+   "prompt": "Explain the difference between TCP and UDP in two sentences.",
+   "latency_s": 446.501,
+   "completion_tokens": 128,
+   "prompt_tokens": 22,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Topic: Difference between TCP and UDP.\n    *   Constraint: Explain in exactly two sentences.\n\n2.  **Identify Key Concepts:**\n    *   TCP (Transmission Control Protocol): Reliable, connection-oriented, ordered delivery, error checking, slower.\n    *   UDP (User Datagram Protocol): Unreliable (best-effort), connectionless, faster, less overhead.\n\n3.  **Drafting - Attempt 1:**\n    TCP is a connection-oriented protocol that ensures reliable data delivery by establishing a connection and verifying data"
+  },
+  {
+   "prompt": "9.11 and 9.8, which number is larger? Answer briefly and explain.",
+   "latency_s": 446.5,
+   "completion_tokens": 128,
+   "prompt_tokens": 30,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"9.11 and 9.8 which number is larger?\"\n    *   Constraint: \"Answer briefly and explain.\"\n\n2.  **Identify the Core Task:** Compare two decimal numbers: 9.11 and 9.8.\n\n3.  **Compare the Numbers:**\n    *   Number A: 9.11\n    *   Number B: 9.8\n    *   Compare the whole number part: Both are 9.\n    *   Compare the tenths"
+  },
+  {
+   "prompt": "Write a one-sentence summary of the plot of Romeo and Juliet.",
+   "latency_s": 446.498,
+   "completion_tokens": 128,
+   "prompt_tokens": 24,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Write a one-sentence summary of the plot of *Romeo and Juliet*.\n    *   Constraint: Must be a single sentence.\n    *   Subject: *Romeo and Juliet* (Shakespeare's play).\n\n2.  **Identify Key Plot Points:**\n    *   Two feuding families (Montagues and Capulets).\n    *   Romeo and Juliet fall in love.\n    *   They marry in secret.\n    *   Miscommunication/misfortune leads to their deaths ("
+  },
+  {
+   "prompt": "What is 17 * 23? Show the multiplication step by step.",
+   "latency_s": 446.494,
+   "completion_tokens": 128,
+   "prompt_tokens": 27,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Calculate the product of 17 and 23.\n    *   Requirement: Show the multiplication step by step.\n\n2.  **Determine the Method:**\n    *   Standard vertical multiplication (long multiplication) is the most common and clear way to show this step-by-step.\n    *   Alternative: Distributive property (breaking down numbers).\n    *   Decision: I will use the standard vertical algorithm as it's the most standard interpretation of \"show the multiplication step by step\" for arithmetic, but I might"
+  },
+  {
+   "prompt": "Name the four largest planets in the solar system in order of size.",
+   "latency_s": 446.493,
+   "completion_tokens": 128,
+   "prompt_tokens": 24,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Name the four largest planets in the solar system.\n    *   Constraint: Order them by size (presumably diameter or volume, which correlates).\n    *   Target: Four planets.\n\n2.  **Identify the Planets:**\n    *   The solar system has eight planets: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune.\n    *   The \"gas giants\" and \"ice giants\" are generally larger than the terrestrial planets.\n    *   The four largest are Jupiter"
+  },
+  {
+   "prompt": "Translate 'the weather is nice today' into French.",
+   "latency_s": 446.495,
+   "completion_tokens": 128,
+   "prompt_tokens": 21,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Source text: \"the weather is nice today\"\n    *   Target language: French\n    *   Task: Translate the sentence.\n\n2.  **Analyze the Source Sentence:**\n    *   \"the weather\" -> \"le temps\" (in the context of weather)\n    *   \"is\" -> \"est\" (verb *être*, 3rd person singular)\n    *   \"nice\" -> \"beau\" (masculine singular to agree with \"temps\")\n    *   \"today\" ->"
+  }
+ ],
+ "single": {
+  "prompt": "The capital of France is",
+  "latency_s": 85.949,
+  "completion_tokens": 128,
+  "prompt_tokens": 15,
+  "text": "Thinking Process:\n\n1.  **Analyze the Request:** The user is asking a simple factual question: \"The capital of France is\".\n2.  **Identify the Core Question:** What is the capital city of France?\n3.  **Retrieve Knowledge:** Access knowledge about geography and world capitals.\n4.  **Retrieve Fact:** The capital of France is Paris.\n5.  **Formulate the Answer:** State the answer clearly and concisely.\n6.  **Final Output:** \"Paris.\" or \"The capital of France is Paris.\"\n\nDecision: Keep it direct and helpful. \""
+ }
+}

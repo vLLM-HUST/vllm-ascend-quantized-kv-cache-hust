@@ -1,7 +1,8 @@
 # Documentation
 
 - [进展与下一步（汇总入口）](roadmap.md)
-- [serve 实测：int8/kivi_int4 跑通（2026-10-03）](serving-verification-20261003.md)
+- [Benchmark 数据（唯一保留）](benchmark.md)
+- [serve 实测：int8/kivi_int4 跑通（2026-10-03/04）](serving-verification-20261003.md)
 - [Architecture](architecture.md)
 
 量化 KV cache 方案（一览：[schemes.md](schemes.md)）：

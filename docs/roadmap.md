@@ -70,8 +70,8 @@ Palu 的 SVD——和我们"不读 checkpoint、免校准"的定位冲突）；
 ## 4. 接下来值得做的（按这个顺序）
 
 **第 0 步：把两个能用的方案补完（基线，先做）**
-✅ 端到端 serve 已跑通（2026-10-03，稠密模型：int8 49 tok/s、
-kivi_int4 4.3 tok/s、KV 并发 2.0x/3.56x 精确兑现，细节见
+✅ 端到端 serve 已跑通（fp16/int8/kivi_int4 三组，稠密模型与
+Qwen3.5-35B 都通；数据见 [benchmark.md](benchmark.md)，过程见
 [serving-verification-20261003.md](serving-verification-20261003.md)）。
 剩两件：Qwen3.5 上的真实数字（卡在宿主树落后两拍，见该文档 §4）、
 模型级精度评测。跑长上下文评测前先确认绕开 FIA 掩码 bug #15503。

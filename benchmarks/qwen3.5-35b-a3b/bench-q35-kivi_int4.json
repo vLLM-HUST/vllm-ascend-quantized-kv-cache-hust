@@ -1,0 +1,78 @@
+{
+ "summary": {
+  "label": "q35-kivi_int4",
+  "requests": 8,
+  "wall_s": 518.08,
+  "completion_tokens": 1024,
+  "throughput_tok_s": 2.0,
+  "latency_mean_s": 517.15,
+  "latency_max_s": 518.075,
+  "single_latency_s": 99.777,
+  "http_ok": true
+ },
+ "batch": [
+  {
+   "prompt": "The capital of France is",
+   "latency_s": 510.747,
+   "completion_tokens": 128,
+   "prompt_tokens": 15,
+   "text": "Thinking Process:\n\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Retrieve knowledge:** Access general knowledge about geography.\n3.  **Verify fact:** The capital of France is Paris.\n4.  **Formulate answer:** State the answer clearly and concisely.\n5.  **Final Output:** \"Paris\" or \"The capital of France is Paris.\"\n\nDecision: Keep it direct and helpful. \"Paris\" is the most direct answer, but a full sentence is polite.\n\nDraft: The capital of France is Paris.\n\nRef"
+  },
+  {
+   "prompt": "List three prime numbers greater than ten:",
+   "latency_s": 518.075,
+   "completion_tokens": 128,
+   "prompt_tokens": 18,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:** The user wants a list of three prime numbers that are greater than ten.\n\n2.  **Define \"Prime Number\":** A prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself.\n\n3.  **Identify Prime Numbers Greater Than 10:**\n    *   11 (Prime)\n    *   12 (Not prime, divisible by 2, 3, 4, 6)\n    *   13 (Prime)\n    *   "
+  },
+  {
+   "prompt": "Explain the difference between TCP and UDP in two sentences.",
+   "latency_s": 518.071,
+   "completion_tokens": 128,
+   "prompt_tokens": 22,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Topic: Difference between TCP and UDP.\n    *   Constraint: Exactly two sentences.\n\n2.  **Identify Key Differences:**\n    *   TCP (Transmission Control Protocol): Connection-oriented, reliable, ordered, error-checked, slower (overhead).\n    *   UDP (User Datagram Protocol): Connectionless, unreliable (best effort), unordered, faster, less overhead.\n\n3.  **Drafting - Attempt 1:**\n    TCP is a connection-oriented protocol that ensures reliable, ordered delivery of data packets, making it ideal"
+  },
+  {
+   "prompt": "9.11 and 9.8, which number is larger? Answer briefly and explain.",
+   "latency_s": 518.068,
+   "completion_tokens": 128,
+   "prompt_tokens": 30,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Compare two numbers: 9.11 and 9.8.\n    *   Determine which is larger.\n    *   Provide a brief answer and explanation.\n\n2.  **Compare the Numbers:**\n    *   Number A: 9.11\n    *   Number B: 9.8\n    *   Look at the whole number part: Both are 9.\n    *   Look at the tenths place (first digit after the decimal):\n        *   9.11 has a"
+  },
+  {
+   "prompt": "Write a one-sentence summary of the plot of Romeo and Juliet.",
+   "latency_s": 518.07,
+   "completion_tokens": 128,
+   "prompt_tokens": 24,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Write a one-sentence summary of the plot of *Romeo and Juliet*.\n    *   Constraint: Must be exactly one sentence.\n    *   Subject: *Romeo and Juliet* (Shakespeare's play).\n\n2.  **Identify Key Plot Points:**\n    *   Two young lovers (Romeo and Juliet).\n    *   From feuding families (Montagues and Capulets).\n    *   Secret marriage.\n    *   Miscommunication/misfortune (Romeo"
+  },
+  {
+   "prompt": "What is 17 * 23? Show the multiplication step by step.",
+   "latency_s": 518.065,
+   "completion_tokens": 128,
+   "prompt_tokens": 27,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Calculate $17 \\times 23$.\n    *   Requirement: Show the multiplication step by step.\n\n2.  **Determine the Method:**\n    *   Standard vertical multiplication (long multiplication) is the most common and clear way to show steps.\n    *   Alternative: Distributive property (breaking down numbers).\n    *   Decision: I will use the standard vertical multiplication method as it's the most intuitive for \"step by step\" requests, but I might also briefly explain the distributive logic if it"
+  },
+  {
+   "prompt": "Name the four largest planets in the solar system in order of size.",
+   "latency_s": 518.064,
+   "completion_tokens": 128,
+   "prompt_tokens": 24,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Name the four largest planets in the solar system.\n    *   Constraint: Order them by size (largest to smallest).\n    *   Context: Solar System.\n\n2.  **Identify the Planets:**\n    *   There are eight planets in the solar system: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune.\n    *   The \"gas giants\" and \"ice giants\" are generally larger than the \"terrestrial\" planets.\n    *   The four largest planets"
+  },
+  {
+   "prompt": "Translate 'the weather is nice today' into French.",
+   "latency_s": 518.065,
+   "completion_tokens": 128,
+   "prompt_tokens": 21,
+   "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Source text: \"the weather is nice today\"\n    *   Target language: French\n    *   Task: Translate the sentence.\n\n2.  **Analyze the Source Sentence:**\n    *   Subject: \"the weather\"\n    *   Verb: \"is\"\n    *   Adjective: \"nice\"\n    *   Time expression: \"today\"\n\n3.  **Determine the French Equivalents:**\n    *   \"the weather\": \"le temps\" (common usage) or \"la météo"
+  }
+ ],
+ "single": {
+  "prompt": "The capital of France is",
+  "latency_s": 99.777,
+  "completion_tokens": 128,
+  "prompt_tokens": 15,
+  "text": "Thinking Process:\n\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Retrieve knowledge:** Access general knowledge about geography.\n3.  **Verify fact:** The capital of France is Paris.\n4.  **Formulate answer:** State the answer clearly and concisely.\n5.  **Final Output:** \"Paris\" or \"The capital of France is Paris.\"\n\nDecision: Keep it direct and helpful. \"Paris\" is the most direct answer, but a full sentence is polite.\n\nDraft: The capital of France is Paris.\n\nRef"
+ }
+}

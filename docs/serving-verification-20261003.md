@@ -19,27 +19,14 @@ wheel。模型：Qwen2.5-1.5B-Instruct（稠密；用它的原因见 §4）。
 AscendKiviInt4KvAttentionImpl`、其余 dtype 原样走宿主、context
 parallel 直接拒绝。
 
-## 2. benchmark 数据（8 路并发 × max_tokens 128，温度 0）
+## 2. 稠密模型首跑（2026-10-03）
 
-| | fp16 (auto) | int8 | kivi_int4 |
-|---|---|---|---|
-| 8192 上下文可并发数 | 453x | 906x（**2.0x**） | 1611x（**3.56x**） |
-| 聚合吞吐（tok/s） | 53.0 | 49.0 | 4.3 |
-| 单路 128 token 延迟 | 0.19s | 0.23s | 0.95s |
-| 输出正确性 | 基准 | 一处事实题答错* | 与 fp16 一致 |
-
-- 并发数比就是压缩比：906/453 = 2.00、1611/453 = 3.56——和布局公式
-  逐位对上，KV 显存收益是真金白银进了块数。
-- \* 有趣的精度样本：问"9.11 和 9.8 哪个大"，fp16 和 kivi_int4 都答
-  9.8 更大（对），int8 答反了。单例不作结论，但说明 4bit 分组 +
-  残差窗口的精度可以好于 per-token int8。
-- kivi_int4 吞吐慢的根源不是 bug：每一步 decode 都要把 int4 历史
-  gather 出来反量化成稠密再算注意力（纯 torch 路径），这正是调研
-  说的"容量收益、不是带宽收益"。修法就是路线图里的融合读路径。
-
-原始 JSON：服务器 `/root/bench/results/VERIFY/bench-*.json`。
-复现脚本：`/root/bench/scripts/{start_vllm_qkv,wait_ready_qkv,verify_qkv}.sh`
-与 `bench_qkv.py`（QKV_MODEL/QKV_SERVED/QKV_EP 环境变量选模型）。
+> 数据统一收在 [benchmark.md](benchmark.md)（项目只保留那一份）。
+> 这里只留结论：Qwen2.5-1.5B-Instruct 上三组 serve 全部成功，页大小
+> 数学被并发比精确验证（fp16→int8 恰好 2.0x、→kivi_int4 恰好
+> 3.56x）；kivi 吞吐慢是 gather→反量化纯 torch 读路径的已知定位；
+> 一个精度观察样本：int8 把"9.11 和 9.8 哪个大"答反，fp16 与
+> kivi_int4 都正确。
 
 ## 3. 这轮在宿主上实测出的三处接合问题（已修）
 
@@ -90,25 +77,11 @@ free_mb 把 npu-smi"已用"当"空闲"，判断完全反向——之前 OFF/INT8
 `VLLM::Worker` 孤儿进程（会占满双卡显存）；auto_bench 的 free_mb
 把 npu-smi"已用"当"空闲"，判断反向。
 
-**benchmark（Qwen3.5-35B-A3B，TP2，8 并发 × 128 token，温度 0，同参
-eager）：**
-
-| | fp16 (auto) | int8 | kivi_int4 |
-|---|---|---|---|
-| 聚合吞吐 | 2.2 tok/s | 2.3 tok/s | 2.0 tok/s |
-| 单路 128 token | 87.1s | 85.9s | 99.8s |
-| 8192 上下文可并发 | 90.14x | 126.20x | 126.20x |
-
-- **三组输出全部连贯**（Qwen3.5 思考体正常："Analyze the Request:
-  Compare two numbers: 9.11 and 9.8..."），量化集成本身成立。
-- 吞吐慢（~2 tok/s）完全由第 3–6 条的纯 torch/Python 兜底支配，
-  三组同瓶颈，跨组对比仍公平——它属于"Qwen3.5 模型适配层"的工作，
-  与 KV 量化方案无关。生产化需要宿主升级到带这些 AscendC 内核的
-  版本（或把兜底做成真正的融合内核）。
-- 可并发数 fp16→量化组 +40%（90→126）：全注意力层只占该模型 KV 的
-  一部分（GDN 层状态是每请求定长、不随 token 增长），稀释是预期
-  行为。int8 与 kivi_int4 数值完全相同（126.20x）尚未解释——稠密
-  模型上 int8 是精确 2.0x，待查该宿主对 int8 模式的页大小处理。
+**benchmark 数据**：统一见 [benchmark.md](benchmark.md)——三组全部
+serve 成功、输出连贯；吞吐 ~2 tok/s 由第 3–6 条的纯 torch/Python
+兜底支配（三组同瓶颈，与 KV 方案无关）；KV 可并发 fp16→量化组
++40%（90→126）。两个待查项也记在那里（int8 与 kivi 并发数相同；
+GDN 兜底的性能恢复路径）。
 
 ## 5. 接下来
 
