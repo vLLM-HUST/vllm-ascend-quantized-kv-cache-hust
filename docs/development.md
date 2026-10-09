@@ -16,7 +16,7 @@ python -m build                        # 构建 wheel + sdist（纯 Python）
 bash scripts/verify-wheel.sh dist/*.whl  # wheel 内容/清单/版本校验
 ```
 
-CI（`.github/extension-ci.yml`，push main / PR 触发）：Python 3.10 /
+CI（`.github/workflows/extension-ci.yml`，push main / PR 触发）：Python 3.10 /
 3.12 / 3.14 矩阵，依次跑 `ruff check` → `ruff format --check` →
 `pytest -q` → `python -m build` → `verify-wheel.sh` → 隔离 venv 冒烟
 安装 → `vllm-hust-ext extension inspect` 发现性检查。**CI 没有 NPU
@@ -143,7 +143,7 @@ bootstrap`。五条硬规则，前四条违反会被 `tests/test_facade.py` 的�
 - 唯一版本源 `src/vllm_ascend_quantized_kv_cache/_version.py`；
   hatchling 动态读取；manifest 的 `extension_version` 必须同值
   （测试强制）。**任何代码改动 = 版本号递增**（PyPI 不可覆盖）。
-- 发布走 tag 触发的 `.github/release.yml`：build → verify-wheel →
+- 发布走 tag 触发的 `.github/workflows/release.yml`：build → verify-wheel →
   uv publish → PyPI 无缓存冒烟安装；首个发布版本需 maintainer 批准。
 - 完整清单见 [packaging-and-release.md](packaging-and-release.md)。
 

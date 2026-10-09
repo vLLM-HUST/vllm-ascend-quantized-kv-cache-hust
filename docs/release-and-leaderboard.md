@@ -39,38 +39,21 @@ benchmark 仓跑压测，成绩自动 merge 进官网。对应关系：
   发布纪律。只发 vllm-hust 项目线自己的包；用 scoped token；不得拿旧 PyPI
   版本当当前版本。目前生态内仅 `vllm-hust==0.17.2.post1` 在 PyPI 上。
 - [BidKV打包与发布指南](https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/PLUGIN_STANDARD.md)
-  （本仓库镜像：`src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md`）：
+  （组织内规范原文；本仓库曾镜像到包目录，已随 main 的
+  `fb83900` 删除，只留上游链接）：
   最完整的逐步操作手册与检查表。
 
 ### 2.2 发布流程
 
-1. **定版本**：唯一来源 `src/vllm_ascend_quantized_kv_cache/_version.py`，
-   与 manifest `bundle_version` 一致；PyPI 不许覆盖同版本文件，改代码必须升版本。
-2. **测试**：`python -m pytest -q`（当前 HEAD 90 passed）。
-3. **构建**：记录发布 commit（`git rev-parse HEAD`）、确认工作树干净后
-   `rm -rf dist && python -m build`（或 `uv build --no-sources --out-dir dist`）。
-4. **查产物**：wheel 必须包含 manifest
-   `vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json`：
-   ```bash
-   python -m zipfile -l dist/*.whl | grep manifests
-   bash scripts/verify-wheel.sh dist/*.whl
-   ```
-5. **隔离冒烟**：装进临时 venv，确认版本可读、manifest 可定位：
-   ```bash
-   uv venv .release-smoke && uv pip install --python .release-smoke/bin/python --no-deps dist/*.whl
-   .release-smoke/bin/python -c 'from importlib.metadata import version; print(version("vllm-ascend-quantized-kv-cache"))'
-   ```
-6. **发布**（需 intellistream org 下 scoped 到本项目的 token，token 不进仓库和日志）：
-   ```bash
-   export UV_PUBLISH_TOKEN='<scoped token>'
-   uv publish --check-url https://pypi.org/simple \
-     dist/vllm_ascend_quantized_kv_cache-<版本>-py3-none-any.whl \
-     dist/vllm_ascend_quantized_kv_cache-<版本>.tar.gz
-   unset UV_PUBLISH_TOKEN
-   ```
-7. **回装验证 + website 同步**：从正式 PyPI 无缓存安装确认版本；随后更新
-   website 仓 `data/version_meta.json`，跑
-   `node --check assets/versions-page.js`、
+命令级的权威流程在 [packaging-and-release.md](packaging-and-release.md)
+（定版本 → 测试 → 构建 → 查产物 → 隔离冒烟 → 上传 → 回装验证），本页
+不再重复同一套命令。这里只留打榜场景额外要做的三件事：
+
+1. **记录发布坐标**：`git rev-parse HEAD` 与工作树是否干净，写进发布说明；
+2. **两个文件都要显式列出**（wheel + sdist），PyPI 不许覆盖同版本内容，
+   所以改代码必须先升版本；
+3. **website 同步**：更新 website 仓 `data/version_meta.json` 后，在**那个仓**
+   里跑 `node --check assets/versions-page.js`、
    `python -m pytest tests/test_site_structure.py`、
    `bash scripts/check_stale_versions.sh`，review 后推 main。
 
@@ -83,21 +66,25 @@ benchmark 仓跑压测，成绩自动 merge 进官网。对应关系：
   vllm serve MODEL --kv-cache-dtype kivi_int4   # KIVI INT4
   ```
   未传 dtype 时不执行任何量化路径。
-- 宿主约束记录在 `HOST_CONTRACT.md`：宿主固定为 `vllm-ascend`，依赖
+- 宿主约束记录在 `HOST_CONTRACT.md`：宿主声明为 `vllm-ascend-hust`（与
+  manifest 的 `host.name` 一致），依赖
   `AscendAttentionBackend.get_impl_cls()` 分派点；context parallel 下拒绝启动。
 - 仅 NPU 可用，不是通用 vLLM 插件；发布说明需写明验证过的宿主版本
   （vllm-ascend-hust commit、CANN、torch_npu）。
 
-与打榜操作记录（vSpec 模板规范）比对出的**两个缺口**，部署打榜前要补：
+早先与打榜操作记录（vSpec 模板规范）比对出的**两个缺口，现已闭合**
+（合并 main 的 `4aab295` / `d6a2e81`）：
 
-- pyproject 缺 `vllm_hust.extension_bundles` entry point 组——操作记录明确
-  两个 entry-point 组缺一不可，缺② `vllm-hust-ext extension list` 看不到包；
-- manifest 是 Bundle v1 schema（`schema_version 1.0` / `bundle_id` /
-  `components`），操作记录采用的 v0.2 schema 字段为 `extension_id` /
-  `extension_version` / `kind: in_process_plugin` / `host.version_range` /
-  `runtime.process_scope` / `implementation` / `activation.environment` /
-  `additional_config`。上服务器后用 `vllm-hust-ext extension list` 实测
-  识别情况，识别不了就按 vSpec 模板对齐 v0.2 manifest。
+- `pyproject.toml` 有 `vllm_hust.extension_bundles` entry point，指向
+  `extension_manager_manifest` 包；**只保留一个同名表**——重复声明会让
+  TOML 非法、整个构建失败（本次合并的文本 auto-merge 就产生了重复，
+  `tests/test_plugin.py` 里的 entry point 断言会当场抓到）。
+- 除 Bundle v1 之外，另有一份 v0.2 Manager manifest
+  （`schema_version 0.2-experimental` / `extension_id` / `kind:
+  in_process_plugin` / `implementation` / `activation`），发现入口不自行
+  启用后端。两份 manifest 的版本与 `__version__` 由同一测试钉住，
+  `extension_id` 与本 bundle 的 `bundle_id` 一致，`activation` 指向的
+  entry point 名必须等于 wheel 实际发布的那个。
 
 ## 3. 打榜流程
 
@@ -189,10 +176,11 @@ cohort 契约的 `prepared_workload_variants` 里，tokenizer fingerprint 与
 
 - 版本 `0.2.0.dev0`；`dist/` 里有 9/21 本地构建的 wheel + sdist，**未发布 PyPI**
   （`pip index versions vllm-ascend-quantized-kv-cache` 查不到）。
-- `python -m pytest -q`：90 passed。
+  合并 main 后 `_version.py` 已随其 release 元数据升到 `0.2.0rc4`。
+- `python -m pytest -q`：当时 90 passed；当前 HEAD 112 passed。
 - manifest 已在 wheel 路径上，`scripts/verify-wheel.sh` 就绪。
-- pyproject 已补 `vllm_hust.extension_bundles` entry point（`vllm-hust-ext
-  extension list` 可见性缺口已闭；manifest 仍是 Bundle v1 schema，v0.2 对齐待做）。
+- pyproject 已补 `vllm_hust.extension_bundles` entry point，v0.2 Manager
+  manifest 也已就位（两个缺口都随合并 main 闭合）。
 
 ### 5.1 打榜服务器部署记录（vllm-hust-cyj，2026-10-02）
 
@@ -284,8 +272,8 @@ cohort 契约的 `prepared_workload_variants` 里，tokenizer fingerprint 与
 行动清单：
 
 - [ ] 版本转正：`_version.py` 与 manifest `bundle_version` 同步改为 `0.2.0`
-- [ ] 按 vSpec 模板补 `vllm_hust.extension_bundles` entry point，并核对
-      manifest 是否需对齐 v0.2 schema（见 §2.3 两个缺口）
+- [x] 按 vSpec 模板补 `vllm_hust.extension_bundles` entry point，并对齐
+      v0.2 manifest（合并 main 完成，见 §2.3）
 - [ ] 重新 `python -m pytest -q` + `python -m build` + `verify-wheel.sh`
 - [ ] 隔离环境 wheel 冒烟（含 manifest 定位检查）
 - [ ] 申请/使用 scoped token 发布 PyPI，记录文件名与哈希
@@ -348,4 +336,4 @@ batched 8192；三组仅 `--kv-cache-dtype` 不同。原始件在服务器
   `FRONTIER-REPEAT-SELECTION.md`、`FRONTIER-QWEN35-SWE-PREFIX.md`、
   `VERSION_METADATA.md`
 - 本仓库：`HOST_CONTRACT.md`、`docs/packaging-and-release.md`、
-  `src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md`
+  `docs/PLUGIN_STANDARD`（上游组织规范）
