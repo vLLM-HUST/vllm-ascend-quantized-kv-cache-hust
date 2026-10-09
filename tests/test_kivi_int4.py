@@ -1,0 +1,2015 @@
+"""KIVI INT4 method: semantics math, residual-window state machine, attention paths.
+
+The triton-ascend kernels require an Ascend NPU, so the mixin's write paths
+run against CPU reference packers, and the fused-attention branches are
+checked at the ``torch_npu`` operator boundary with a recording stub.
+"""
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+# torch is a host/runtime dependency, not a build one: the CI lane that installs
+# only the test extra has no torch, and these are the CPU numerical references for
+# the device kernels, so the whole module skips there rather than erroring.
+torch = pytest.importorskip("torch", reason="needs torch (host runtime dependency)")
+
+from vllm_ascend_quantized_kv_cache.methods.base import MethodConfig
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4 import (
+    attention_backend as ab,
+)
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4.geometry import (
+    validate_kivi_config,
+)
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4.semantics import (
+    KiviInt4Semantics,
+)
+
+HEAD_SIZE = 32
+NUM_KV_HEADS = 2
+GROUP = 8
+BLOCK = 16
+
+
+# ---------------------------------------------------------------------------
+# config invariants
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_accepts_aligned_geometry() -> None:
+    cfg = MethodConfig(
+        head_size=HEAD_SIZE,
+        group_size=GROUP,
+        residual_length=2 * GROUP,
+        block_size=BLOCK,
+    )
+    validate_kivi_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"group_size": 7}, "divisible by 8"),
+        ({"residual_length": 4, "group_size": 8}, "residual_length"),
+        ({"head_size": 12}, "head_size"),
+        ({"head_size": 8, "group_size": 16}, "head_size"),
+        ({"block_size": 8, "group_size": 16}, "block_size"),
+    ],
+)
+def test_validate_config_rejects_bad_geometry(overrides: dict, match: str) -> None:
+    kwargs = dict(
+        head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
+    )
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        validate_kivi_config(MethodConfig(**kwargs))
+
+
+# ---------------------------------------------------------------------------
+# packing math
+# ---------------------------------------------------------------------------
+
+
+def test_pack_unpack_int4_roundtrip() -> None:
+    torch.manual_seed(0)
+    quant = torch.randint(0, 16, (3, NUM_KV_HEADS, 4, 8), dtype=torch.int32)
+    packed = KiviInt4Semantics.pack_int4(quant)
+    unpacked = KiviInt4Semantics.unpack_int4(packed)
+    assert torch.equal(unpacked, quant.to(torch.float32))
+
+
+def test_fake_quant_error_bounded_by_group_range() -> None:
+    torch.manual_seed(1)
+    key = torch.randn(32, NUM_KV_HEADS, HEAD_SIZE)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
+        )
+    )
+    out = sem.fake_quant_key(key)
+    assert out.shape == key.shape
+    assert torch.max(torch.abs(out - key)) <= key.abs().max() / 7 + 1e-5
+
+    value = torch.randn(4, NUM_KV_HEADS, HEAD_SIZE)
+    vout = sem.fake_quant_value(value)
+    assert vout.shape == value.shape
+
+
+def test_dequant_key_blocks_roundtrip_shape() -> None:
+    torch.manual_seed(2)
+    batch, blocks, block_size = 1, 3, BLOCK
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
+        )
+    )
+    # legacy cache layout: [B, blocks, H, D, block/G] scales, quantised words
+    # [B, blocks, H, D, block/8]
+    k_quant = torch.randint(
+        0,
+        256,
+        (batch, blocks, NUM_KV_HEADS, HEAD_SIZE, block_size // 8),
+        dtype=torch.int32,
+    )
+    k_scale = (
+        torch.rand(batch, blocks, NUM_KV_HEADS, HEAD_SIZE, block_size // GROUP) + 0.5
+    )
+    k_mn = torch.full(
+        (batch, blocks, NUM_KV_HEADS, HEAD_SIZE, block_size // GROUP), -1.0
+    )
+    out = sem.dequant_key_blocks(k_quant, k_scale, k_mn, torch.float32)
+    assert out.shape == (batch, blocks, block_size, NUM_KV_HEADS, HEAD_SIZE)
+
+
+def test_is_aligned_key_window() -> None:
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
+        )
+    )
+    block_size = BLOCK
+    good = list(range(block_size, block_size + GROUP)) + list(
+        range(2 * block_size, 2 * block_size + GROUP)
+    )
+    assert sem.is_aligned_key_window(good, block_size)
+    assert not sem.is_aligned_key_window([], block_size)
+    assert not sem.is_aligned_key_window(list(range(GROUP - 1)), block_size)
+    # misaligned group start (offset 1 inside its block)
+    assert not sem.is_aligned_key_window(list(range(1, 1 + GROUP)), block_size)
+    # group spanning a block boundary
+    crossing = list(range(block_size - 4, block_size + 4))
+    assert not sem.is_aligned_key_window(crossing, block_size)
+
+
+def test_ordered_slots_matches_per_position_reference() -> None:
+    """The vectorized slot expansion must equal the naive per-position walk.
+
+    Random tables include unallocated (-1) blocks and hole rows; the -1
+    case is the subtle one: a negative block id can never alias a valid
+    absolute slot (block * block_size + offset <= -1), so the ``>= 0``
+    filter is exactly the old ``if block_id >= 0``.
+    """
+    torch.manual_seed(11)
+
+    def reference(block_table, seq_lens, block_size):
+        out = []
+        for req_idx, seq_len in enumerate(seq_lens):
+            slots = []
+            for pos in range(int(seq_len)):
+                block_id = int(block_table[req_idx, pos // block_size].item())
+                if block_id >= 0:
+                    slots.append(block_id * block_size + pos % block_size)
+            out.append(slots)
+        return out
+
+    for trial in range(8):
+        batch, cols, block = 5, 6, 32
+        table = torch.randint(0, 40, (batch, cols))
+        table[torch.rand_like(table.float()) < 0.25] = -1  # unallocated blocks
+        table[2, :] = -1  # a request whose whole table is holes
+        lens = [[0, 7, 3 * block + 11, 1, 6 * block], [block], [1], [0, 0, 0]][
+            trial % 4
+        ]
+        want = reference(table, lens, block)
+        got = KiviInt4Semantics.ordered_slots(table, lens, block)
+        assert got == want, f"trial {trial}: {got} != {want}"
+
+    assert (
+        KiviInt4Semantics.ordered_slots(torch.zeros(0, 2, dtype=torch.long), [], 32)
+        == []
+    )
+    assert KiviInt4Semantics.ordered_slots(
+        torch.tensor([[3, 4]], dtype=torch.long), [0], 32
+    ) == [[]]
+
+
+def test_build_causal_mask_shape_and_values() -> None:
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE, group_size=GROUP, residual_length=16, block_size=BLOCK
+        )
+    )
+    mask = sem.build_causal_mask(2, 4, torch.float32, torch.device("cpu"))
+    assert mask.shape == (1, 2, 4)
+    neg_inf = torch.finfo(torch.float32).min
+    # q_pos = [2, 3]; a kv position is masked only when kv_pos > q_pos.
+    # Row 0 (q=2) masks kv position 3; row 1 (q=3) masks nothing.
+    assert mask[0, 0, :3].equal(torch.zeros(3))
+    assert mask[0, 0, 3].item() == neg_inf
+    assert mask[0, 1].equal(torch.zeros(4))
+
+
+# ---------------------------------------------------------------------------
+# mixin residual-window state machine (stubs instead of NPU kernels)
+# ---------------------------------------------------------------------------
+
+
+class _StubBase:
+    num_kv_heads = NUM_KV_HEADS
+    head_size = HEAD_SIZE
+    num_queries_per_kv = 1
+    scale = 0.125
+    vllm_config = None
+
+    def __init__(self) -> None:
+        self.num_queries_per_kv = 1
+
+
+def _make_impl(
+    residual_length: int = 2 * GROUP,
+    max_seqs: int = 2,
+    *,
+    head_size: int = HEAD_SIZE,
+    num_kv_heads: int = NUM_KV_HEADS,
+    group_size: int = GROUP,
+    block_size: int = BLOCK,
+    num_blocks: int = 4,
+):
+    class Impl(ab.AscendKiviInt4AttentionBackendMixin, _StubBase):
+        pass
+
+    impl = Impl()
+    # initialise the full attribute set with validation deferred (the stub
+    # geometry below is intentionally smaller than the defaults)
+    impl._init_kivi_state(None)
+    impl.enable_kivi = True
+    impl.head_size = head_size
+    impl.num_kv_heads = num_kv_heads
+    impl.kivi_group_size = group_size
+    impl.kivi_residual_length = residual_length
+    impl.kivi_max_num_seqs = max_seqs
+    impl.k_quant_cache = torch.zeros(
+        num_blocks, num_kv_heads, head_size, block_size // 8, dtype=torch.int32
+    )
+    impl.k_scale_cache = torch.ones(
+        num_blocks, num_kv_heads, head_size, block_size // group_size
+    )
+    impl.k_mn_cache = torch.zeros(
+        num_blocks, num_kv_heads, head_size, block_size // group_size
+    )
+    impl.v_quant_cache = torch.zeros(
+        num_blocks, block_size, num_kv_heads, head_size // 8, dtype=torch.int32
+    )
+    impl.v_scale_cache = torch.ones(
+        num_blocks, block_size, num_kv_heads, head_size // group_size
+    )
+    impl.v_mn_cache = torch.zeros(
+        num_blocks, block_size, num_kv_heads, head_size // group_size
+    )
+
+    # Stub only the kernel launches; the real write validations stay active.
+    impl._kivi_key_launches: list = []
+    impl._kivi_value_launches: list = []
+    impl._launch_kivi_key_pack = lambda key, slots: impl._kivi_key_launches.append(
+        (key.clone(), slots.clone())
+    )
+    impl._launch_kivi_value_pack = lambda val, slots: impl._kivi_value_launches.append(
+        (val.clone(), slots.clone())
+    )
+    return impl
+
+
+def test_residual_row_lifecycle() -> None:
+    impl = _make_impl()
+    assert impl._get_kivi_residual_row("req-a", create=False) is None
+    row = impl._get_kivi_residual_row("req-a", create=True)
+    assert row == 0
+    assert impl._get_kivi_residual_row("req-a", create=False) == row
+    impl._release_kivi_residual_row("req-a")
+    assert impl._get_kivi_residual_row("req-a", create=False) is None
+    assert impl.kivi_residual_free_rows == [1, 0]
+
+
+def test_residual_rows_exhaustion_fails_closed() -> None:
+    impl = _make_impl(max_seqs=1)
+    impl._get_kivi_residual_row("r0", create=True)
+    with pytest.raises(RuntimeError, match="exhausted"):
+        impl._get_kivi_residual_row("r1", create=True)
+
+
+def test_store_entries_and_key_flush_whole_window() -> None:
+    impl = _make_impl(residual_length=2 * GROUP)
+    # 2*GROUP entries exactly fill the window: no flush yet.
+    key = torch.randn(2 * GROUP, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.arange(2 * GROUP, dtype=torch.long)  # block 1, aligned
+    impl._store_kivi_residual_entries(key, slots, req_key="r", is_key=True)
+    assert len(impl._kivi_key_launches) == 0
+    window_slots, _ = impl._collect_kivi_residual_window("r", is_key=True)
+    assert window_slots == slots.tolist()
+
+    # one more entry evicts the whole window as a single aligned flush
+    key2 = torch.randn(1, NUM_KV_HEADS, HEAD_SIZE)
+    impl._store_kivi_residual_entries(
+        key2, torch.tensor([32]), req_key="r", is_key=True
+    )
+    assert len(impl._kivi_key_launches) == 1
+    flushed, flush_slots = impl._kivi_key_launches[0]
+    assert flushed.shape[0] == 2 * GROUP
+    assert torch.equal(flush_slots, slots)
+    window_slots, tensors = impl._collect_kivi_residual_window("r", is_key=True)
+    assert window_slots == [32] and tensors is not None
+
+
+def test_store_mixed_overwrite_and_value_eviction_keeps_order() -> None:
+    """In-place overwrite of a held slot while the window is full.
+
+    The mirror-based store must reproduce the sequential semantics: the
+    overwrite does not evict anything, the new slot evicts exactly one
+    (the oldest) value lane, and the overwritten lane survives.
+    """
+    impl = _make_impl(residual_length=2 * GROUP)
+    value = torch.randn(2 * GROUP, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.arange(2 * GROUP, dtype=torch.long)
+    impl._store_kivi_residual_entries(value, slots, req_key="r", is_key=False)
+    assert [len(launch) for launch in impl._kivi_value_launches] == []
+
+    # slot 5 already lives in the window; slot 2*GROUP is new and must
+    # evict slot 0 (FIFO), not touch slot 5's lane.
+    batch_values = torch.randn(2, NUM_KV_HEADS, HEAD_SIZE)
+    batch_slots = torch.tensor([5, 2 * GROUP], dtype=torch.long)
+    impl._store_kivi_residual_entries(
+        batch_values, batch_slots, req_key="r", is_key=False
+    )
+    assert len(impl._kivi_value_launches) == 1
+    flushed, flush_slots = impl._kivi_value_launches[0]
+    assert flushed.shape[0] == 1 and flush_slots.tolist() == [0]
+
+    window_slots, tensors = impl._collect_kivi_residual_window("r", is_key=False)
+    assert window_slots == list(range(1, 2 * GROUP + 1))
+    assert tensors is not None
+    # slot 5's lane holds the overwrite (last write wins), slot 2*GROUP the
+    # fresh append; every other lane keeps its original value.
+    assert torch.allclose(tensors[4], batch_values[0])
+    assert torch.allclose(tensors[-1], batch_values[1])
+    assert torch.allclose(tensors[0], value[1])
+
+
+def test_value_flush_is_slot_at_a_time() -> None:
+    impl = _make_impl(residual_length=2 * GROUP)
+    value = torch.randn(2 * GROUP + 1, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.arange(2 * GROUP + 1, dtype=torch.long)
+    impl._store_kivi_residual_entries(value, slots, req_key="r", is_key=False)
+    # the 17th store evicts exactly one (the oldest) value slot
+    assert len(impl._kivi_value_launches) == 1
+    flushed, flush_slots = impl._kivi_value_launches[0]
+    assert flushed.shape[0] == 1
+    assert flush_slots.tolist() == [0]
+    window_slots, _ = impl._collect_kivi_residual_window("r", is_key=False)
+    assert window_slots == slots[1:].tolist()
+
+
+def test_bulk_prefill_flushes_a_full_window_that_incremental_writes_keep_exact() -> (
+    None
+):
+    """The two INT4 write paths disagree exactly at a full residual window.
+
+    Pinned because it decides what a generation looks like on device: a prompt
+    of exactly ``residual_length`` tokens is quantized by the prefill writer,
+    while the same tokens arriving one per step stay full precision until the
+    first overflow. ``scripts/npu_probe_kivi_generate.py`` applies one rule per
+    phase and fails if either half drifts.
+    """
+    tokens = 2 * GROUP  # == residual_length: the boundary case
+    key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn_like(key)
+    slots = torch.arange(tokens, dtype=torch.long)
+
+    bulk = _make_impl()
+    bulk._write_kivi_prefill_cache(key, value, slots, ["bulk"], [tokens])
+    assert len(bulk._kivi_key_launches) == 1
+    assert len(bulk._kivi_value_launches) == 1
+    flushed_keys, flush_slots = bulk._kivi_key_launches[0]
+    assert flushed_keys.shape[0] == tokens
+    assert torch.equal(flush_slots, slots)
+    # the whole prompt went to the int4 region, so no residual row exists at all
+    assert bulk._get_kivi_residual_row("bulk", create=False) is None
+
+    incremental = _make_impl()
+    for step in range(tokens):
+        incremental._write_kivi_cache(
+            key[step : step + 1],
+            value[step : step + 1],
+            slots[step : step + 1],
+            ["incr"],
+            [step + 1],
+        )
+    assert incremental._kivi_key_launches == []
+    assert incremental._kivi_value_launches == []
+    row = incremental._get_kivi_residual_row("incr", create=False)
+    assert row is not None
+    assert int(incremental.kivi_residual_key_len[row]) == tokens
+    assert int(incremental.kivi_residual_value_len[row]) == tokens
+
+
+def test_misaligned_key_flush_fails_closed_before_kernel() -> None:
+    impl = _make_impl()
+    # Real validation path: misaligned slots must be rejected before any
+    # triton import/launch happens.
+    key = torch.randn(GROUP, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.arange(1, 1 + GROUP, dtype=torch.long)  # offset 1 -> misaligned
+    with pytest.raises(RuntimeError, match="aligned token groups"):
+        impl._write_kivi_key_quant_cache(key, slots)
+    # partial token count must be rejected too
+    with pytest.raises(RuntimeError, match="whole token groups"):
+        impl._write_kivi_key_quant_cache(key[:-1], torch.arange(GROUP - 1))
+
+
+def test_aligned_key_flush_reaches_kernel_hook() -> None:
+    impl = _make_impl()
+    launches: list = []
+    impl._launch_kivi_key_pack = lambda key, slots: launches.append(slots.clone())
+    key = torch.randn(GROUP, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.arange(GROUP, dtype=torch.long)  # block 0 group 0: aligned
+    impl._write_kivi_key_quant_cache(key, slots)
+    assert len(launches) == 1
+    assert torch.equal(launches[0], slots)
+
+
+def test_release_finished_rows_clears_windows() -> None:
+    impl = _make_impl()
+    value = torch.randn(2, NUM_KV_HEADS, HEAD_SIZE)
+    slots = torch.tensor([0, 1], dtype=torch.long)
+    impl._store_kivi_residual_entries(value, slots, req_key="r", is_key=False)
+    assert impl._has_kivi_residual_entry(0, req_key="r", is_key=False)
+    impl._release_finished_kivi_residual_rows({"r"})
+    assert not impl._has_kivi_residual_entry(0, req_key="r", is_key=False)
+    assert impl._get_kivi_residual_row("r", create=False) is None
+
+
+def test_sync_windows_releases_finished_and_keeps_live() -> None:
+    impl = _make_impl()
+    impl._get_kivi_residual_row("live", create=True)
+    impl._get_kivi_residual_row("dead", create=True)
+    block_table = torch.tensor([[0], [1]])
+    impl._sync_kivi_residual_windows(
+        block_table, [1, 1], ["live"], finished_req_ids={"dead"}
+    )
+    assert impl._get_kivi_residual_row("dead", create=False) is None
+    assert impl._get_kivi_residual_row("live", create=False) is not None
+
+
+def test_sync_prunes_residual_slots_the_request_no_longer_owns() -> None:
+    """A rolled-back request must not keep full-precision entries for slots it
+    no longer owns, or its next gather splices them back into the sequence."""
+    impl = _make_impl(residual_length=2 * GROUP)
+    value = torch.randn(4, NUM_KV_HEADS, HEAD_SIZE)
+    impl._store_kivi_residual_entries(
+        value, torch.tensor([0, 1, 2, 3]), req_key="r", is_key=False
+    )
+    stored, _ = impl._collect_kivi_residual_window("r", is_key=False)
+    assert stored == [0, 1, 2, 3]
+
+    # the scheduler rolls the request back to two tokens: slots 2 and 3 are no
+    # longer part of its sequence
+    impl._sync_kivi_residual_windows(torch.tensor([[0]], dtype=torch.long), [2], ["r"])
+    stored, tensors = impl._collect_kivi_residual_window("r", is_key=False)
+    assert stored == [0, 1]
+    assert tensors is not None and tensors.shape[0] == 2
+    # the request itself keeps its row -- only the stale slots go
+    assert impl._get_kivi_residual_row("r", create=False) is not None
+
+
+def test_bind_kivi_cache_rejects_bad_layouts() -> None:
+    impl = _make_impl()
+    with pytest.raises(RuntimeError, match="6-tuple"):
+        impl._bind_kivi_cache((impl.k_quant_cache,))
+    impl._bind_kivi_cache(
+        [
+            impl.k_quant_cache,
+            impl.k_scale_cache,
+            impl.k_mn_cache,
+            impl.v_quant_cache,
+            impl.v_scale_cache,
+            impl.v_mn_cache,
+        ]
+    )
+    assert impl.kivi_residual_key_cache is not None
+
+
+def test_chunked_prefill_with_history_fails_closed() -> None:
+    impl = _make_impl()
+    md = SimpleNamespace(
+        actual_seq_lengths_q=[8, 16],
+        seq_lens_list=[32, 16],
+        num_decodes=1,
+        num_decode_tokens=8,
+        num_prefills=1,
+    )
+    assert impl._is_kivi_chunked_prefill_all_new(md) is False
+
+
+# ---------------------------------------------------------------------------
+# torch-op gather path (routed by kivi_dequant_gather_cache) — CPU roundtrip
+# ---------------------------------------------------------------------------
+
+
+def _build_packed_key_cache(
+    key, *, num_blocks, block_size, group_size, num_kv_heads, head_size
+):
+    """Emulate the (NPU-only) pack kernel layout on CPU via semantics math."""
+    torch.manual_seed(3)
+    kq = torch.zeros(
+        num_blocks, num_kv_heads, head_size, block_size // 8, dtype=torch.int32
+    )
+    ks = torch.zeros(num_blocks, num_kv_heads, head_size, block_size // group_size)
+    km = torch.zeros_like(ks)
+    for b in range(num_blocks):
+        block_key = key[b * block_size : (b + 1) * block_size]  # [B, KVH, H]
+        grouped = block_key.view(
+            block_size // group_size, group_size, num_kv_heads, head_size
+        )
+        mn = grouped.amin(dim=1, keepdim=True)
+        mx = grouped.amax(dim=1, keepdim=True)
+        scale = KiviInt4Semantics.group_scale(mn, mx)
+        quant = KiviInt4Semantics.quantize_group(grouped, mn, scale)
+        # [groups, group, KVH, H] -> [KVH, H, block/8, 8]
+        words = quant.permute(2, 3, 0, 1).reshape(
+            num_kv_heads, head_size, block_size // 8, 8
+        )
+        kq[b] = KiviInt4Semantics.pack_int4(words)
+        ks[b] = scale[:, 0].permute(1, 2, 0)  # [KVH, H, groups]
+        km[b] = mn[:, 0].permute(1, 2, 0)
+    return kq, ks, km
+
+
+def _build_packed_value_cache(
+    value, *, num_blocks, block_size, group_size, num_kv_heads, head_size
+):
+    """值的 head 维组量化打包成 ``[blocks, block, KVH, head/8]`` int32 word。"""
+    total = num_blocks * block_size
+    grouped = value.view(total, num_kv_heads, head_size // group_size, group_size)
+    vmn = grouped.amin(-1, keepdim=True)
+    vscale = KiviInt4Semantics.group_scale(vmn, grouped.amax(-1, keepdim=True))
+    vquant = KiviInt4Semantics.quantize_group(grouped, vmn, vscale).view(
+        total, num_kv_heads, head_size
+    )
+    pad = torch.zeros(total, num_kv_heads, (8 - head_size % 8) % 8, dtype=torch.int32)
+    vquant = torch.cat([vquant, pad], dim=-1)
+    vq_words = KiviInt4Semantics.pack_int4(
+        vquant.view(num_blocks, block_size, num_kv_heads, head_size // 8, 8)
+    )
+    return (
+        vq_words,
+        vscale.view(num_blocks, block_size, num_kv_heads, head_size // group_size),
+        vmn.view(num_blocks, block_size, num_kv_heads, head_size // group_size),
+    )
+
+
+def test_dequant_gather_cache_torch_roundtrip_cpu() -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_gather import (
+        kivi_dequant_gather_cache,
+    )
+
+    torch.manual_seed(4)
+    nb, block, group, kvh, head = 3, 16, 8, 2, 32
+    total = nb * block
+    key = torch.randn(total, kvh, head)
+    value = torch.randn(total, kvh, head)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=group,
+            block_size=block,
+        )
+    )
+    kq, ks, km = _build_packed_key_cache(
+        key,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    # values: per-token per-head-dim-group quantization
+    vq_words, v_scale, v_mn = _build_packed_value_cache(
+        value,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+
+    block_table = torch.arange(nb).view(1, nb)
+    seq_lens = torch.tensor([total])
+    k_out, v_out = kivi_dequant_gather_cache(
+        kq,
+        ks,
+        km,
+        vq_words,
+        v_scale,
+        v_mn,
+        block_table,
+        seq_lens,
+        torch.float32,
+        group,
+    )
+    ref_k = sem.fake_quant_key(key)
+    ref_v = sem.fake_quant_value(value)
+    assert torch.allclose(k_out, ref_k, atol=1e-5)
+    assert torch.allclose(v_out, ref_v, atol=1e-5)
+
+    # partial sequence: only live tokens come back
+    k_out2, v_out2 = kivi_dequant_gather_cache(
+        kq,
+        ks,
+        km,
+        vq_words,
+        v_scale,
+        v_mn,
+        block_table,
+        torch.tensor([total - 3]),
+        torch.float32,
+        group,
+    )
+    assert k_out2.shape[0] == total - 3
+    assert torch.equal(k_out2, k_out[: total - 3])
+
+
+def test_semantics_block_dequant_matches_gather_op() -> None:
+    """The CPU reference and the routed gather op encode the same dequant math.
+
+    They are two implementations, so drift has to fail loudly: the semantics
+    side is what the NPU kernels are bit-checked against on 910B2.
+    """
+    from vllm_ascend_quantized_kv_cache.ops.kivi_gather import (
+        kivi_dequant_gather_cache,
+    )
+
+    torch.manual_seed(11)
+    nb, block, group, kvh, head = 2, 16, 8, 2, 32
+    total = nb * block
+    key = torch.randn(total, kvh, head)
+    value = torch.randn(total, kvh, head)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=group,
+            block_size=block,
+        )
+    )
+    kq, ks, km = _build_packed_key_cache(
+        key,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    vq, vs, vm = _build_packed_value_cache(
+        value,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+
+    gathered_k, gathered_v = kivi_dequant_gather_cache(
+        kq,
+        ks,
+        km,
+        vq,
+        vs,
+        vm,
+        torch.arange(nb).view(1, nb),
+        torch.tensor([total]),
+        torch.float32,
+        group,
+    )
+    ref_k = sem.dequant_key_blocks(
+        kq.unsqueeze(0), ks.unsqueeze(0), km.unsqueeze(0), torch.float32
+    )
+    ref_v = sem.dequant_value_blocks(
+        vq.unsqueeze(0), vs.unsqueeze(0), vm.unsqueeze(0), torch.float32
+    )
+    assert torch.equal(ref_k.reshape(total, kvh, head), gathered_k)
+    assert torch.equal(ref_v.reshape(total, kvh, head), gathered_v)
+
+
+# ---------------------------------------------------------------------------
+# forward(): CPU reference packers stand in for the triton launches, so the
+# whole write -> flush -> gather -> attention pipeline runs without an NPU.
+# ---------------------------------------------------------------------------
+
+
+def _install_cpu_packers(impl) -> None:
+    """Slot-driven int4 packers writing the exact layout the kernels define."""
+    block = impl.k_quant_cache.shape[-1] * 8
+
+    def pack_key(key, slots):
+        group = impl.kivi_group_size
+        for gi in range(key.shape[0] // group):
+            grp = key[gi * group : (gi + 1) * group].to(torch.float32)
+            blk, off = int(slots[gi * group]) // block, int(slots[gi * group]) % block
+            mn = grp.amin(dim=0, keepdim=True)
+            scale = KiviInt4Semantics.group_scale(mn, grp.amax(dim=0, keepdim=True))
+            quant = KiviInt4Semantics.quantize_group(grp, mn, scale)
+            words = quant.permute(1, 2, 0).reshape(
+                impl.num_kv_heads, impl.head_size, group // 8, 8
+            )
+            first_word = off // 8
+            impl.k_quant_cache[blk, :, :, first_word : first_word + group // 8] = (
+                KiviInt4Semantics.pack_int4(words)
+            )
+            impl.k_scale_cache[blk, :, :, off // group] = scale[0]
+            impl.k_mn_cache[blk, :, :, off // group] = mn[0]
+
+    def pack_value(value, slots):
+        group = impl.kivi_group_size
+        heads = impl.head_size // group
+        for i in range(value.shape[0]):
+            v = value[i].to(torch.float32)
+            blk, off = int(slots[i]) // block, int(slots[i]) % block
+            grouped = v.reshape(impl.num_kv_heads, heads, group)
+            mn = grouped.amin(dim=-1, keepdim=True)
+            scale = KiviInt4Semantics.group_scale(
+                mn, grouped.amax(dim=-1, keepdim=True)
+            )
+            quant = KiviInt4Semantics.quantize_group(grouped, mn, scale)
+            flat = quant.reshape(impl.num_kv_heads, impl.head_size)
+            impl.v_quant_cache[blk, off] = KiviInt4Semantics.pack_int4(
+                flat.reshape(impl.num_kv_heads, impl.head_size // 8, 8)
+            )
+            impl.v_scale_cache[blk, off] = scale[..., 0]
+            impl.v_mn_cache[blk, off] = mn[..., 0]
+
+    impl._launch_kivi_key_pack = pack_key
+    impl._launch_kivi_value_pack = pack_value
+
+
+def _six_tuple(impl):
+    return (
+        impl.k_quant_cache,
+        impl.k_scale_cache,
+        impl.k_mn_cache,
+        impl.v_quant_cache,
+        impl.v_scale_cache,
+        impl.v_mn_cache,
+    )
+
+
+def _metadata(tokens: int, **overrides):
+    class _State:
+        name = "PrefillCacheHit"
+
+    md = SimpleNamespace(
+        attn_state=_State(),
+        actual_seq_lengths_q=[tokens],
+        seq_lens_list=[tokens],
+        slot_mapping=torch.arange(tokens, dtype=torch.long),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.long),
+        req_ids=["r"],
+        num_actual_tokens=tokens,
+        causal=True,
+        finished_req_ids=None,
+    )
+    for key, value in overrides.items():
+        setattr(md, key, value)
+    return md
+
+
+def test_forward_guards_fail_closed() -> None:
+    impl = _make_impl()
+    q = k = v = torch.randn(1, NUM_KV_HEADS, HEAD_SIZE)
+    out = torch.zeros(1, NUM_KV_HEADS, HEAD_SIZE)
+
+    assert impl.forward(None, q, k, v, _six_tuple(impl), None, out) is out
+    assert torch.equal(out, torch.zeros_like(out))
+
+    with pytest.raises(NotImplementedError, match="fused output quantization"):
+        impl.forward(
+            None, q, k, v, _six_tuple(impl), _metadata(1), out, output_scale=out.clone()
+        )
+    with pytest.raises(RuntimeError, match="6-tuple"):
+        impl.forward(None, q, k, v, (impl.k_quant_cache,), _metadata(1), out)
+
+    impl.enable_kivi = False
+    with pytest.raises(RuntimeError, match="kivi_int4 cache dtype"):
+        impl.forward(None, q, k, v, _six_tuple(impl), _metadata(1), out)
+
+
+def test_forward_history_plus_residual_matches_quantized_reference() -> None:
+    """Keys flush whole groups into int4 history; the residual tail stays exact."""
+    residual = 2 * GROUP
+    tokens = residual + 1
+    torch.manual_seed(7)
+    impl = _make_impl(residual_length=residual)
+    _install_cpu_packers(impl)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            group_size=GROUP,
+            residual_length=residual,
+            block_size=BLOCK,
+        )
+    )
+
+    query = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    output = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+
+    got = impl.forward(
+        None, query, key, value, _six_tuple(impl), _metadata(tokens), output
+    )
+
+    # history: the first `residual` keys were flushed as two aligned groups;
+    # values only evict one oldest slot at a time.
+    expected_k = torch.cat([sem.fake_quant_key(key[:residual]), key[residual:]])
+    expected_v = torch.cat([sem.fake_quant_value(value[:1]), value[1:]])
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        torch.tensor([[0, 1]], dtype=torch.long), [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5)
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5)
+
+    scores = torch.einsum("qhd,khd->hqk", query, expected_k) * impl.scale
+    mask = torch.triu(torch.full((tokens, tokens), float("-inf")), diagonal=1)
+    reference = torch.einsum(
+        "hqk,khd->qhd", torch.softmax(scores + mask, dim=-1), expected_v
+    )
+    assert torch.allclose(got, reference, atol=1e-4)
+
+    # Non-vacuity: the same attention over unquantized KV must differ, or the
+    # int4 history would not be in the compute loop at all.
+    exact_scores = torch.einsum("qhd,khd->hqk", query, key) * impl.scale
+    exact = torch.einsum(
+        "hqk,khd->qhd", torch.softmax(exact_scores + mask, dim=-1), value
+    )
+    assert (got - exact).abs().max() > 1e-3
+    assert impl.k_quant_cache.any() and impl.v_quant_cache.any()
+
+
+@pytest.mark.parametrize(
+    "break_it, match",
+    [
+        (lambda c: c.__setitem__("kq", c["kq"].transpose(1, 2)), "must be contiguous"),
+        (
+            lambda c: c.__setitem__("ks", torch.zeros(2, 2, 32, 3)),
+            "k_scale_cache layout",
+        ),
+        (
+            lambda c: c.__setitem__("vq", torch.zeros(2, 8, 2, 4, dtype=torch.int32)),
+            "layout mismatch",
+        ),
+        (
+            lambda c: c.__setitem__("block_table", c["block_table"].float()),
+            "block_table must be int32/int64",
+        ),
+        (lambda c: c.__setitem__("seq_lens", torch.tensor([16, 16])), "must match"),
+    ],
+)
+def test_gather_op_rejects_broken_cache_layout(break_it, match) -> None:
+    """Every pack-kernel layout promise is enforced before any gather compute."""
+    from vllm_ascend_quantized_kv_cache.ops.kivi_gather import (
+        kivi_dequant_gather_cache,
+    )
+
+    nb, block, group, kvh, head = 2, 16, 8, 2, 32
+    total = nb * block
+    key = torch.randn(total, kvh, head)
+    value = torch.randn(total, kvh, head)
+    kq, ks, km = _build_packed_key_cache(
+        key,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    vq, vs, vm = _build_packed_value_cache(
+        value,
+        num_blocks=nb,
+        block_size=block,
+        group_size=group,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    caches = {
+        "kq": kq,
+        "ks": ks,
+        "km": km,
+        "vq": vq,
+        "vs": vs,
+        "vm": vm,
+        "block_table": torch.arange(nb).view(1, nb),
+        "seq_lens": torch.tensor([total]),
+    }
+    break_it(caches)
+    with pytest.raises(RuntimeError, match=match):
+        kivi_dequant_gather_cache(
+            caches["kq"],
+            caches["ks"],
+            caches["km"],
+            caches["vq"],
+            caches["vs"],
+            caches["vm"],
+            caches["block_table"],
+            caches["seq_lens"],
+            torch.float32,
+            group,
+        )
+
+
+def test_gather_op_requires_eight_lane_groups() -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_gather import (
+        kivi_dequant_gather_cache,
+    )
+
+    nb, block, kvh, head = 2, 16, 2, 32
+    total = nb * block
+    key = torch.randn(total, kvh, head)
+    value = torch.randn(total, kvh, head)
+    kq, ks, km = _build_packed_key_cache(
+        key,
+        num_blocks=nb,
+        block_size=block,
+        group_size=8,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    vq, vs, vm = _build_packed_value_cache(
+        value,
+        num_blocks=nb,
+        block_size=block,
+        group_size=8,
+        num_kv_heads=kvh,
+        head_size=head,
+    )
+    with pytest.raises(RuntimeError, match="divisible by 8"):
+        kivi_dequant_gather_cache(
+            kq,
+            ks,
+            km,
+            vq,
+            vs,
+            vm,
+            torch.arange(nb).view(1, nb),
+            torch.tensor([total]),
+            torch.float32,
+            4,
+        )
+
+
+# ---------------------------------------------------------------------------
+# NPU operator boundary: the fused-attention branches are checked against a
+# recording torch_npu stub (port fidelity), which is the same standard the
+# pack/gather kernels are held to before a 910B2 run.
+# ---------------------------------------------------------------------------
+
+
+def _fake_torch_npu(monkeypatch):
+    """Install a recording ``torch_npu`` and return the captured call list."""
+    import sys
+    import types
+
+    calls: list[dict] = []
+
+    def npu_fused_infer_attention_score(**kwargs):
+        query = kwargs["query"]
+        heads = kwargs["num_heads"]
+        head_size = kwargs["key"].shape[-1]
+        # a per-call sentinel, so a wrong output slice is detectable
+        out = torch.full(
+            (query.shape[0], heads, head_size), float(len(calls) + 1), dtype=query.dtype
+        )
+        calls.append(kwargs)
+        return out, None
+
+    module = types.ModuleType("torch_npu")
+    module.npu_fused_infer_attention_score = npu_fused_infer_attention_score
+    monkeypatch.setitem(sys.modules, "torch_npu", module)
+    return calls
+
+
+def _attention_impl(residual_length: int = 2 * GROUP):
+    impl = _make_impl(residual_length=residual_length)
+    _install_cpu_packers(impl)
+    impl.num_heads = NUM_KV_HEADS
+    return impl
+
+
+def test_prefill_nocache_quantizes_then_calls_dense_tnd_fia(monkeypatch) -> None:
+    tokens = 2 * GROUP + 1
+    impl = _attention_impl()
+    calls = _fake_torch_npu(monkeypatch)
+
+    query = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    mask = torch.zeros(1, tokens, tokens)
+
+    md = _metadata(
+        tokens,
+        attn_state=SimpleNamespace(name="PrefillNoCache"),
+        attn_mask=mask,
+    )
+
+    impl.forward(
+        None,
+        query,
+        key,
+        value,
+        _six_tuple(impl),
+        md,
+        out,
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["input_layout"] == "TND"
+    # causal prefill uses the additive mask, and the operator sees the raw
+    # prompt K/V while the packed copy lands in history + residual
+    assert call["sparse_mode"] == 3
+    assert call["atten_mask"] is mask
+    assert torch.equal(call["key"], key)
+    assert call["block_table"] is None
+    assert call["actual_seq_lengths"] == [tokens]
+    assert call["num_heads"] == NUM_KV_HEADS
+    assert call["num_key_value_heads"] == NUM_KV_HEADS
+    assert torch.equal(out, torch.ones_like(out))
+    assert impl.k_scale_cache.abs().sum() > 0
+    assert impl._get_kivi_residual_row("r", create=False) is not None
+
+
+def test_decode_only_gathers_history_and_calls_paged_fia(monkeypatch) -> None:
+    impl = _attention_impl()
+    history = 2 * GROUP
+    # two requests, each with a fully flushed 16-token history
+    prefill_key = torch.randn(2 * history, NUM_KV_HEADS, HEAD_SIZE)
+    prefill_value = torch.randn(2 * history, NUM_KV_HEADS, HEAD_SIZE)
+    impl._write_kivi_cache(
+        prefill_key,
+        prefill_value,
+        torch.arange(2 * history, dtype=torch.long),
+        ["a", "b"],
+        [history, 2 * history],
+    )
+
+    calls = _fake_torch_npu(monkeypatch)
+    # one decode token per request; request a continues into block 2
+    query = torch.randn(2, NUM_KV_HEADS, HEAD_SIZE)
+    key = torch.randn(2, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn(2, NUM_KV_HEADS, HEAD_SIZE)
+    out = torch.zeros(2, NUM_KV_HEADS, HEAD_SIZE)
+    seq_len = history + 1
+    md = _metadata(
+        2,
+        attn_state=SimpleNamespace(name="DecodeOnly"),
+        seq_lens_list=[seq_len, seq_len],
+        slot_mapping=torch.tensor([2 * history, 2 * history + 1], dtype=torch.long),
+        block_tables=torch.tensor([[0, 2], [1, 2]], dtype=torch.long),
+        req_ids=["a", "b"],
+    )
+
+    impl.forward(None, query, key, value, _six_tuple(impl), md, out)
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["input_layout"] == "TND"
+    assert call["sparse_mode"] == 0
+    assert call["block_table"] is None
+    assert "atten_mask" not in call
+    # one query token per request; kv lengths are cumulative across the batch
+    assert call["actual_seq_lengths"] == [1, 2]
+    assert call["actual_seq_lengths_kv"] == [seq_len, 2 * seq_len]
+    assert call["query"].shape[0] == 2
+    assert call["key"].shape == (2 * seq_len, NUM_KV_HEADS, HEAD_SIZE)
+    assert call["num_key_value_heads"] == NUM_KV_HEADS
+    assert torch.equal(out, torch.ones_like(out))
+    # the overflowed windows left for int4 history; this step's K/V stayed exact
+    assert impl._has_kivi_residual_entry(2 * history, req_key="a", is_key=True)
+    assert not impl._has_kivi_residual_entry(0, req_key="a", is_key=True)
+    assert impl.k_scale_cache.abs().sum() > 0
+
+
+def test_chunked_prefill_dispatches_decode_rows_then_prompt_rows(monkeypatch) -> None:
+    impl = _attention_impl()
+    calls = _fake_torch_npu(monkeypatch)
+
+    num_decode, prompt = 1, 4
+    tokens = num_decode + prompt
+    query = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    md = _metadata(
+        tokens,
+        attn_state=SimpleNamespace(name="ChunkedPrefill"),
+        actual_seq_lengths_q=[num_decode, tokens],
+        seq_lens_list=[num_decode, prompt],
+        num_decodes=num_decode,
+        num_decode_tokens=num_decode,
+        num_prefills=1,
+        req_ids=["d", "p"],
+        block_tables=torch.tensor([[0, 0], [0, 1]], dtype=torch.long),
+        attn_mask=torch.zeros(1, prompt, prompt),
+    )
+
+    impl.forward(None, query, key, value, _six_tuple(impl), md, out)
+
+    assert len(calls) == 2
+    decode_call, prefill_call = calls
+    assert decode_call["query"].shape[0] == num_decode
+    assert decode_call["actual_seq_lengths"] == [1]
+    assert decode_call["actual_seq_lengths_kv"] == [num_decode]
+    assert prefill_call["query"] is not None
+    assert prefill_call["query"].shape[0] == prompt
+    # all-new prompt rows attend to their own dense K/V, not the paged cache
+    assert torch.equal(prefill_call["key"], key[num_decode:tokens])
+    assert prefill_call["sparse_mode"] == 3
+    assert prefill_call["actual_seq_lengths"] == [prompt]
+    assert prefill_call["block_size"] == BLOCK
+    # decode rows took the first FIA result, prefill rows the second one
+    assert torch.equal(out[:num_decode], torch.ones_like(out[:num_decode]))
+    assert torch.equal(
+        out[num_decode:tokens], torch.full_like(out[num_decode:tokens], 2.0)
+    )
+
+
+def test_reference_arithmetic_matches_pack_kernel_contract() -> None:
+    """The CPU reference must round and floor exactly like the triton kernel.
+
+    Both choices were measured against ``ops/triton/kivi_pack.py``: the scale
+    floor applies to the scale, and ties round up (``floor(x + 0.5)``), while
+    ``torch.round`` is half-to-even.
+    """
+    kernel_source = (
+        Path(__file__).parents[1]
+        / "src/vllm_ascend_quantized_kv_cache/ops/triton/kivi_pack.py"
+    ).read_text()
+    assert "tl.maximum((mx - mn) / 15.0, 1.0e-6)" in kernel_source
+    assert "tl.floor((pack_values - mn) / scale + 0.5)" in kernel_source
+
+    mn = torch.zeros(1, 1, 1)
+    # a near-constant group: flooring the range first would yield 2e-8 scale
+    assert KiviInt4Semantics.group_scale(mn, torch.full_like(mn, 3e-7)).item() == (
+        pytest.approx(1e-6, rel=1e-6)
+    )
+    assert KiviInt4Semantics.group_scale(mn, torch.full_like(mn, 1e-9)).item() == (
+        pytest.approx(1e-6, rel=1e-6)
+    )
+
+    scale = torch.full((1, 1, 3), 1.0)
+    values = torch.full((1, 1, 3), 2.5)
+    quantized = KiviInt4Semantics.quantize_group(values, mn, scale)
+    assert quantized.tolist() == [[[3, 3, 3]]]
+    assert quantized.dtype == torch.int32
+    clipped = KiviInt4Semantics.quantize_group(
+        torch.full((1, 1, 1), 99.0), torch.zeros(1, 1, 1), torch.ones(1, 1, 1)
+    )
+    assert clipped.item() == 15
+
+
+def test_chunked_prefill_with_prompt_history_fails_closed(monkeypatch) -> None:
+    impl = _attention_impl()
+    _fake_torch_npu(monkeypatch)
+    tokens = 5
+    md = _metadata(
+        tokens,
+        attn_state=SimpleNamespace(name="ChunkedPrefill"),
+        actual_seq_lengths_q=[1, tokens],
+        seq_lens_list=[1, tokens - 1 + 3],
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_prefills=1,
+    )
+    with pytest.raises(RuntimeError, match="historical KV cache"):
+        impl.forward(
+            None,
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            _six_tuple(impl),
+            md,
+            torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE),
+        )
+
+
+# ---------------------------------------------------------------------------
+# byte-region caches: vLLM hands the impl two tensors, so the six KIVI views
+# have to be views over those two buffers.
+# ---------------------------------------------------------------------------
+
+
+def _byte_caches(num_blocks: int = 4, block_size: int = BLOCK):
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+    )
+
+    layout = KiviByteCacheLayout(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        group_size=GROUP,
+    )
+    key = torch.zeros(
+        num_blocks,
+        block_size,
+        NUM_KV_HEADS,
+        layout.bytes_per_token_head,
+        dtype=torch.uint8,
+    )
+    value = torch.zeros_like(key)
+    return key, value, layout
+
+
+def test_byte_cache_budget_matches_view_sizes() -> None:
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+    )
+
+    key, value, layout = _byte_caches()
+    # independent arithmetic: int4 data + one fp32 scale and min per group
+    assert layout.bytes_per_token_head == HEAD_SIZE // 2 + 8 * HEAD_SIZE // GROUP
+    assert key.numel() * key.element_size() == layout.region_bytes
+    assert layout.key_bytes == layout.value_bytes == layout.region_bytes
+    assert layout.bytes_per_token == 2 * NUM_KV_HEADS * layout.bytes_per_token_head
+
+    # the default production geometry must beat fp16 by ~3.5x, not a vague 4x
+    default = KiviByteCacheLayout(
+        num_blocks=1, block_size=128, num_kv_heads=8, head_size=128, group_size=128
+    )
+    assert default.compression_vs_fp16() == pytest.approx(256 / 72, rel=1e-6)
+    assert (
+        layout.compression_vs_fp16() < 2.0
+    )  # head_size 32 / group 8 is overhead-heavy
+
+
+def test_byte_cache_views_alias_the_host_buffers() -> None:
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        kivi_caches_from_byte_tensors,
+    )
+
+    key, value, layout = _byte_caches()
+    k_quant, k_scale, k_mn, v_quant, v_scale, v_mn = kivi_caches_from_byte_tensors(
+        key, value, layout
+    )
+    assert k_quant.shape == (4, NUM_KV_HEADS, HEAD_SIZE, BLOCK // 8)
+    assert k_quant.dtype == torch.int32
+    assert k_scale.shape == k_mn.shape == (4, NUM_KV_HEADS, HEAD_SIZE, BLOCK // GROUP)
+    assert k_scale.dtype == torch.float32
+    assert v_quant.shape == (4, BLOCK, NUM_KV_HEADS, HEAD_SIZE // 8)
+    assert v_scale.shape == v_mn.shape == (4, BLOCK, NUM_KV_HEADS, HEAD_SIZE // GROUP)
+
+    k_quant[0, 0, 0, 0] = 0x04030201
+    assert key.reshape(-1)[:4].tolist() == [1, 2, 3, 4]  # little-endian, same memory
+    v_scale[0, 0, 0, 0] = 2.5
+    # the value region is [v_quant | v_scale | v_mn]; fp32 2.5 is 00 00 20 40
+    scale_offset = v_quant.numel() * v_quant.element_size()
+    flat_value = value.reshape(-1)
+    assert not flat_value[:scale_offset].any()
+    assert flat_value[scale_offset : scale_offset + 4].tolist() == [0, 0, 0x20, 0x40]
+    assert key.reshape(-1)[:4].tolist() == [1, 2, 3, 4]  # value side never touches K
+
+
+@pytest.mark.parametrize(
+    "break_it, match",
+    [
+        (
+            lambda kv: (kv[0], kv[1][:1]),
+            "equal regions",
+        ),
+        (
+            lambda kv: (kv[0].transpose(0, 1), kv[1]),
+            "must be contiguous",
+        ),
+    ],
+)
+def test_byte_cache_layout_rejects_bad_buffers(break_it, match) -> None:
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        kivi_byte_cache_layout,
+    )
+
+    key, value, _ = _byte_caches()
+    key, value = break_it((key, value))
+    with pytest.raises(RuntimeError, match=match):
+        kivi_byte_cache_layout(
+            key, value, num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE, group_size=GROUP
+        )
+
+
+@pytest.mark.parametrize(
+    "head,group,block,kvh,nb",
+    [(128, 128, 128, 8, 7), (32, 8, 16, 2, 3), (64, 32, 256, 4, 2)],
+)
+def test_host_published_numbers_rebuild_the_plugin_layout(
+    head: int, group: int, block: int, kvh: int, nb: int
+) -> None:
+    """Pin the three numbers ``docs/int4-host-integration.md`` asks the host for.
+
+    The host patch publishes a cache shape whose last dim is ``S``, a uint8
+    storage dtype, and ``page_size_bytes``; vLLM then allocates one raw buffer of
+    ``page_size_bytes * num_blocks`` per layer and splits it with
+    ``k_shape = v_shape = kv_cache_shape[1:]``. If those numbers ever drift from
+    the plugin's own byte budget, binding fails at startup -- so check the
+    round trip here instead of leaving it to arithmetic in prose.
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_byte_cache_layout,
+        kivi_caches_from_byte_tensors,
+    )
+
+    layout = KiviByteCacheLayout(
+        num_blocks=nb,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    shape = (2, nb, block, kvh, layout.bytes_per_token_head)
+    page_size_bytes = 2 * block * kvh * layout.bytes_per_token_head
+
+    # one layer's raw buffer, split the way _reshape_kv_cache_tensors splits it
+    assert page_size_bytes * nb == 2 * layout.region_bytes
+    raw = torch.zeros(shape, dtype=torch.uint8)
+    key, value = raw[0], raw[1]
+
+    assert (
+        kivi_byte_cache_layout(
+            key, value, num_kv_heads=kvh, head_size=head, group_size=group
+        )
+        == layout
+    )
+    quant_k, scale_k, mn_k, quant_v, scale_v, mn_v = kivi_caches_from_byte_tensors(
+        key, value, layout
+    )
+    assert [t.dtype for t in (quant_k, scale_k, mn_k)] == [
+        torch.int32,
+        torch.float32,
+        torch.float32,
+    ]
+    assert quant_k.shape == (nb, kvh, head, block // 8)
+    assert quant_v.shape == (nb, block, kvh, head // 8)
+    # the views must live inside the host's buffer, not beside it
+    scale_k[0, 0, 0, 0] = 3.5
+    flat = raw[0].reshape(-1).view(torch.float32)
+    assert float(flat[quant_k.numel()]) == 3.5
+    assert flat.data_ptr() == raw[0].data_ptr()
+
+
+def test_forward_on_two_byte_buffers_matches_six_tuple_run(monkeypatch) -> None:
+    """The host-visible 2-tensor form must behave exactly like the 6-tuple one."""
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        kivi_caches_from_byte_tensors,
+    )
+
+    residual = 2 * GROUP
+    tokens = residual + 1
+    torch.manual_seed(21)
+    query = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    value = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    md = _metadata(tokens)
+
+    six = _attention_impl(residual_length=residual)
+    _install_cpu_packers(six)
+    six_out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    six.forward(None, query, key, value, _six_tuple(six), md, six_out)
+
+    buffers, value_buffers, layout = _byte_caches(num_blocks=six.k_quant_cache.shape[0])
+    two = _attention_impl(residual_length=residual)
+    _install_cpu_packers(two)
+    two_out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+    two.forward(None, query, key, value, (buffers, value_buffers), md, two_out)
+
+    assert torch.equal(two_out, six_out)
+    derived = kivi_caches_from_byte_tensors(buffers, value_buffers, layout)
+    assert all(
+        torch.equal(new, old) for new, old in zip(derived, _six_tuple(two), strict=True)
+    )
+    assert buffers.any(), "int4 history must have been written into the host buffer"
+
+
+def test_forward_at_production_geometry_on_byte_buffers() -> None:
+    """head 128 / kv 8 / block 128 / group 128 -- the shipped defaults.
+
+    Every other test runs at a small toy geometry; the word math, the
+    one-group-per-block flush and the region budget all depend on the real
+    sizes, so they are exercised here over the host's two byte buffers.
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_caches_from_byte_tensors,
+    )
+
+    head, kvh, block, group = 128, 8, 128, 128
+    residual = 128
+    num_blocks = 3
+    tokens = residual + 1
+
+    layout = KiviByteCacheLayout(
+        num_blocks=num_blocks,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    key_buf = torch.zeros(
+        num_blocks, block, kvh, layout.bytes_per_token_head, dtype=torch.uint8
+    )
+    value_buf = torch.zeros_like(key_buf)
+    assert key_buf.numel() == layout.region_bytes
+
+    impl = _make_impl(
+        residual_length=residual,
+        head_size=head,
+        num_kv_heads=kvh,
+        group_size=group,
+        block_size=block,
+        num_blocks=num_blocks,
+    )
+    impl.num_heads = kvh
+    _install_cpu_packers(impl)
+
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=residual,
+            block_size=block,
+        )
+    )
+    torch.manual_seed(31)
+    query = torch.randn(tokens, kvh, head)
+    key = torch.randn(tokens, kvh, head)
+    value = torch.randn(tokens, kvh, head)
+    out = torch.zeros(tokens, kvh, head)
+
+    md = _metadata(
+        tokens,
+        block_tables=torch.tensor([[0, 1]], dtype=torch.long),
+        req_ids=["r"],
+    )
+    impl.forward(None, query, key, value, (key_buf, value_buf), md, out)
+
+    k_quant, k_scale, k_mn, v_quant, v_scale, v_mn = kivi_caches_from_byte_tensors(
+        key_buf, value_buf, layout
+    )
+    assert k_quant.shape == (num_blocks, kvh, head, block // 8)
+    assert k_scale.shape == (num_blocks, kvh, head, 1)  # one group per block
+    assert v_quant.shape == (num_blocks, block, kvh, head // 8)
+
+    # 128 keys flushed as a single aligned group into block 0, token 128 stayed
+    # exact; values evict only the oldest slot.
+    expected_k = torch.cat([sem.fake_quant_key(key[:residual]), key[residual:]])
+    expected_v = torch.cat([sem.fake_quant_value(value[:1]), value[1:]])
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        torch.tensor([[0, 1]], dtype=torch.long), [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5)
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5)
+    assert key_buf.any() and value_buf.any()
+
+    # memory claim, measured rather than quoted: ~3.6x vs fp16 at this geometry
+    assert layout.compression_vs_fp16() == pytest.approx(
+        2 * head / layout.bytes_per_token_head, rel=1e-9
+    )
+    assert 3.5 < layout.compression_vs_fp16() < 3.7
+
+
+def test_forward_at_qwen35_geometry_on_byte_buffers() -> None:
+    """head 256 / kv 1 per rank / GQA 8:1 -- Qwen3.5-35B-A3B under TP=2.
+
+    The shipped-default test above pins 128/8; this pins the leaderboard
+    model's geometry (config: 16 q heads, 2 kv heads, head_dim 256, so TP=2
+    serves 8 q / 1 kv heads per rank).  head_size % group_size == 0 holds
+    (256 % 128), the pack kernel measured compilable at (256, 128, 128) on
+    910B2, and S grows to 144 B/token/head/side while the 3.56x compression
+    ratio stays put (the scale/min terms amortise the same way).
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_caches_from_byte_tensors,
+    )
+
+    head, kvh, block, group = 256, 1, 128, 128
+    residual = 128
+    num_blocks = 3
+    tokens = residual + 1
+    num_heads = 8 * kvh  # per-rank GQA: 8 query heads share 1 kv head
+
+    layout = KiviByteCacheLayout(
+        num_blocks=num_blocks,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    assert layout.bytes_per_token_head == 144  # 128 int4 + 2x8 scale/min
+    key_buf = torch.zeros(
+        num_blocks, block, kvh, layout.bytes_per_token_head, dtype=torch.uint8
+    )
+    value_buf = torch.zeros_like(key_buf)
+    assert key_buf.numel() == layout.region_bytes
+
+    impl = _make_impl(
+        residual_length=residual,
+        head_size=head,
+        num_kv_heads=kvh,
+        group_size=group,
+        block_size=block,
+        num_blocks=num_blocks,
+    )
+    impl.num_heads = num_heads
+    impl.num_queries_per_kv = num_heads // kvh
+    _install_cpu_packers(impl)
+
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=residual,
+            block_size=block,
+        )
+    )
+    torch.manual_seed(35)
+    query = torch.randn(tokens, num_heads, head)
+    key = torch.randn(tokens, kvh, head)
+    value = torch.randn(tokens, kvh, head)
+    out = torch.zeros(tokens, num_heads, head)
+
+    md = _metadata(
+        tokens,
+        block_tables=torch.tensor([[0, 1]], dtype=torch.long),
+        req_ids=["r"],
+    )
+    impl.forward(None, query, key, value, (key_buf, value_buf), md, out)
+    assert out.shape == (tokens, num_heads, head) and torch.isfinite(out).all()
+
+    k_quant, k_scale, k_mn, v_quant, v_scale, v_mn = kivi_caches_from_byte_tensors(
+        key_buf, value_buf, layout
+    )
+    assert k_quant.shape == (num_blocks, kvh, head, block // 8)
+    assert k_scale.shape == (num_blocks, kvh, head, 1)  # one group per block
+    assert v_quant.shape == (num_blocks, block, kvh, head // 8)
+    assert v_scale.shape == (num_blocks, block, kvh, head // group)  # 2 head groups
+
+    # 128 keys flushed as a single aligned group into block 0, token 128 stayed
+    # exact; values evict only the oldest slot.  The GQA ratio only widens the
+    # query, so the expected K/V are identical to the kvh-sized reference.
+    expected_k = torch.cat([sem.fake_quant_key(key[:residual]), key[residual:]])
+    expected_v = torch.cat([sem.fake_quant_value(value[:1]), value[1:]])
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        torch.tensor([[0, 1]], dtype=torch.long), [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5)
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5)
+
+    # the two equal host regions: same S on both sides at this asymmetric
+    # geometry (key scales per (head,dim), value scales per head group).
+    assert layout.key_bytes == layout.value_bytes == layout.region_bytes
+    assert layout.compression_vs_fp16() == pytest.approx(
+        2 * head / layout.bytes_per_token_head, rel=1e-9
+    )
+    assert 3.5 < layout.compression_vs_fp16() < 3.7
+
+
+# ---------------------------------------------------------------------------
+# kernel-boundary validators (moved out of the triton module so CPU tests can
+# reach them) and their agreement with the state machine's own gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "slots, num_tokens, match",
+    [
+        (torch.arange(8).view(2, 4), 8, "must be 1D"),
+        (torch.arange(7, dtype=torch.long), 8, "must match num_tokens"),
+        (torch.arange(8, dtype=torch.float32), 8, "int32/int64"),
+    ],
+)
+def test_slot_mapping_validator_rejects(slots, num_tokens, match) -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_layout import _check_slot_mapping
+
+    with pytest.raises(RuntimeError, match=match):
+        _check_slot_mapping(slots, num_tokens)
+
+
+def test_slot_mapping_validator_accepts_a_group() -> None:
+    from vllm_ascend_quantized_kv_cache.ops.kivi_layout import _check_slot_mapping
+
+    _check_slot_mapping(torch.arange(GROUP, dtype=torch.int32), GROUP)
+
+
+def _kernel_accepts(slots: list[int]) -> bool:
+    """True when the pack-kernel gate lets the window through."""
+    from vllm_ascend_quantized_kv_cache.ops.kivi_layout import _check_key_slot_groups
+
+    try:
+        _check_key_slot_groups(
+            torch.tensor(slots, dtype=torch.long),
+            block_size=BLOCK,
+            group_size=GROUP,
+        )
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_kivi_slot_group_guards_agree() -> None:
+    """The state machine and the kernel must accept/reject the same windows."""
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=HEAD_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            group_size=GROUP,
+            residual_length=2 * GROUP,
+            block_size=BLOCK,
+        )
+    )
+    windows = {
+        "one aligned group": list(range(GROUP)),
+        "two aligned groups": list(range(2 * GROUP)),
+        "second group of a block": list(range(GROUP, 2 * GROUP)),
+        "misaligned start": list(range(1, 1 + GROUP)),
+        "offset inside block": list(range(4, 4 + GROUP)),
+        "hole in the window": [0, 1, 2, 3, 4, 5, 6, 9],
+        "partial group": list(range(GROUP - 1)),
+        # padding must never reach a flush; both gates refuse it
+        "padding slot present": [-1] + list(range(1, GROUP)),
+    }
+    for label, slots in windows.items():
+        assert bool(sem.is_aligned_key_window(slots, BLOCK)) == _kernel_accepts(
+            slots
+        ), f"guards disagree on {label}"
+
+
+# ---------------------------------------------------------------------------
+# geometry sweep: the pack word math, the region budget and the flush cadence
+# all depend on (head, group, block, residual), so one toy size and one
+# production size is not enough coverage.
+# ---------------------------------------------------------------------------
+
+#: (head_size, num_kv_heads, group_size, block_size, residual_length)
+GEOMETRIES = [
+    (32, 2, 8, 16, 16),
+    (64, 4, 16, 32, 32),
+    (128, 8, 128, 128, 128),
+    (128, 4, 32, 64, 64),
+    (256, 2, 64, 64, 128),
+]
+
+
+@pytest.mark.parametrize(
+    "head, kvh, group, block, residual",
+    GEOMETRIES,
+    ids=[f"h{h}_g{g}_b{b}" for h, _, g, b, _ in GEOMETRIES],
+)
+def test_int4_pipeline_across_geometries(head, kvh, group, block, residual) -> None:
+    """flush -> int4 history -> gather, over the host's two byte buffers."""
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        KiviByteCacheLayout,
+        kivi_byte_cache_layout,
+    )
+
+    # one extra key group plus a partial group: values must have evicted
+    # one slot per overflow while keys flush whole windows
+    tokens = residual + group + 8
+    pages = -(-tokens // block) + 1
+    layout = KiviByteCacheLayout(
+        num_blocks=pages,
+        block_size=block,
+        num_kv_heads=kvh,
+        head_size=head,
+        group_size=group,
+    )
+    key_buf = torch.zeros(
+        pages, block, kvh, layout.bytes_per_token_head, dtype=torch.uint8
+    )
+    value_buf = torch.zeros_like(key_buf)
+
+    impl = _make_impl(
+        residual_length=residual,
+        head_size=head,
+        num_kv_heads=kvh,
+        group_size=group,
+        block_size=block,
+        num_blocks=pages,
+    )
+    impl.num_heads = kvh
+    _install_cpu_packers(impl)
+    sem = KiviInt4Semantics(
+        MethodConfig(
+            head_size=head,
+            num_kv_heads=kvh,
+            group_size=group,
+            residual_length=residual,
+            block_size=block,
+        )
+    )
+
+    torch.manual_seed(41)
+    query = torch.randn(tokens, kvh, head)
+    key = torch.randn(tokens, kvh, head)
+    value = torch.randn(tokens, kvh, head)
+    out = torch.zeros(tokens, kvh, head)
+    md = _metadata(
+        tokens,
+        block_tables=torch.arange(pages, dtype=torch.long).view(1, pages),
+        req_ids=["r"],
+    )
+    impl.forward(None, query, key, value, (key_buf, value_buf), md, out)
+
+    # keys leave the window in whole-window flushes, values one oldest slot at
+    # a time -- so the two histories cover different token ranges.
+    flushed_keys = ((tokens - 1) // residual) * residual
+    evicted_values = max(0, tokens - residual)
+    expected_k = torch.cat([sem.fake_quant_key(key[:flushed_keys]), key[flushed_keys:]])
+    expected_v = torch.cat(
+        [sem.fake_quant_value(value[:evicted_values]), value[evicted_values:]]
+    )
+    gathered_k, gathered_v = impl._gather_dequant_kivi_paged_cache(
+        md.block_tables, [tokens], torch.float32, ["r"]
+    )
+    assert torch.allclose(gathered_k, expected_k, atol=1e-5), f"keys at {head}/{group}"
+    assert torch.allclose(gathered_v, expected_v, atol=1e-5), (
+        f"values at {head}/{group}"
+    )
+    # the dense fallback really wrote every row of this geometry
+    assert out.shape == (tokens, kvh, head)
+    assert torch.isfinite(out).all() and out.abs().sum() > 0
+
+    # the two host buffers really are re-derivable at this geometry
+    assert (
+        kivi_byte_cache_layout(
+            key_buf, value_buf, num_kv_heads=kvh, head_size=head, group_size=group
+        )
+        == layout
+    )
+    assert key_buf.any() and value_buf.any()
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        (
+            {
+                "head_size": 32,
+                "group_size": 12,
+                "residual_length": 24,
+                "block_size": 24,
+            },
+            "divisible by 8",
+        ),
+        (
+            {"head_size": 32, "group_size": 16, "residual_length": 16, "block_size": 8},
+            "block_size",
+        ),
+        (
+            {"head_size": 36, "group_size": 8, "residual_length": 8, "block_size": 8},
+            "head_size",
+        ),
+        (
+            {
+                "head_size": 24,
+                "group_size": 16,
+                "residual_length": 32,
+                "block_size": 32,
+            },
+            "head_size",
+        ),
+        (
+            {
+                "head_size": 32,
+                "group_size": 16,
+                "residual_length": 24,
+                "block_size": 32,
+            },
+            "residual_length",
+        ),
+    ],
+)
+def test_illegal_int4_geometries_are_rejected(kwargs, match) -> None:
+    from vllm_ascend_quantized_kv_cache import kv_methods
+
+    for builder in (
+        lambda: validate_kivi_config(MethodConfig(**kwargs)),
+        lambda: kv_methods.get("kivi_int4", **kwargs),
+    ):
+        with pytest.raises(ValueError, match=match):
+            builder()
+
+
+def test_adapter_built_int4_impl_runs_the_pipeline(monkeypatch) -> None:
+    """The impl class the Ascend adapter composes must really work end to end.
+
+    Everything above drives a test-local stub base; this is the one place the
+    adapter's own composition (host base + mixin + state initialised from
+    ``vllm_config.cache_config``) is exercised through ``forward()``.
+    """
+    import sys
+    import types
+
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust import backend
+
+    residual = 2 * GROUP
+    tokens = residual + 1
+
+    class HostAttentionImpl(_StubBase):
+        """Stands in for the host impl the adapter mixes the mixin onto."""
+
+        def __init__(self, *args, **kwargs):
+            self.num_heads = NUM_KV_HEADS
+            self.vllm_config = SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    kivi_group_size=GROUP,
+                    kivi_residual_length=residual,
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=2),
+            )
+
+    module = types.ModuleType("vllm_ascend.attention.attention_v1")
+    module.AscendAttentionBackendImpl = HostAttentionImpl
+    monkeypatch.setitem(sys.modules, "vllm_ascend", types.ModuleType("vllm_ascend"))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention", types.ModuleType("x"))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention.attention_v1", module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops", types.ModuleType("x"))
+
+    backend._build_kivi_impl_cls.cache_clear()
+    try:
+        impl = backend._build_kivi_impl_cls()()
+        assert impl.enable_kivi is True
+        assert impl.kivi_group_size == GROUP
+        assert impl.kivi_residual_length == residual
+        assert impl.kivi_max_num_seqs == 2
+
+        # the host binds caches on the first forward, so do the same here
+        key_buf, value_buf, _ = _byte_caches(num_blocks=4, block_size=BLOCK)
+        impl._bind_kivi_cache((key_buf, value_buf))
+        _install_cpu_packers(impl)
+        torch.manual_seed(57)
+        query = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        key = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        value = torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+
+        got = impl.forward(
+            None, query, key, value, (key_buf, value_buf), _metadata(tokens), out
+        )
+        assert torch.isfinite(got).all() and got.abs().sum() > 0
+        assert key_buf.any() and value_buf.any()
+
+        # composing the mixin over the host base must not change behaviour: the
+        # same pipeline on a test-local stub has to give the identical result
+        local = _make_impl(residual_length=residual)
+        local.num_heads = NUM_KV_HEADS
+        _install_cpu_packers(local)
+        reference = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        local.forward(
+            None, query, key, value, _six_tuple(local), _metadata(tokens), reference
+        )
+        assert torch.equal(got, reference)
+    finally:
+        backend._build_kivi_impl_cls.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# one flow: kv_methods.activate -> host dispatch -> composed impl -> cache
+# binding -> forward, plus the negative case where the host hands over a
+# dense cache it never re-sized for int4.
+# ---------------------------------------------------------------------------
+
+
+def _stub_ascend_host(monkeypatch, host_impl_cls):
+    """Install the host surfaces the plugin's activation pipeline touches."""
+    import importlib.machinery
+    import sys
+    import types
+    from types import SimpleNamespace as NS
+
+    def stub(name):
+        module = types.ModuleType(name)
+        module.__spec__ = importlib.machinery.ModuleSpec(name, None)
+        monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    for name in ("vllm", "vllm_ascend", "vllm_ascend.attention", "vllm_ascend.ops"):
+        stub(name)
+    vllm_config = stub("vllm.config")
+    attention_v1 = stub("vllm_ascend.attention.attention_v1")
+    utils = stub("vllm_ascend.attention.utils")
+
+    cache_config = NS(
+        cache_dtype="kivi_int4", kivi_group_size=GROUP, kivi_residual_length=2 * GROUP
+    )
+    vllm_config.get_current_vllm_config = lambda: NS(
+        cache_config=cache_config, scheduler_config=NS(max_num_seqs=2)
+    )
+    utils.enable_cp = lambda: False
+
+    class HostBackend:
+        @staticmethod
+        def get_impl_cls():
+            return host_impl_cls
+
+    attention_v1.AscendAttentionBackend = HostBackend
+    attention_v1.AscendAttentionBackendImpl = host_impl_cls
+    return HostBackend, cache_config
+
+
+def test_activate_dispatch_binds_and_runs_the_int4_impl(monkeypatch) -> None:
+    from vllm_ascend_quantized_kv_cache import kv_methods
+    from vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust import backend
+
+    residual = 2 * GROUP
+
+    class HostAttentionImpl(_StubBase):
+        def __init__(self, *args, **kwargs):
+            self.num_heads = NUM_KV_HEADS
+            self.vllm_config = SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    kivi_group_size=GROUP, kivi_residual_length=residual
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=2),
+            )
+
+    host_backend, cache_config = _stub_ascend_host(monkeypatch, HostAttentionImpl)
+    backend._build_kivi_impl_cls.cache_clear()
+    try:
+        info = kv_methods.activate("kivi_int4", host="vllm_ascend_hust")
+        assert info["cache_dtype_literal"] == "kivi_int4"
+        assert "--kv-cache-dtype kivi_int4" in info["usage"]
+
+        impl_cls = host_backend.get_impl_cls()
+        assert impl_cls is not HostAttentionImpl
+        assert issubclass(impl_cls, ab.AscendKiviInt4AttentionBackendMixin)
+
+        cache_config.cache_dtype = "auto"
+        assert host_backend.get_impl_cls() is HostAttentionImpl
+        cache_config.cache_dtype = "kivi_int4"
+
+        impl = host_backend.get_impl_cls()()
+        assert impl.enable_kivi is True
+        assert impl.kivi_group_size == GROUP
+        assert impl.kivi_residual_length == residual
+
+        key_buf, value_buf, _ = _byte_caches(num_blocks=4, block_size=BLOCK)
+        impl._bind_kivi_cache((key_buf, value_buf))
+        _install_cpu_packers(impl)
+
+        tokens = residual + 1
+        torch.manual_seed(71)
+        out = torch.zeros(tokens, NUM_KV_HEADS, HEAD_SIZE)
+        got = impl.forward(
+            None,
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            torch.randn(tokens, NUM_KV_HEADS, HEAD_SIZE),
+            (key_buf, value_buf),
+            _metadata(tokens),
+            out,
+        )
+        assert torch.isfinite(got).all() and got.abs().sum() > 0
+        assert key_buf.any() and value_buf.any()
+    finally:
+        backend._build_kivi_impl_cls.cache_clear()
+
+
+def test_dense_host_cache_is_refused_not_misviewed(monkeypatch) -> None:
+    """A cache the host never re-sized for int4 must fail loudly.
+
+    The plugin views two byte buffers as the int4 history. If a host accepts
+    the ``kivi_int4`` literal but still allocates the dense ``(block, heads,
+    head_size)`` fp16 pair, the byte totals must not line up -- otherwise the
+    pack kernels would silently scribble over a wrongly-sized region.
+    """
+    impl = _make_impl(residual_length=2 * GROUP)
+    dense_key = torch.zeros(4, BLOCK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+    dense_value = torch.zeros_like(dense_key)
+
+    with pytest.raises(RuntimeError, match="must hold|whole number of pages"):
+        impl._bind_kivi_cache((dense_key, dense_value))
+    assert impl.k_quant_cache.shape[-1] == BLOCK // 8  # previous binding untouched
+
+
+def test_byte_view_entry_rejects_buffers_that_do_not_fit() -> None:
+    """The public view entry checks both sides, not just the inferred layout.
+
+    A view over a too-small buffer would let the pack kernels write past the
+    allocation, so the byte check has to hold even when a caller supplies a
+    layout that matches the key side only.
+    """
+    from vllm_ascend_quantized_kv_cache.methods.kivi_int4.byte_cache import (
+        kivi_caches_from_byte_tensors,
+    )
+
+    key_buf, value_buf, layout = _byte_caches(num_blocks=4, block_size=BLOCK)
+    short_value = value_buf[:-1]
+
+    with pytest.raises(RuntimeError, match="value cache must hold"):
+        kivi_caches_from_byte_tensors(key_buf, short_value, layout)
+    with pytest.raises(RuntimeError, match="key cache must hold"):
+        kivi_caches_from_byte_tensors(key_buf[:-1], value_buf, layout)

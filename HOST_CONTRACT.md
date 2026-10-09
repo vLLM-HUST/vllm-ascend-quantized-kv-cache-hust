@@ -15,16 +15,68 @@
 3. `AscendAttentionBackend.get_impl_cls()` 是可替换的静态 implementation
    分派点。
 
-插件加载时为宿主 backend 安装幂等的 `get_impl_cls` 分派器。当
-cache dtype 为 `int8` 时，返回由宿主 `AscendAttentionBackendImpl` 与本包
-`AscendInt8AttentionBackendMixin` 组合的实现类；其他 dtype 始终委托给宿主
-原始 `get_impl_cls`。宿主必须支持
-`CacheConfig.cache_dtype == "int8"`，并为它分配未打包的 `torch.int8`
-KV cache。
+插件加载时为宿主 backend 安装幂等的 `get_impl_cls` 分派器。cache dtype 为
+`int8` 时返回由宿主 `AscendAttentionBackendImpl` 与本包
+`AscendInt8AttentionBackendMixin` 组合的实现类；为 `kivi_int4` 时返回
+`AscendKiviInt4AttentionBackendMixin` 与同一宿主基类组合的实现类；其他
+dtype 始终委托给宿主原始 `get_impl_cls`。
 
-非 Ascend 宿主、缺少上述 API 或在 INT8 下开启 context parallel 时必须
-fail closed。非 `int8` dtype 不应由插件拒绝，而应保持宿主原有行为。
+INT8 要求宿主支持 `CacheConfig.cache_dtype == "int8"`，并为它分配未打包的
+`torch.int8` KV cache。
+
+INT4（KIVI）额外要求宿主（逐步改动清单与已核实的宿主行号见
+`docs/int4-host-integration.md`）：
+
+1. 接受 CLI 字面量 `--kv-cache-dtype kivi_int4`；
+2. 为该 dtype 每层分配**两张等大的字节缓冲**：键侧与值侧各
+   `num_blocks * block_size * num_kv_heads * S` 字节，其中
+   `S = head_size/2 + 8*head_size/group_size`（int4 数据 + 每组一份 fp32
+   scale 与 min）。插件自己把这两张缓冲切成内核与 gather 需要的 6 个视图
+   （`methods/kivi_int4/byte_cache.py`，视图不复制数据）；这一代 vLLM 没有
+   "一层六张"的机制，所以字节区域是唯一的接合点。若宿主已在树里按 6 张
+   分配（legacy 形态），绑定路径同样接受。
+3. 暴露 `CacheConfig.kivi_group_size` / `kivi_residual_length` 两个旋钮
+   （缺失时插件按 128/128 取值）。
+
+插件不猜测缓存布局：字节数对不上区域预算、两张缓冲不等大、或除不出整数
+页时都在绑定期抛错（`must hold N bytes` / `equal regions` / `whole number
+of pages`）；残差窗口几何不满足 `validate_kivi_geometry` 时在方法构造期抛错。
+
+INT4 的压缩比按 `KiviByteCacheLayout.compression_vs_fp16()` 计算，默认
+head_size=128 / group_size=128 下约 **3.6x**（int4 数据本身是 4x，scale/min
+开销吃掉一部分；group_size 越小开销越大），不要按"4x"报预算。
+
+非 Ascend 宿主、缺少上述 API 或在量化 dtype 下开启 context parallel 时必须
+fail closed。非量化 dtype 不应由插件拒绝，而应保持宿主原有行为。
+
+INT4 的 `block_size` 不只是布局问题，还受打包内核的片上缓冲限制：910B2 +
+triton-ascend 3.5 实测 `group_size=128` 配 `block_size=256` 会在内核编译期 UB 溢出
+（`ub overflow, requires 1655040 bits while 1572864 bits available`，位置
+`ops/triton/kivi_pack.py:135`），而出厂默认 128/128/128 与 `64/512`、
+`head=256 + group=64 + block=256` 等形状可编译。`validate_kivi_geometry` 的整除
+规则比这更宽，宿主换 `block_size` 前请用 `scripts/npu_probe_kivi_geometry.py`
+复测（测量表见 `docs/validation-int4-20260920.md` 第 10 节；尚无可靠公式）。
 
 当前已验证的宿主基线为 vLLM-HUST `8a6655cf62` 和
-vLLM-Ascend-HUST `f4f49832`。对其他 commit 或发行版的兼容性不应仅根据
-`host_api_range` 推断，必须重新运行集成测试。
+vLLM-Ascend-HUST `f4f49832`（覆盖 INT8 端到端）。INT4 的打包内核、gather，以及
+prefill / decode / chunked prefill 三条注意力分支、**多请求 ragged 批量
+decode**（跨 block、`actual_seq_lengths_kv` 前缀和）、GQA 头布局、纯 torch 兜底
+路径，以及 64~67 步连续生成下每一步的 flush 调度、一步内多请求的 chunked 批次
+（2 decode + 3 个不等长 prompt），均已在 910B2 容器
+`vllm-hust-cyj-21rc-cloud-container-86` 上逐位复验通过（记录见
+`docs/validation-int4-20260920.md`；设备侧量化口径：int4 vs fp16 注意力偏差
+0.068~0.101 倍 K/V rms、余弦 ≥0.990，随头布局而变），分派也用 `scripts/probe_host_dispatch.py`
+在该容器的宿主（vLLM-HUST `f18cf803c5` / vLLM-Ascend-HUST `17ed0571d`）上核对
+通过；安装态（wheel + `vllm.general_plugins` entry point +
+`vllm.plugins.load_general_plugins()`）另由 `scripts/probe_installed_plugin.py`
+核对。注册路径不得假设宿主导入顺序：`attention_v1` 在该 revision 上不能作为第一
+个 `vllm_ascend` 导入（循环导入），插件必须先 `import vllm_ascend.ops`。
+
+**INT4 端到端 serving 已在打过上述四处改动的宿主树上跑通**（稠密模型
+3.56x 容量兑现、Qwen3.5-35B-A3B 亦通，见
+`docs/serving-verification-20261003.md`；改动可用 `scripts/host_int4_patch.py`
+复现）。在**未打补丁**的宿主 revision 上（如该容器的 `f18cf803c5`），
+`CacheDType` 是 pydantic 校验的 `Literal`，既无 `kivi_int4` 也无 `int8`，
+CLI 阶段就会被拒。模型级精度评测仍未建立基线。同一宿主还把 `enable_cp()` 换成了
+`enable_dcp()`/`enable_pcp()`，插件两种形状都支持（`fb046ec`）。对其他 commit
+或发行版的兼容性不应仅根据 `host_api_range` 推断，必须重新运行集成测试。

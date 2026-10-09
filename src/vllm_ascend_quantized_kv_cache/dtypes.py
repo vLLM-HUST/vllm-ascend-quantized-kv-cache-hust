@@ -16,20 +16,37 @@ class KVQuantMode(IntEnum):
     """量化模式枚举（数值与 legacy vllm 的 KVQuantMode 对齐）。"""
 
     NONE = 0
+    # 每 (token, head) E4M3 + fp32 scale（插件契约本地编号；宿主同名模式是 3）
+    FP8_PER_TOKEN_HEAD = 10
+    KIVI_INT4 = 9  # KIVI：int4 历史区 + 全精度残差窗口（ascend#116 口径）
     INT8_PER_TENSOR = 8
 
 
 def get_kv_quant_mode(dtype: str) -> KVQuantMode:
     """dtype 字符串 -> 量化模式。
 
-    仅接受 CLI 字面量 ``int8``；其余返回 NONE。
+    仅接受 CLI 字面量 ``int8``、``kivi_int4`` 与 ``fp8_per_token_head``；
+    其余返回 NONE。
     """
-    return KVQuantMode.INT8_PER_TENSOR if dtype == "int8" else KVQuantMode.NONE
+    if dtype == "int8":
+        return KVQuantMode.INT8_PER_TENSOR
+    if dtype == "kivi_int4":
+        return KVQuantMode.KIVI_INT4
+    if dtype == "fp8_per_token_head":
+        return KVQuantMode.FP8_PER_TOKEN_HEAD
+    return KVQuantMode.NONE
 
 
 def is_quantized_kv_cache(dtype: str) -> bool:
     """该 dtype 是否是量化 KV（即能否解析出非 NONE 的量化模式）。"""
     return get_kv_quant_mode(dtype) is not KVQuantMode.NONE
+
+
+def int4_packed_dim(head_size: int) -> int:
+    """INT4 打包后的每头维度：2 个 int4 共 1 字节，故为 head_size/2。"""
+    if head_size <= 0 or head_size % 2:
+        raise ValueError("INT4 head_size must be a positive even number")
+    return head_size // 2
 
 
 @dataclass(frozen=True)
@@ -53,13 +70,25 @@ class KVCacheLayout:
 def resolve_layout(dtype: str, head_size: int) -> KVCacheLayout:
     """dtype + head_size -> 存储布局（fail-closed）。
 
-    ``int8`` 使用未打包的 int8 存储；其他 dtype 直接抛 ValueError。
+    ``int8`` 使用未打包的 int8 存储；``kivi_int4`` 的历史区是 4bit，
+    两个 int4 打进一字节（uint8 存储，packed 维度减半）；
+    ``fp8_per_token_head`` 是逐元素 E4M3 字节（uint8 存储，不打包），
+    fp32 scale 由方法层的区域布局另行预算；其他 dtype 直接抛 ValueError。
     """
     mode = get_kv_quant_mode(dtype)
     if mode is KVQuantMode.INT8_PER_TENSOR:
         if head_size <= 0:
             raise ValueError("head_size must be positive")
         packed, storage = head_size, "int8"
+    elif mode is KVQuantMode.KIVI_INT4:
+        packed, storage = int4_packed_dim(head_size), "uint8"
+    elif mode is KVQuantMode.FP8_PER_TOKEN_HEAD:
+        if head_size <= 0 or head_size % 4:
+            raise ValueError(
+                "fp8_per_token_head requires head_size positive and divisible "
+                f"by 4 (fp32 scale alignment), got {head_size}"
+            )
+        packed, storage = head_size, "uint8"
     else:
         raise ValueError(f"dtype is not a registered quantized KV layout: {dtype}")
     return KVCacheLayout(dtype, head_size, storage, packed, mode)
@@ -69,6 +98,7 @@ __all__ = [
     "KVCacheLayout",
     "KVQuantMode",
     "get_kv_quant_mode",
+    "int4_packed_dim",
     "is_quantized_kv_cache",
     "resolve_layout",
 ]

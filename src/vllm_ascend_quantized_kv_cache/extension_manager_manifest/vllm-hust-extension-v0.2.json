@@ -1,6 +1,6 @@
 {
   "schema_version": "0.2-experimental",
-  "extension_id": "org.vllm-hust.ascend-int8-kv-cache",
+  "extension_id": "org.vllm-hust.ascend-quantized-kv-cache",
   "extension_version": "0.2.0rc4",
   "kind": "in_process_plugin",
   "host": {
@@ -20,25 +20,47 @@
     {
       "type": "python_entry_point",
       "group": "vllm.general_plugins",
-      "name": "vllm-ascend-int8-kv-cache"
+      "name": "vllm-ascend-quantized-kv-cache"
     }
   ],
   "requires_services": [],
   "components": [
     {
       "component_id": "int8-kv-attention-backend",
-      "contracts": ["vllm.attention.quantized-kv.v1"],
-      "execution_planes": ["worker", "device"],
+      "contracts": [
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": [
+        "worker",
+        "device"
+      ],
       "isolation": "trusted_in_process",
       "implementation_ref": "vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend:AscendInt8KvAttentionBackend",
-      "permissions": ["device_access"]
+      "permissions": [
+        "device_access"
+      ]
+    },
+    {
+      "component_id": "kivi-int4-kv-attention-backend",
+      "contracts": [
+        "vllm.attention.quantized-kv.v1"
+      ],
+      "execution_planes": [
+        "worker",
+        "device"
+      ],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm_ascend_quantized_kv_cache.adapters.vllm_ascend_hust.backend:AscendKiviInt4KvAttentionBackend",
+      "permissions": [
+        "device_access"
+      ]
     }
   ],
   "activation": {
     "entry_points": [
       {
         "group": "vllm.general_plugins",
-        "name": "vllm-ascend-int8-kv-cache"
+        "name": "vllm-ascend-quantized-kv-cache"
       }
     ],
     "environment": {},

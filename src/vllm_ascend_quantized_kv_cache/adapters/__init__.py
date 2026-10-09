@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vllm-ascend-hust INT8 KV attention backend 适配器层。
+"""vllm-ascend-hust 量化 KV attention backend 适配器层。
 
 模块顶层不导入宿主；``register()`` 时才惰性导入并 fail-closed。
 
 推荐入口是统一激活管线（自动选层、自动探测宿主）::
 
     from vllm_ascend_quantized_kv_cache import kv_methods
-    kv_methods.activate("int8_dynamic", host="vllm_ascend_hust")
+    kv_methods.activate("kivi_int4", host="vllm_ascend_hust")
 """
 
 from __future__ import annotations

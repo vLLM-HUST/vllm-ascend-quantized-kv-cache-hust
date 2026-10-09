@@ -32,7 +32,7 @@ def register_method(spec: MethodSpec) -> MethodSpec:
 
 
 def known_methods() -> tuple[str, ...]:
-    """全部已注册方法名（当前仅 ``int8_dynamic``）。"""
+    """全部已注册方法名（``int8_dynamic`` 与 ``kivi_int4``）。"""
     return tuple(sorted(_REGISTRY))
 
 
