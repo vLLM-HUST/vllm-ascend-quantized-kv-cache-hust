@@ -92,7 +92,7 @@ benchmark 仓跑压测，成绩自动 merge 进官网。对应关系：
 
 ```bash
 python -m vllm_hust_benchmark.cli run-test serving_llama8B_tp1_sharegpt --execute
-bash scripts/run-official-v0180-baselines.sh   # 官方基线一键入口
+bash scripts/run-official-v0180-baselines.sh   # 官方基线一键入口（vllm-hust-benchmark 仓，不在本仓库）
 ```
 
 硬件为 Ascend 910B2（benchmark 仓 `agent.md` 指定当前活跃机器，禁止无证据
@@ -114,7 +114,8 @@ swe-prefix 压测的完整命令模板、OFF/ON 对比方法、数据口径（TP
   `push-to-hf.yml` 同步 HF 数据集 `intellistream/vllm-hust-benchmark-results`
   → 官网前端按 GitHub snapshots → HF → 本地优先级读取。**不是 PR**。
 - **Benchmark settings / Frontier 页（人工）**：评审通过后直接替换 website 仓
-  `data/leaderboard_frontier.json`，跑 `scripts/curate_frontier_repeats.py`，
+  `data/leaderboard_frontier.json`，跑 website 仓的
+  `scripts/curate_frontier_repeats.py`（不在本仓库），
   被替代点进 `archived_points`。
 
 ### 3.3 打榜红线
@@ -205,7 +206,9 @@ cohort 契约的 `prepared_workload_variants` 里，tokenizer fingerprint 与
   漂移（`enable_cp` 优先、`enable_cp` 也是 lru_cache 需 cache_clear）。
 - workload：`swe-prefix-reuse prepare`（tokenizer 同模型）→
   `prepared/qwen35.json`，最长会话 141,269 token，与操作记录一致。
-- 自动执行：`scripts/auto_bench.sh` 由 setsid 拉起（断 SSH 不死），每
+- 自动执行：bench 树上的 `scripts/auto_bench.sh`（**不在本仓库**，位于
+  服务器 `/root/bench/scripts/`，与 `qkv35_run.sh` 同目录）由 setsid 拉起
+  （断 SSH 不死），每
   60s 检查两卡 HBM 空闲 ≥52GB 且连续两拍，自动串行跑 OFF（fp16 基线）
   与 INT8 两组：serve → 20s 探测（valid/failed_requests 门槛）→ 900s
   正式窗口。进度看 `results/AUTO_STATE`，完成标记 `results/AUTO_DONE`。

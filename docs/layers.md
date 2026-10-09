@@ -38,7 +38,7 @@
 | 方法模型 | `methods/base.py`、`methods/registry.py` | ✅ | ✅ | ✅ | 元数据注册，零重导入 |
 | 方法发现 | `kv_methods` 门面 | ✅ | ✅ | ✅ | `list/get/describe/activate` |
 | 方法语义 | `methods/*/semantics.py` | 需 torch | ✅ | ✅ | 纯数学，CPU 可测，内核数值参考 |
-| 设备 mixin | `methods/*/attention_mixin.py` | 需 torch；设备路径 fail-closed | ⚠️ 仅 CUSTOM 后端挂载后由引擎触发 | ✅ 由宿主 impl 触发（C8 类手术） | 只在 Ascend NPU 真正执行 |
+| 设备 mixin | `methods/*/attention_backend.py` | 需 torch；设备路径 fail-closed | ⚠️ 仅 CUSTOM 后端挂载后由引擎触发 | ✅ 由宿主 impl 触发（C8 类手术） | 只在 Ascend NPU 真正执行 |
 | 设备内核 | `ops/`（torch）、`ops/triton/` | ❌ 不应直接调 | ❌ | ✅ 经 mixin 路径 | 库内专用 + `scripts/npu_*.py` 诊断 |
 | Ascend 适配器 | `adapters/vllm_ascend_hust/` | import 安全；`register()` 抛"缺 vllm_ascend" | ❌ 单栈下 fail-closed* | ✅ `activate(..., host="vllm_ascend_hust")` | `@register_scheme` + C8 类手术 |
 | vllm 适配器 | `adapters/vllm_hust/` | import 安全；`register()` 抛"缺 vllm" | ✅ `activate(..., host="vllm_hust")` | ❌ 单栈下 fail-closed* | CUSTOM 后端类路径 + CacheDType 协商 |
@@ -99,7 +99,8 @@ vllm serve 启动
    上层可在函数体内延迟导入下层，绝不顶层反向依赖。
 2. **重导入只在方法体内**：torch / vllm / triton / torch_npu 全部在使用
    点惰性导入；`import vllm_ascend_quantized_kv_cache` 本身零重依赖
-   （`tests/test_facade.py` 子进程强制）。
+   （`tests/test_plugin.py::test_method_discovery_and_contracts_need_no_torch`
+子进程强制）。
 3. **宿主入口唯一**：激活逻辑只存在于 `core.activation.activate`；
    `kv_methods.activate` 与 `bootstrap.register_plugins` 都是它的薄
    封装——改注册语义只改一处。

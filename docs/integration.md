@@ -45,7 +45,8 @@ kv_methods.activate("int8_dynamic")   # host=None → 自动探测宿主栈
 - `bootstrap.register_plugins`（entry point
   `vllm.general_plugins` → `bootstrap:register_plugins`）在每次 vLLM
   进程启动时被宿主调用；环境变量未设时**立即返回**（这就是"安装不改
-  变行为"的保证，`tests/test_bootstrap.py` 覆盖）。它和
+  变行为"的保证，`tests/test_plugin.py::test_bootstrap_is_noop_without_ascend`
+覆盖）。它和
   `kv_methods.activate` 共用同一条激活管线
   （`core/activation.py`，见 [layers.md](layers.md) §4）。
 - 宿主探测顺序：可 `import vllm_ascend` → 走 Ascend 适配器；否则可
@@ -124,8 +125,9 @@ vllm-hust 的 `CacheDType` 是封闭 Literal，在三层各自 fail-closed
 | `fp4_e2m1` | **无 → ValueError** | 加字面量是宿主路线图项，不是运行时 hack |
 
 给宿主加字面量时：同步更新本文件表格、
-`adapters/vllm_hust/register.py` 的 `DTYPE_LITERAL_MAP`，并在
-`tests/test_adapters.py` 补对应断言。
+**dev 分支的** `adapters/vllm_hust/register.py`（本分支只有
+`adapters/vllm_ascend_hust/`）的 `DTYPE_LITERAL_MAP`，并在
+`tests/test_plugin.py` 补对应断言。
 
 ## 4. Extension Manager 路线（设计上被阻塞，路线图）
 

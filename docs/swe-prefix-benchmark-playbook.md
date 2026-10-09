@@ -402,7 +402,8 @@ swe-prefix-reuse run \
 | `docs/FRONTIER-...md` | 证据文档,point 的 `evidence.url` 指向它 |
 | `tests/leaderboard_frontier_model.test.cjs` | 这个测试里写死了点数等,加点后要同步更新 |
 
-格式可直接参照 `scripts/import_qwen35_v018_native.py` 里的 `make_point` / `make_evidence_run`。
+格式可直接参照 website 仓（不在本仓库）
+`scripts/import_qwen35_v018_native.py` 里的 `make_point` / `make_evidence_run`。
 
 ### 11.2 一个 point 必须有的内容
 
@@ -430,7 +431,7 @@ node --test tests/leaderboard_runs_model.test.cjs tests/leaderboard_frontier_mod
   tests/leaderboard_tiering_evidence.test.cjs tests/leaderboard_mooncake_evidence.test.cjs \
   tests/plugin_performance.test.cjs tests/loader_publication_identity.test.cjs tests/snapshot_status.test.cjs
 pytest tests/ -q
-python scripts/check_engine_version_consistency.py
+python scripts/check_engine_version_consistency.py   # 以下均在 website 仓执行，不在本仓库
 pre-commit run --files <改动的文件>     # 需要 Python >= 3.10
 ```
 

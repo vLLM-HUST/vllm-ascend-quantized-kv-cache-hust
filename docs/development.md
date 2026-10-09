@@ -34,7 +34,7 @@ src/vllm_ascend_quantized_kv_cache/
 ├── methods/
 │   ├── base.py            # MethodSpec/MethodConfig/KvQuantMethod（零依赖）
 │   ├── registry.py        # fail-closed 注册表（只写元数据）
-│   ├── int8_dynamic/      # __init__ 注册 + semantics.py + attention_mixin.py
+│   ├── int8_dynamic/      # __init__ 注册 + semantics.py + attention_backend.py
 │   ├── kivi_int4/         # 同上三件套
 │   ├── packed_base.py     # PackedFormatSemantics 基类 + 分发表
 │   └── int4_packed.py / fp4_e2m1.py / fp8_e4m3.py / nvfp4.py  # 格式方法
@@ -60,8 +60,9 @@ src/vllm_ascend_quantized_kv_cache/
 ## 3. 分层纪律（改代码前必读）
 
 五层严格按依赖序：`contracts → core → methods → ops → adapters →
-bootstrap`。五条硬规则，前四条违反会被 `tests/test_facade.py` 的子进程
-测试抓住：
+bootstrap`。五条硬规则，前四条违反会被 `tests/test_plugin.py` 的子进程测试
+`test_method_discovery_and_contracts_need_no_torch` 抓住（dev 分支把这份
+测试拆成 `tests/test_facade.py`，本分支集中在 `test_plugin.py`）：
 
 1. **导入卫生**：import 本包不得拉起 torch / vllm / triton /
    vllm_ascend。所有重依赖在使用点函数体内惰性导入（经
@@ -102,15 +103,21 @@ bootstrap`。五条硬规则，前四条违反会被 `tests/test_facade.py` 的�
 2. **契约**：若引入新 dtype 字符串，在 `dtypes.py` 的
    `get_kv_quant_mode` 精确表加键、`KVQuantMode` 加枚举、
    `resolve_layout` 加分支（storage dtype + 打包维度公式），并在
-   `tests/test_dtypes.py` 补用例——包括非法 head_size 的抛错路径。
+   `tests/test_plugin.py` 补用例（见 `test_cli_*_layout_contract`）——包括非法
+head_size 的抛错路径。
 3. **语义**：`methods/my_quant/semantics.py` 纯 torch 数学 +
    `describe()`；在 `tests/` 加 CPU 对拍测试（参考 §5 的测试策略）。
-4. **设备路径**（如需要）：`ops/` 加内核或写 attention mixin（状态
-   初始化遵循 `_init_<name>_state(kv_cache_dtype, vllm_config)` 约定，
-   并把它登记进 `adapters/vllm_ascend_hust/attention.py::_MIXINS`）。
+4. **设备路径**（如需要）：`ops/` 加内核，或在
+   `methods/<name>/attention_backend.py` 写 mixin（状态初始化遵循
+   `_init_<name>_state(kv_cache_dtype, vllm_config)` 约定，参照
+   `_init_kivi_state`）。把它接进引擎靠
+   `adapters/vllm_ascend_hust/backend.py`：加一个
+   `_build_<name>_impl_cls()` 并在 `install_kv_impl_dispatch()` 的 dtype
+   分派里登记——没有集中式 mixin 注册表。
    NPU 验证脚本按 `scripts/npu_smoke_*.py` 的模式写（对拍语义层参考，
    结尾打印 `RESULT: PASS/FAIL` 并以退出码区分）。
-5. **宿主接线**：格式方法（packed）→ 在 `methods/packed_base.py` 的
+5. **宿主接线**：格式方法（packed，见 dev 分支的 `methods/packed_base.py`，
+   本分支尚无该文件）→ 在
    分发表（`FORMAT_SEMANTICS` / `METHOD_NAME_TO_SEMANTICS`）登记语义
    类（或仿 `PackedFormatSemantics` 写新基类）；vllm-hust 宿主 →
    在 `adapters/vllm_hust/register.py::DTYPE_LITERAL_MAP` 协商一个

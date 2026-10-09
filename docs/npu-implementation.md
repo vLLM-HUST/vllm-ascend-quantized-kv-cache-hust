@@ -30,11 +30,11 @@ triton 的获取顺序：先试 `vllm.triton_utils`（vllm 系宿主环境），
 | `kivi_pack_key_cache` / `kivi_pack_value_cache` | `ops/triton/kivi_pack.py` | triton-ascend | **逐位通过**（对照 `KiviInt4Semantics.fake_quant_*` CPU 参考） |
 | `kivi_dequant_gather_cache`（实际路由） | `ops/kivi_gather.py` | 纯 torch 算子 | **逐位通过** |
 | `_kivi_dequant_gather_*_kernel`（融合 gather，**不路由**） | `ops/triton/kivi_gather_experimental.py` | triton-ascend | 误编译，保留待重验（§3.3） |
-| INT8 在线 antiquant（decode / chunked-prefill / prefill 三分支） | `methods/int8_dynamic/attention_mixin.py` | torch_npu `npu_fused_infer_attention_score` | 端口保真度；端到端待宿主集成 |
-| KIVI TND 分派 + 稠密 fallback | `methods/kivi_int4/attention_mixin.py` | torch_npu + torch | 同上 |
+| INT8 在线 antiquant（decode / chunked-prefill / prefill 三分支） | `methods/int8_dynamic/attention_backend.py` | torch_npu `npu_fused_infer_attention_score` | 端口保真度；端到端待宿主集成 |
+| KIVI TND 分派 + 稠密 fallback | `methods/kivi_int4/attention_backend.py` | torch_npu + torch | 同上 |
 | 统一激活管线（`kv_methods.activate` → 宿主 `register_scheme`） | `core/activation.py` + `adapters/vllm_ascend_hust/` | 宿主进程 | ✅ 真实 vllm-ascend-hust 宿主**进程内实测**（2026-09-11，910B2 容器：六方法注册可见、幂等再激活 OK） |
-| fa_quant_type 分发 + impl 类手术（真实引擎） | `adapters/vllm_ascend_hust/{scheme,attention}.py` | vLLM 引擎（NPU） | ✅ 2026-09-12：Qwen3-0.6B + `fa_quant_type` checkpoint，28/28 层 `create_weights` 类手术成功；浮点 KV 前向 `LLM.generate` 生成成功 |
-| int8 KV 存储路径（decode antiquant） | `methods/int8_dynamic/attention_mixin.py` | torch_npu | ⚠️ 引擎内未及执行：宿主 `model_runner_v1` 对 `int8_per_token_head` 的 KV 分配/重排不一致（见 [how-to-run.md](how-to-run.md) §8.1），属宿主联调工作项 |
+| fa_quant_type 分发 + impl 类手术（真实引擎） | `adapters/vllm_ascend_hust/{register,backend}.py` | vLLM 引擎（NPU） | ✅ 2026-09-12：Qwen3-0.6B + `fa_quant_type` checkpoint，28/28 层 `create_weights` 类手术成功；浮点 KV 前向 `LLM.generate` 生成成功 |
+| int8 KV 存储路径（decode antiquant） | `methods/int8_dynamic/attention_backend.py` | torch_npu | ⚠️ 引擎内未及执行：宿主 `model_runner_v1` 对 `int8_per_token_head` 的 KV 分配/重排不一致（见 [how-to-run.md](how-to-run.md) §8.1），属宿主联调工作项 |
 
 vectorcore 数量探测（pack 内核的 grid 依赖）是从宿主
 `get_vectorcore_num` 本地移植的：查不到 `num_vectorcore` 属性直接抛错。
@@ -69,7 +69,8 @@ antiquant 参数，形状要求 BNSD 视图 `[1, H, 1, D]`）：
   "全新 prefill"（`seq_lens == qlen`，缓存无历史）直接用浮点 K/V，
   否则把分页 int8 缓存 gather 反量化成稠密再算。
 - **PrefillNoCache / PrefillCacheHit**：TND；缓存命中读回的是 int8，
-  先 `_dequant_paged_kv_to_dense`（`ops/int8_ops.py`，按块表 gather +
+  先 `_dequant_int8_paged_kv_to_dense`（`methods/int8_dynamic/attention_backend.py`，
+  按块表 gather +
   seq_lens 掩码 + 逐通道反量化）。
 
 未知的 attention state 一律 `RuntimeError`（fail-closed）。
