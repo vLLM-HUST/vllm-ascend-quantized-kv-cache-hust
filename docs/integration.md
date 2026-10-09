@@ -138,8 +138,7 @@ wheel 内带 Manifest 0.2 描述符
 `vllm-hust-ext extension inspect org.vllm-hust.quantized-kv-cache`
 应显示 `activation_ready=false`），但必须拒绝激活。
 
-翻转为 `active` 的前提（见 [../HOST_CONTRACT.md](../HOST_CONTRACT.md)
-与 [architecture.md](architecture.md)）：
+翻转为 `active` 的前提（见 [../HOST_CONTRACT.md](../HOST_CONTRACT.md)）：
 
 1. 宿主实现四协议：
    `vllm.kv-cache.dtype-registry.v1`、`vllm.kv-cache.layout.v1`、

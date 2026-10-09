@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 per-token-head KV cache 量化方法（E4M3 + 每 (token, head) 动态 scale）。
 
-出处与定位见调研文档 ``kvquant-schemes-beyond-int8-int4.md`` §9.3/§10.1：
+出处与定位见调研文档 ``kvquant-survey.md`` §9.3/§10.1：
 宿主 vllm-hust 的 triton 后端（``triton_attn.py`` 的
 ``supported_kv_cache_dtypes``）原生声明 ``fp8_per_token_head``，是 NPU 上
 不依赖厂商新算子的最低成本新 dtype；与本仓库 int8_dynamic 同一"在线

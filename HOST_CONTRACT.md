@@ -65,13 +65,18 @@ decode**（跨 block、`actual_seq_lengths_kv` 前缀和）、GQA 头布局、�
 （2 decode + 3 个不等长 prompt），均已在 910B2 容器
 `vllm-hust-cyj-21rc-cloud-container-86` 上逐位复验通过（记录见
 `docs/validation-int4-20260920.md`；设备侧量化口径：int4 vs fp16 注意力偏差
-≤0.068 倍 K/V rms、余弦 ≥0.990），分派也用 `scripts/probe_host_dispatch.py`
+0.068~0.101 倍 K/V rms、余弦 ≥0.990，随头布局而变），分派也用 `scripts/probe_host_dispatch.py`
 在该容器的宿主（vLLM-HUST `f18cf803c5` / vLLM-Ascend-HUST `17ed0571d`）上核对
 通过；安装态（wheel + `vllm.general_plugins` entry point +
 `vllm.plugins.load_general_plugins()`）另由 `scripts/probe_installed_plugin.py`
 核对。注册路径不得假设宿主导入顺序：`attention_v1` 在该 revision 上不能作为第一
-个 `vllm_ascend` 导入（循环导入），插件必须先 `import vllm_ascend.ops`。但 **INT4 端到端 serving 与模型级精度仍未验证**：该宿主 `CacheDType` 是
-pydantic 校验的 `Literal`，既无 `kivi_int4` 也无 `int8`，CLI 阶段就会被拒，需先
-落地上面列出的宿主改动。同一宿主还把 `enable_cp()` 换成了
+个 `vllm_ascend` 导入（循环导入），插件必须先 `import vllm_ascend.ops`。
+
+**INT4 端到端 serving 已在打过上述四处改动的宿主树上跑通**（稠密模型
+3.56x 容量兑现、Qwen3.5-35B-A3B 亦通，见
+`docs/serving-verification-20261003.md`；改动可用 `scripts/host_int4_patch.py`
+复现）。在**未打补丁**的宿主 revision 上（如该容器的 `f18cf803c5`），
+`CacheDType` 是 pydantic 校验的 `Literal`，既无 `kivi_int4` 也无 `int8`，
+CLI 阶段就会被拒。模型级精度评测仍未建立基线。同一宿主还把 `enable_cp()` 换成了
 `enable_dcp()`/`enable_pcp()`，插件两种形状都支持（`fb046ec`）。对其他 commit
 或发行版的兼容性不应仅根据 `host_api_range` 推断，必须重新运行集成测试。

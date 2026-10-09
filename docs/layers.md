@@ -1,8 +1,7 @@
 # 调用层次与宿主可见性（vllm-hust / vllm-ascend-hust 各自能调什么）
 
-本文是"**哪一层、谁可以调、调了会发生什么**"的权威速查。架构设计
-背景见 [architecture.md](architecture.md)，方案语义见
-[schemes.md](schemes.md)。
+本文是"**哪一层、谁可以调、调了会发生什么**"的权威速查。运行时分派见
+[../README.md](../README.md) 的运行机制，方案语义见 [schemes.md](schemes.md)。
 
 ## 1. 六层一图
 

@@ -27,7 +27,7 @@
     bootstrap vLLM 钩子   —— vLLM 经 vllm.general_plugins entry point 调用
 
 设备内核只在 Ascend NPU 上执行；任何设备路径在非 NPU 环境 fail-closed
-并给出明确报错。分层设计见 ``docs/architecture.md``，发布流程见
+并给出明确报错。分层设计见 ``docs/layers.md``，发布流程见
 ``docs/packaging-and-release.md``。
 """
 

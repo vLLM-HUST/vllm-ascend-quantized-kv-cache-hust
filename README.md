@@ -1,173 +1,103 @@
 # Ascend Quantized KV Cache Plugin
 
-面向 `vllm-ascend-hust` 的量化 KV-cache attention implementation 插件，
-运行在由 `vllm-hust` 启动的推理进程中。仓库提供两种量化方式：动态
-per-channel INT8（2x）与 KIVI INT4（历史区 4x + 全精度残差窗口）；它不是
-CUDA、ROCm 或 CPU 可用的通用 vLLM 插件。
-
-插件不读取模型 checkpoint 的 `fa_quant_type`，也不要求模型预量化。
-唯一启用开关是 vLLM 命令行参数：
+面向 `vllm-ascend-hust`（由 `vllm-hust` 启动的推理进程）的量化 KV-cache
+attention implementation 插件。提供两种量化方案：动态 per-channel **INT8**
+（2x）与 **KIVI INT4**（历史区 int4 + 全精度残差窗口，约 3.6x）。不是
+CUDA / ROCm / CPU 的通用 vLLM 插件；不读 checkpoint 的 `fa_quant_type`，
+也不要求模型预量化——唯一开关是命令行 dtype：
 
 ```bash
 vllm serve MODEL --kv-cache-dtype int8        # 动态 per-channel INT8
 vllm serve MODEL --kv-cache-dtype kivi_int4   # KIVI INT4
 ```
 
-## 运行机制
-
-安装 wheel 后，vLLM 通过 `vllm.general_plugins` 动态加载
-`bootstrap.register_plugins`。入口为宿主 `AscendAttentionBackend` 安装
-`get_impl_cls` 分派器：cache dtype 为 `int8` / `kivi_int4` 时返回对应插件
-实现，其他 dtype 继续调用宿主原始分派逻辑。未传量化 dtype 时不会执行任何
-量化路径。
-
-- **INT8**：scale 在每层首次收到 K/V 时沿 token 维计算，K/V 分别使用动态
-  对称 per-channel scale。decode 使用 Ascend fused attention 的在线
-  antiquant；prefill 和 chunked prefill 在需要时 gather 并反量化分页缓存。
-- **INT4（KIVI）**：每请求最近 `kivi_residual_length` 个 token 保持全精度
-  （残差窗口），更早的 token 按键的 token 组 / 值的 head 维组做非对称
-  min-max 量化，经 triton-ascend 内核打包成分页 int4 历史区。vLLM 每层只
-  会给两张 KV 缓冲，因此历史区是**两张等大字节缓冲**，插件按
-  `S = head_size/2 + 8*head_size/group_size` 字节/token/head 的预算把它切成
-  `(k_quant, k_scale, k_mn, v_quant, v_scale, v_mn)` 六个视图（视图不复制
-  数据）。注意力计算时把历史区 gather + 反量化成稠密张量走 TND fused
-  attention，再覆盖全精度残差尾。组大小与窗口长度读自宿主
-  `cache_config.kivi_group_size` / `kivi_residual_length`（默认 128/128）。
-  默认几何（head 128、group 128）下相对 fp16 约 **3.6x**，不是 4x：scale
-  与 min 的开销要算进预算（`KiviByteCacheLayout.compression_vs_fp16()`）。
-
-实际类组合为：
-
-```text
-AscendInt8KvAttentionImpl
-  = plugin AscendInt8AttentionBackendMixin
-  + host AscendAttentionBackendImpl
-
-AscendKiviInt4KvAttentionImpl
-  = plugin AscendKiviInt4AttentionBackendMixin
-  + host AscendAttentionBackendImpl
-```
-
-当 context parallel 开启时，两种量化 KV cache 都会明确拒绝启动，与当前
-宿主限制一致。
-
-## 安装与运行
+## 安装与自检
 
 ```bash
 conda activate vllm-hust-dev
-python -m pip install -e .
-
-VLLM_LOGGING_LEVEL=INFO vllm serve MODEL \
-  --kv-cache-dtype int8 \
-  --max-model-len 8192
+python -m pip install -e .                       # 部署时必须装进运行 vllm 的同一环境
+PYTHONPATH=src python -m pytest -q               # CPU 全量测试，不需要 NPU
+python -m build && bash scripts/verify-wheel.sh dist/*.whl
 ```
 
-不需要 `VLLM_HUST_KV_METHODS`，不需要修改 checkpoint。
-
-检查动态插件入口：
+插件经 `vllm.general_plugins` entry point 由 vLLM 自动加载，无需额外环境
+变量。检查注册是否可见：
 
 ```bash
 python -c "from importlib.metadata import entry_points; print([e for e in entry_points(group='vllm.general_plugins') if e.name == 'vllm-ascend-quantized-kv-cache'])"
 ```
 
-## Bundle manifest
+## 运行机制
 
-wheel 内包含 Bundle v1 manifest：
-`vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json`。
-其宿主声明为 `provider=vllm`、`name=vllm-ascend`。
-需要静态准入的宿主可通过 `VLLM_EXTENSION_MANIFESTS` 显式传入该文件。
-Manifest 的 `implementation_ref` 描述插件提供的 backend 组件；实际运行时
-接入由 `vllm.general_plugins` 调用 `install_kv_impl_dispatch()` 完成。
+安装 wheel 后，`bootstrap.register_plugins()` 给宿主的
+`AscendAttentionBackend` 装上 `get_impl_cls` 分派器：只有量化 dtype 走插件
+实现，其他 dtype 原样委托宿主；context parallel 下两种量化 cache 一律
+fail-closed（与当前宿主能力一致）。
 
-## 验证
-
-```bash
-PYTHONPATH=src python -m pytest -q
-python -m build
-bash scripts/verify-wheel.sh dist/*.whl
+```text
+vllm serve MODEL --kv-cache-dtype {int8|kivi_int4}
+  └─ host AscendAttentionBackend.get_impl_cls()
+       ├─ plugin AscendInt8AttentionBackendMixin + host AscendAttentionBackendImpl
+       │    ├─ 首个 K/V 到达时按 token 维算动态对称 per-channel scale
+       │    ├─ decode：fused attention 的在线 antiquant
+       │    └─ prefill / chunked prefill：需要时 gather 并反量化分页缓存
+       └─ plugin AscendKiviInt4AttentionBackendMixin + host AscendAttentionBackendImpl
+            ├─ 每请求最近 kivi_residual_length 个 token 保持全精度
+            ├─ 更早的 token：键按 token 组、值按 head 维组做非对称 min-max
+            ├─ 宿主只给两张 KV 缓冲 → 插件按字节预算切成 6 个视图（不复制数据）
+            ├─ int4 打包：triton-ascend 内核（ops/triton/kivi_pack）
+            └─ 注意力：gather + 反量化成稠密 TND 走 fused attention，再覆盖残差尾
 ```
 
-设备执行仅支持 Ascend NPU。当前目标环境为 Ascend 910B +
-`vllm-hust-dev`。
+INT4 的历史区是**两张等大字节缓冲**，每 token 每 head 单侧
+`S = head_size/2 + 8*head_size/group_size` 字节（int4 数据 + 每组一份 fp32
+scale 与 min）。默认几何（head 128 / group 128）相对 fp16 约 **3.6x**，
+不是 4x——scale/min 的开销要算进预算，口径以
+`KiviByteCacheLayout.compression_vs_fp16()` 为准。组大小与窗口长度读自宿主
+`cache_config.kivi_group_size` / `kivi_residual_length`（默认 128/128）。
 
-### 已验证环境
+## 现状（feat/int4）
 
-2026-09-16 完成了真实 NPU 端到端验证：
+| 方案 | 代码 | 设备验证 | 端到端 serve | CLI 可选 |
+|---|---|---|---|---|
+| `int8_dynamic` | ✅ | ✅ 910B2 分派 + 前向 | ✅ 2026-10-03（[实测](docs/serving-verification-20261003.md)） | ✅ `int8` |
+| `kivi_int4` | ✅ | ✅ 13 节设备记录（[验证记录](docs/validation-int4-20260920.md)） | ✅ 同上，稠密模型 3.56x 兑现；Qwen3.5-35B-A3B 也跑通 | ✅ `kivi_int4` |
+| `fp8_per_token_head` | 写入内核有，读路径没有 | ❌ | ❌ | ❌ |
+| 四个纯格式契约 | 只在 dev 分支 | ❌ | ❌ | ❌ |
 
-| 项目 | 已验证值 |
-|---|---|
-| 插件版本 | `0.2.0.dev0` |
-| vLLM-HUST commit | `8a6655cf62` |
-| vLLM-Ascend-HUST commit | `f4f49832` |
-| vLLM 运行时版本 | `0.23.1.post1.dev498+g802ead286.dirty` |
-| 设备 | Ascend 910B，单卡 |
-| 模型 | Qwen2.5-14B-Instruct |
-| 模型权重 | BF16 |
-| KV cache | 动态 per-channel INT8 |
-| 上下文长度 | 8192 |
-| Prefill / decode | 通过 |
-| ACL Graph capture / replay | 通过 |
-| OpenAI Chat API | 3 次请求均返回 HTTP 200 |
+端到端跑通依赖宿主那四处改动（CLI 字面量、存储 dtype、页大小、缓存形状）；
+在**未打补丁**的宿主 revision 上选量化 dtype 会在构造 `CacheConfig` 时被
+pydantic 的 `Literal` 拒绝，清单与已核行号见
+[docs/int4-host-integration.md](docs/int4-host-integration.md)。模型级精度
+评测（真实权重下的输出质量）尚未建立基线。
 
-该验证不代表已覆盖多卡、context parallel、所有模型或所有宿主版本。
-正式发布前应使用目标 wheel 在每个声明支持的宿主版本上重复验证。
+## 文档地图
 
-### INT4 的验证状态
+按"要做什么"入口：
 
-KIVI INT4 在 CPU 上覆盖了整条数据通路：语义数学、残差窗口状态机，以及用
-CPU 参考打包器替换 triton 内核后跑通的 `forward()` 全链路（整组 flush →
-分页 int4 历史区 → gather 反量化 → 残差尾覆盖 → 稠密注意力），输出与
-独立写出的量化参考逐位对齐、并确认与全精度结果存在量化误差；语义侧的
-分块反量化与在线 gather 实现互为对拍。三条 fused-attention 分支
-（DecodeOnly / PrefillNoCache / ChunkedPrefill）用一个记录型 `torch_npu` 桩
-在算子边界上验证：layout、sparse_mode、因果掩码、逐请求
-`actual_seq_lengths`、跨批 cumsum 的 kv 长度、输入切片与输出写回区间都逐条
-断言（对该区域做 5 处变异全部被抓）。移植自 legacy Ascend PR #116
-0003-0009（该分支在 910B2 上逐位验证过打包与 gather 内核）。
+- **选方案** → [docs/schemes.md](docs/schemes.md)（一览 + 每方案一页 + 下一步）
+- **改代码** → [docs/development.md](docs/development.md)（环境、分层纪律、如何加方法、测试策略）
+  与 [docs/layers.md](docs/layers.md)（六层调用图、宿主可见性矩阵）
+- **接宿主** → [docs/integration.md](docs/integration.md)（两条宿主链路、验收清单）
+  与 [docs/int4-host-integration.md](docs/int4-host-integration.md)（INT4 字节预算）
+- **上设备** → [docs/how-to-run.md](docs/how-to-run.md)（910B 运行与探针命令）
+  与 [docs/npu-implementation.md](docs/npu-implementation.md)（内核清单、状态机、精度方法论）
+- **查证据** → [docs/validation-int4-20260920.md](docs/validation-int4-20260920.md)（910B2 逐位记录）、
+  [docs/serving-verification-20261003.md](docs/serving-verification-20261003.md)（serve 实测）、
+  [docs/benchmark.md](docs/benchmark.md)（唯一保留的压测数据）
+- **发布 / 打榜** → [docs/packaging-and-release.md](docs/packaging-and-release.md)、
+  [docs/release-and-leaderboard.md](docs/release-and-leaderboard.md)、
+  [docs/swe-prefix-benchmark-playbook.md](docs/swe-prefix-benchmark-playbook.md)
+- **对外契约与出处** → [HOST_CONTRACT.md](HOST_CONTRACT.md)、
+  [PROVENANCE.md](PROVENANCE.md)（legacy 移植范围与算术口径）
+- **业界对照** → [docs/kvquant-survey.md](docs/kvquant-survey.md)（唯一一份调研）
 
-**910B2 设备复验已完成（2026-09-20，HEAD `84e5ab3`，见
-`docs/validation-int4-20260920.md`）**：打包内核与纯 torch dequant-gather 逐位
-复现语义参考（value `EXACT`、key `max|diff|=0`），三条注意力分支（prefill /
-decode / **chunked prefill**）在玩具几何与出厂默认几何（head 128 / kv 8 /
-group 128 / block 128）下都与"对同一份 gather 结果直接调用 fused attention"
-完全一致（差异 0，且把 chunked 的输出写回区间改错只有该探针能抓到）；多请求
-批量 decode（历史长度互不相干、各跨 2~5 个 block、只靠
-`actual_seq_lengths_kv` 前缀和描述）同样零差异，跨请求泄漏类变异（所有请求读
-同一行残差、切片不偏移）只有 `scripts/npu_probe_kivi_batched.py` 能抓到，它同时
-给出设备侧量化口径：int4 历史 vs fp16 缓存的注意力输出偏差 ≤0.068 倍 K/V rms、
-余弦 ≥0.990，且该误差在 48→192 token 内不随上下文累积；retire 后的残差行与
-block 立刻给新请求复用（重挂载）也在这一步里对拍。chunked 步也第一次以
-"2 个 decode + 3 个不等长 prompt"的批跑过：每个 prompt 请求的 q 长度要从累积的
-`actual_seq_lengths_q` 减去 decode 行数还原，1+1 的批里这套算术退化、错了也看不出来
-（`scripts/npu_probe_kivi_chunked_batch.py`）。`block_size` 与 `residual_length`
-错开的几何也过；同时测出**能过校验但编不出内核**的形状（`group=128`+`block=256`
-在 910B2 上 UB 溢出；出厂默认 128/128/128 无恙，见
-`scripts/npu_probe_kivi_geometry.py` 与 `HOST_CONTRACT.md`）。多步生成（64~67 个 decode step、跨多次整窗 flush、真 triton 打包）
-也逐步对过：每一步的 gather 都符合 pinned 的 flush 调度，出厂几何上唯一的不同是
-128 行里有 1 行的某个元素落在**恰好一半**的格点上（归一化值数学上是 7.5），内核的
-fp32 中间结果是 7.49999973，于是比 `quantize_group` 低一档——这一条已写进
-`quantize_group` 的 docstring，探针按"同档或平局相邻档"判定。两个探针还跑在 GQA 形状下（`KIVI_PROBE_GQA=7`，即 14Q/2KV 与
-56Q/8KV）——这条形状此前完全没跑过，而把 `num_key_value_heads` 报错时 MHA 毫无
-反应、GQA 立刻 NaN；纯 torch 兜底注意力（自己扩 q 头、自己拼掩码）也在设备上与
-aclnn 对过，差异只有输出 rms 的 0.005。实验性融合 gather 仍误编译，保持不路由。
-分派本身用 `scripts/probe_host_dispatch.py` 在**真实宿主类**上核对：
-`auto`/`fp8`/`float16`
-原样委托 `AscendAttentionBackendImpl`，`int8` / `kivi_int4` 各自返回插件组合的
-实现类，用真实 `decode_context_parallel_size=2` 配置时抛
-`NotImplementedError`。该脚本同时暴露并修掉了一处宿主漂移：新宿主已把
-`enable_cp()` 换成 `enable_dcp()`/`enable_pcp()`，旧分派在真机上一选量化 dtype
-就 `ImportError`。
+## 支持范围
 
-**安装态也验过**：把 wheel 装到源码树之外，只用 vLLM 自己的
-`load_general_plugins()` 触发 entry point，插件正常挂上并交出 INT4 实现类
-（`scripts/probe_installed_plugin.py`）。这一步顺带修掉一个会拦住启动的缺陷：
-注册路径在宿主的 attention 栈尚未导入时直接 import `attention_v1`，会撞上该
-宿主 revision 的循环导入（`ImportError: cannot import name 'DeviceOperator'`），
-**已发布的 INT8 路径同样中招**，修复见 `6a1dc4b`。
-
-**仍未验证的是端到端 serving**：该容器宿主的 `CacheDType` 是 pydantic 校验的
-`Literal`，`kivi_int4`（和 `int8`）都不在其中，CLI 层面就会被拒；宿主还需按
-上面的字节预算给每层分配两张等大缓冲，并暴露
-`kivi_group_size` / `kivi_residual_length` 旋钮；对不上预算时插件在绑定期
-fail-closed（见 `HOST_CONTRACT.md`、`docs/int4-host-integration.md`）。模型级
-精度（真实权重下的输出质量）也要等端到端跑通后才能测。
+- 目标环境：Ascend 910B / 910B2 + `vllm-hust-dev`；已验证的宿主基线记在
+  [HOST_CONTRACT.md](HOST_CONTRACT.md)。其他 commit 或发行版的兼容性不能只靠
+  API 存在性推断，必须重跑集成测试。
+- 非 NPU 环境、缺少契约要求的 API、或量化 dtype 下开启 context parallel 时
+  一律 fail-closed 并报明确错误，不猜布局。
+- 调研引用的外部数字（精度、吞吐、压缩比）全部来自论文或厂商口径，我们自己
+  没复测过；对外引用前先跑自己的 benchmark。

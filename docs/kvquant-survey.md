@@ -1,14 +1,17 @@
-# 除 INT8 / INT4 之外的 KV 量化方案调研
+# KV 量化方案调研（业界与学术全景）
 
-> 调研时间：2026-09-22。本文只谈**非纯整数 int8/int4** 的 KV cache 量化
-> 方案（浮点与块微缩格式、码本/向量量化、显著性自适应混合精度、旋转
-> 与分层位宽分配、误差补偿混合方案）。KIVI / KVQuant / ZipCache 等既有
-> 综述见 [industry-survey.md](industry-survey.md)，本仓库六个方案的语义
-> 差异见 [schemes.md](schemes.md)。
+> 两轮合并：2026-09-12 的行业/学术综述 + 2026-09-22 的"非纯整数
+> int8/int4"深挖，本文是**唯一一份调研**（外部框架与宿主的真实支持
+> 状态以第二轮为准，其口径修正了第一轮若干处）。整数主线方案
+> （KIVI / KVQuant 家族）速览见 §5.5；本仓库各方案的语义差异见
+> [schemes.md](schemes.md)。
 >
 > 证据分三档，逐条标注：**本地实测**（在本机宿主 checkout 里读到的
 > 代码与行号，可复现）、**已核验**（联网打开过原始页面/博客/文档）、
 > **待核验**（检索摘要或凭知识整理，采用前需复核）。
+>
+> **外部数字一律是论文/厂商口径，我们没复测过**；对外引用前先跑自己
+> 的 benchmark（见 [benchmark.md](benchmark.md)）。
 
 ## 1. 一页结论
 
@@ -338,6 +341,27 @@
 - **KIVI 官方仓库已停更（2025-01-18）**：把 kivi_int4 当作"论文复现"
   对外描述时，不要再暗示有活跃上游可依。
 
+### 5.5 整数主线方案速览（KIVI / KVQuant 家族）
+
+本文主体谈非整数格式，这里把两条被广泛引用的整数量化主线放在一起，
+因为它们决定了 `kivi_int4` 的定位与后续增强项（**已核验**，来源见
+§12）：
+
+| 方案 | 核心思想 | 与本仓库的关系 |
+|---|---|---|
+| **KIVI**（arXiv 2402.02750，ICML 2024） | 键 **per-channel**（同组覆盖连续 token）、值 **per-token** 的非对称量化；2bit；免调参；**全精度滚动残差窗口**吸收近期 token 与溢出组；2.6x 峰值内存、4x batch、2.35–3.47x 吞吐 | `kivi_int4` 的直系来源：分组结构与残差窗口状态机一致，位宽取 int4（论文 2bit）；legacy 出处 ascend#116/0003-0009。官方仓库已停更（§5.4） |
+| **KVQuant**（arXiv 2401.18079，NeurIPS 2024） | 四件套：per-channel key 量化 + 敏感度加权**非均匀码本**（LlamaNormal）+ **pre-RoPE** key 量化 + **dense-and-sparse** 分解保护 ~0.1% attention-sink 离群；~4bit 近无损 | 键分组思路已对齐；非均匀码本 / pre-RoPE / sink 保护是三个已验证的增益方向 |
+
+同一族里其余常被引用的工作，按"离群值从哪消失"归位到本文的坐标系
+（§2）：**ZipCache**（2405.14256，显著 token 识别 + canonic 乘法内核，
+属 §5 的显著性自适应）、**Palu**（2407.21118，低秩投影后重建 K/V，属
+§7 误差补偿）、**SKVQ**（2405.06219，滑窗通道重排 + 截断动态范围，属
+§6 旋转/重排）、**GEAR**（2403.05527，量化 + 低秩 + 稀疏三路修正，属
+§7.1）、**LogQuant**（2503.19950，log 分布 2bit，属 §4 码本族）。
+共同主题：**位宽越低，越要专门安置离群/显著元素**——残差窗口、
+dense-sparse、低秩残差、稀疏修正、换码本、截断范围或重排通道，都是
+这一件事的不同做法。
+
 ## 6. 旋转 / 变换与分层位宽分配
 
 ### 6.1 宿主里已有的旋转路线（本地实测）
@@ -507,6 +531,26 @@ NPU 宿主上目前都不可达——除非常驻插件自己接管实现与分�
   llm-compressor 校准、以及 `--kv-cache-dtype-skip-layers`。**看代码不看
   文档**是这一族目前的常态。
 
+**上游 vLLM 的 FP8 生产口径**（已核验，官方博客
+2026-04-22《The State of FP8 KV-Cache and Attention Quantization in
+vLLM》）：scale 粒度是 **per-tensor 未校准（scale=1.0，默认）** 与
+**per-KV-head 静态**（FA3 为此扩展了 `reshape_and_cache_flash`），博客
+未涉及 per-block / 动态 scale；Hopper 上修复长上下文两级累加后 128k
+NIAH 从 13% 回到 89%；混合注意力用
+`--kv-cache-dtype-skip-layers sliding_window` 把 break-even 从 ~741k
+token 降到 ~7.7k；结论是 FP8 "可作为多数长上下文部署的默认起点"，
+短上下文（<~7k）、head_dim=256 且在意 TTFT、未校准精度 <95% 时留在
+BF16。社区工程口径另提示 **INT8 KV 在长上下文检索类任务比 FP8 多损失
+1.5–3 点**（SqueezeBits 对比评测同向：decode 密集负载收益最大，GPU 上
+FP8 的吞吐与精度都优于 INT8）；上游 `int8` KV 至今不是
+`CacheDType` 成员（issue #33480 仍在请求）。
+
+**llama.cpp / LMDeploy**（已核验，属"框架把 K/V 的 dtype 彻底解耦"
+一路）：llama.cpp 用 `-ctk/-ctv` 各选各的（`q8_0` 2x 视为近无损，
+`-ctk q8_0 -ctv q4_0` ~4x 但 V 侧有感度风险），且 **V 量化要求 Flash
+Attention**（issue #21450）；LMDeploy 提供 INT4/INT8 KV 量化，粒度
+同样是 per-head/per-channel。
+
 **SGLang main@c79510cc2a33**：CLI 允许
 `auto, fp8_e5m2, fp8_e4m3, mxfp8, bf16, nvfp4, fp4_mx_block16, fp4_e2m1`
 （`srt/arg_groups/fields/model.py:196-219`）。其中 **`fp4_e2m1` 已标记
@@ -628,8 +672,8 @@ torch.ops.npu.npu_add_rms_norm_dynamic_mx_quant
    后端引用它们——意味着移植到 triton-ascend **不依赖 CANN/FIA 新增
    antiquant 参数**，而我们的 pack 内核已在 910B2 逐位跑通。它同时给
    FP8 的动态 per-token-head scale——正好补上本仓库
-   `int8_dynamic` 的"scale 只在首个 prefill 算一次"这一短板（见
-   [industry-survey.md](industry-survey.md) §5.2 第 5 条）。先做语义 +
+   `int8_dynamic` 的"scale 只在首个 prefill 算一次"这一短板
+   （[schemes/int8-dynamic.md](schemes/int8-dynamic.md)）。先做语义 +
    CPU 参考，再测内核形状包络。
 2. **TurboQuant 以"对齐上游"的方式做**（§4、§4.4）：宿主已有完整实现与
    纯 triton 内核，接入形态与我们的 `get_impl_cls` 分派匹配。但先做两件
@@ -666,33 +710,28 @@ torch.ops.npu.npu_add_rms_norm_dynamic_mx_quant
 8. **KV transfer 那条路线现在就能立项**（§7.2）：CacheGen 的差值 +
    熵编码口径正好对应 `HOST_CONTRACT.md` 缺失的第四协议，且与位宽选择
    正交——disagg serving 下量化 KV 布局协商是业界真实需求。
-9. **建 benchmark 前不对外引用任何外部数字**（沿用
-   [industry-survey.md](industry-survey.md) §6）：本轮所有 PPL/AUC/压缩
+9. **建 benchmark 前不对外引用任何外部数字**：本文所有 PPL/AUC/压缩
    比都来自论文或厂商口径；§4.1 的四个 preset 数字目前只有宿主注释的
    出处，属**待核验**。
 
-## 11. 与自家文档的口径差异（本轮已修）
+## 11. 状态复核与修订记录（截至 2026-10-03）
 
-`schemes.md` §2 契约表把 `fp4_e2m1` / `nvfp4` 记为
-"**~7.1 bit/元素**、相对 fp16 **~4.5x**"。按契约自身
-（`dtypes.fp4_e2m1_packed_dim` / `nvfp4_packed_dim`，head_size=128 →
-72 字节/头/侧）：
-
-```text
-每元素有效位宽 = 72 B * 8 / 128 = 4.5 bit/元素
-相对 fp16 压缩 = 256 B / 72 B = 3.56x
-```
-
-即两个数字被写反了。旁证：SGLang 文档口径为"FP4 E2M1 ≈ 3.56x vs
-BF16、1.78x vs FP8"（0.5B 数据 + 1/16B scale），与本仓库算法一致
-（已核验）。本仓库 `kivi_int4` 的 3.56x 与之一致，也说明 packed 两行
-是笔误而非另一种口径。
-
-**已就地修正**（本轮）：`schemes.md` §1.1 叙述 + §2 契约表两行 + §4
-横向对比表两行，统一为"4.5 bit/元素、~3.6x"。仍**保留未动**的是
-`kivi_int4` 的"4x（历史区）"写法——它在字面上没错（历史区确实是 4
-bit），但对外报预算时必须用 `KiviByteCacheLayout.compression_vs_fp16()`
-的 **3.56x**（`HOST_CONTRACT.md` 已明令"不要按 4x 报预算"）。
+- **口径修正（已就地改掉）**：`fp4_e2m1` / `nvfp4` 曾被写成
+  "~7.1 bit/元素、~4.5x"；按契约自身的打包维（head_size=128 →
+  72 字节/头/侧）实为 **4.5 bit/元素、3.56x**，两个数字写反了。与
+  SGLang 文档口径（FP4 E2M1 ≈3.56x vs BF16）一致。`kivi_int4` 报预算
+  同样用 `KiviByteCacheLayout.compression_vs_fp16()` 的 3.56x，不用"4x"。
+- **上游 issue 当日核对**：vllm-ascend **#15198 / #15821**（TurboQuant NPU
+  内核）仍 open、0 评论；vLLM **#46774**（OSCAR-2 2bit backend）仍 open、
+  needs-rebase；vllm-ascend **#15503**（FIA 掩码在 KV 位置 512 之后静默
+  失效）仍 open——**做任何长上下文精度评测前先排除这条**。
+- **§10.1 第一步已落地**：`fp8_per_token_head` 做到契约 + 布局 + CPU 参考
+  语义 + triton store 内核（1:1 移植宿主 `_reshape_cache_per_token_head`），
+  **未上机、未路由**；细节与后续顺序见
+  [schemes/fp8-per-token-head.md](schemes/fp8-per-token-head.md) 与
+  [npu-implementation.md](npu-implementation.md)。
+- 2026-09-22 → 10-03 检索未发现超出本文覆盖的新方案；INT2/1-bit 动向
+  多为 snippet 级（待核验），不改变 §4.5/§5.4 的门槛判断。
 
 ## 12. 来源清单
 
@@ -830,61 +869,3 @@ sed -n '1,12p' ../vllm-hust/vllm/v1/attention/ops/int4_per_token_head.py
 cd ../vllm-ascend-hust && grep -rhoE "torch\.ops\.npu\.npu_[a-z0-9_]*(quant|mx)[a-z0-9_]*" vllm_ascend/ | sort -u
 ```
 
-## 13. 本轮增补（2026-10-03）：状态复核与 §10.1 第一步落地
-
-### 13.1 上游与文献状态复核（当日核对）
-
-- vllm-ascend **#15198 / #15821**（TurboQuant NPU 融合算子 / DeepSeek V4
-  Flash）：GitHub API 核对，仍 **open、0 评论**，无进展。
-- vLLM **#46774**（OSCAR-2 2bit backend）：仍 **open、needs-rebase、
-  25 评论**，最后更新 2026-08-21。
-- vllm-ascend **#15503**（FIA 掩码在 KV 位置 512 之后静默失效）：仍
-  **open、0 评论**——做任何长上下文精度评测前依旧必须先排除这条。
-- 文献面：2026-09-22 → 10-03 检索未发现超出本文覆盖的新方案。最近的
-  动向仍集中在 INT2/1-bit（输出感知旋转、MPO 分解、可交换 VQ 等，
-  多为 snippet 级、待核验），与 §4.5/§5.4 的门槛判断一致；NVFP4 KV
-  仍锁定 Blackwell 家族（SM120 讨论帖口径：FP8 "statistically
-  lossless"、NVFP4 +0.01–0.04 nats，待核验），不改变 §3.3/§10.7。
-
-### 13.2 §10.1 第一步已落地（本仓库 feat/int4）
-
-按 §10.1 的顺序（先语义 + CPU 参考，再内核形状包络）：
-
-- **契约层**：`KVQuantMode.FP8_PER_TOKEN_HEAD`（插件本地编号 10），
-  `resolve_layout("fp8_per_token_head")`——uint8 存储、不打包、
-  head_size % 4 校验（fp32 scale 对齐）。
-- **布局**：`methods/fp8_per_token_head/byte_cache.py`——与 KIVI 同一
-  "两张等大宿主缓冲、插件切视图"接法，每侧
-  `[head_size B E4M3 数据 | 4 B fp32 scale]`，S = head_size + 4，与
-  宿主 `real_page_size_bytes` 的 per_token_head 分支
-  （数据 `2*block*kvh*head` + scale `2*block*kvh*4`）逐位一致；
-  head 128 → 132 B/（token·head·侧），≈1.94x。
-- **CPU 参考语义**：`methods/fp8_per_token_head/semantics.py`
-  （scale = amax/448、clamp 后 cast、误差界与离群稳健性测试）——
-  将来 triton-ascend store 内核的对拍基准。
-- **fail-closed 边界**：`adapter_factories` 缺位、
-  `bootstrap.REGISTERED_METHODS` 不含它——设备路径落地前
-  `--kv-cache-dtype fp8_per_token_head` 不可选，`host_adapter` 抛
-  "no adapter wired"。
-- **store 内核已移植（同日第二轮）**：`ops/triton/per_token_head_store.py`
-  1:1 移植宿主 `triton_reshape_and_cache_flash.py` 的
-  `_reshape_cache_per_token_head`（每 (token, head) 一个程序、
-  absmax/448 scale 下限 1e-6、clamp 后按张量 dtype store cast；int8
-  参数表随内核带入、路径未启用）。校验器是普通函数、triton 惰性导入，
-  CPU 测试不需要 triton；jit 函数进程内只构建一次（防编译缓存失效）。
-  语义层的 scale 下限同步从 fp32 tiny 改成 1e-6 与宿主逐位同口径。
-  **未上机验证、未路由**——设备探针要回答的两件事：①triton-ascend
-  对 fp8 指针 store cast 的支持（不支持则在本模块内换手工 E4M3 位型
-  编码）；②(2D grid, HEAD_SIZE_PADDED=256, num_warps) 的编译包络。
-- 后续（按投入产出排序）：①910B2 设备对拍（内核 vs 本语义 CPU 参考）
-  与包络测量（复用第 10 节方法）→ ②FIA 读通路（per-token-head scale
-  反量化进注意力；宿主 triton_attn 的 per-token-head 读路径是参考）
-  → ③接线注册 + 真宿主分派核对 → ④int8_per_token_head 变体
-  （IS_INT_QUANT 分支已在内核里）。
-- 同轮（2026-10-03）还完成了 kivi_int4 热路径去同步化：
-  `ordered_slots` / 残差 store / 残差 gather 的逐 token
-  host-device 同步全部向量化（真机 serving 每步原本付
-  O(sum(seq_len)) 次同步），顺序语义由逐位置参考实现对拍钉死。
-
-提交：`d432a92`（perf 去同步化）、`eb3a54f`（fp8_per_token_head 脚手架）、
-store 内核移植 + 死代码清理（见 git log 同日提交）。

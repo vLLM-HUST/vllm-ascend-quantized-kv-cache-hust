@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 per-token-head 的纯语义（纯 torch，CPU 可测）。
 
-方案定位（调研文档 kvquant-schemes-beyond-int8-int4.md §9.3/§10.1）：
+方案定位（调研文档 kvquant-survey.md §9.3/§10.1）：
 宿主 vllm-hust 的 triton 后端原生支持 ``fp8_per_token_head``（per-token-head
 动态 scale 的 E4M3 存储），是 NPU 上不依赖任何厂商新算子的最低成本新
 dtype。与本仓库 int8_dynamic 同一"在线 scale、免校准、免预量化
