@@ -9,7 +9,11 @@ monkeypatch 的启动契约，数值对拍要等 910B2 的设备探针。
 from __future__ import annotations
 
 import pytest
-import torch
+
+# torch is a host/runtime dependency, not a build one: the CI lane that installs
+# only the test extra has no torch, and these are the CPU numerical references for
+# the device kernels, so the whole module skips there rather than erroring.
+torch = pytest.importorskip("torch", reason="needs torch (host runtime dependency)")
 
 from vllm_ascend_quantized_kv_cache.dtypes import (
     KVCacheLayout,

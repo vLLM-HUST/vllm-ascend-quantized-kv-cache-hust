@@ -16,6 +16,10 @@ test = [
   "pytest>=8",
   "ruff>=0.12",
   "tomli>=2; python_version < '3.11'",
+  # The CPU numerical references for the device kernels need torch. The
+  # 3.14 lane has no torch wheel yet, so those modules skip there instead
+  # of erroring (pytest -rs makes every skip visible in the CI log).
+  "torch>=2.4; python_version < '3.14'",
 ]
 
 # Runtime plugin hook. It registers the backends; --kv-cache-dtype int8 or

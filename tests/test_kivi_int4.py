@@ -9,7 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+# torch is a host/runtime dependency, not a build one: the CI lane that installs
+# only the test extra has no torch, and these are the CPU numerical references for
+# the device kernels, so the whole module skips there rather than erroring.
+torch = pytest.importorskip("torch", reason="needs torch (host runtime dependency)")
 
 from vllm_ascend_quantized_kv_cache.methods.base import MethodConfig
 from vllm_ascend_quantized_kv_cache.methods.kivi_int4 import (

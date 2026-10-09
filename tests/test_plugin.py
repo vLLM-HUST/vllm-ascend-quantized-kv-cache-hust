@@ -309,6 +309,9 @@ def test_registration_touches_host_ops_before_the_attention_module(
 
 
 def test_kivi_impl_composition_turns_on_kivi_state(monkeypatch, host_stack) -> None:
+    pytest.importorskip(
+        "torch", reason="composing the KIVI mixin needs torch (host runtime dependency)"
+    )
     """The dispatcher's INT4 impl must self-initialise from the host config."""
     import vllm_ascend.attention.attention_v1 as attention_v1
 
@@ -525,6 +528,10 @@ assert "torch" not in sys.modules, sorted(sys.modules)
 
 
 def test_shipped_dispatch_maps_each_dtype_to_its_own_mixin(monkeypatch, host_stack):
+    pytest.importorskip(
+        "torch",
+        reason="building the shipped impl classes needs torch (host runtime dependency)",
+    )
     """The builder table itself must map each dtype to that dtype's mixin.
 
     Per-dtype selection is checked with stub builders elsewhere; nothing else
