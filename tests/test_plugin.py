@@ -349,13 +349,71 @@ def test_bundle_v1_publishes_both_backends() -> None:
     )
     payload = json.loads(manifest_path.read_text())
     assert payload["schema_version"] == "1.0"
-    assert payload["host"] == {"provider": "vllm", "name": "vllm-ascend"}
+    assert payload["host"] == {"provider": "vllm", "name": "vllm-ascend-hust"}
     refs = {c["component_id"]: c["implementation_ref"] for c in payload["components"]}
     assert set(refs) == {"int8-kv-attention-backend", "kivi-int4-kv-attention-backend"}
     assert refs["int8-kv-attention-backend"].endswith(":AscendInt8KvAttentionBackend")
     assert refs["kivi-int4-kv-attention-backend"].endswith(
         ":AscendKiviInt4KvAttentionBackend"
     )
+
+
+def test_extension_manager_bundle_is_static_and_matches_runtime_hook() -> None:
+    """Discovery metadata must name the entry point that really registers.
+
+    Ported from main and widened: this wheel publishes two backends, so the
+    Manager manifest and the Bundle v1 manifest both have to agree with the
+    distribution version and with the ``vllm.general_plugins`` entry point --
+    a stale int8-only id here would make the Extension Manager resolve a
+    plugin name the installed dist-info does not contain.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
+
+    project_root = Path(__file__).parents[1]
+    entry_points = tomllib.loads((project_root / "pyproject.toml").read_text())[
+        "project"
+    ]["entry-points"]
+
+    assert entry_points["vllm.general_plugins"] == {
+        "vllm-ascend-quantized-kv-cache": (
+            "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
+        )
+    }
+    assert entry_points["vllm_hust.extension_bundles"] == {
+        "org.vllm-hust.ascend-quantized-kv-cache": (
+            "vllm_ascend_quantized_kv_cache.extension_manager_manifest"
+        )
+    }
+
+    from vllm_ascend_quantized_kv_cache import __version__
+
+    manager = json.loads(
+        (
+            project_root
+            / "src/vllm_ascend_quantized_kv_cache/extension_manager_manifest/"
+            "vllm-hust-extension-v0.2.json"
+        ).read_text()
+    )
+    bundle = json.loads(
+        (
+            project_root / "src/vllm_ascend_quantized_kv_cache/manifests/"
+            "vllm-hust-extension-v1.json"
+        ).read_text()
+    )
+    assert manager["schema_version"] == "0.2-experimental"
+    assert manager["kind"] == "in_process_plugin"
+    assert manager["extension_id"] == bundle["bundle_id"]
+    assert manager["activation"]["entry_points"] == [
+        {"group": "vllm.general_plugins", "name": "vllm-ascend-quantized-kv-cache"}
+    ]
+    assert manager["activation"]["additional_config"] == {}
+    assert manager["extension_version"] == __version__ == bundle["bundle_version"]
+    assert {c["component_id"] for c in manager["components"]} == {
+        c["component_id"] for c in bundle["components"]
+    }
 
 
 def test_runtime_backends_use_plugin_mixins_over_the_host_impl() -> None:

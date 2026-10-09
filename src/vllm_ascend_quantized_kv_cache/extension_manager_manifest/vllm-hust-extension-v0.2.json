@@ -1,12 +1,29 @@
 {
-  "schema_version": "1.0",
-  "bundle_id": "org.vllm-hust.ascend-quantized-kv-cache",
-  "bundle_version": "0.2.0rc4",
-  "host_api_range": ">=1,<2",
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.ascend-quantized-kv-cache",
+  "extension_version": "0.2.0rc4",
+  "kind": "in_process_plugin",
   "host": {
     "provider": "vllm",
-    "name": "vllm-ascend-hust"
+    "name": "vllm",
+    "version_range": ">=0",
+    "api_range": ">=1,<2"
   },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm_processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [],
+  "implementation": [
+    {
+      "type": "python_entry_point",
+      "group": "vllm.general_plugins",
+      "name": "vllm-ascend-quantized-kv-cache"
+    }
+  ],
+  "requires_services": [],
   "components": [
     {
       "component_id": "int8-kv-attention-backend",
@@ -38,5 +55,15 @@
         "device_access"
       ]
     }
-  ]
+  ],
+  "activation": {
+    "entry_points": [
+      {
+        "group": "vllm.general_plugins",
+        "name": "vllm-ascend-quantized-kv-cache"
+      }
+    ],
+    "environment": {},
+    "additional_config": {}
+  }
 }

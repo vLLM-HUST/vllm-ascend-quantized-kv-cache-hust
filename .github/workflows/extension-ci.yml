@@ -31,9 +31,8 @@ jobs:
           .release-smoke/bin/python -m pip install --no-cache-dir dist/*.whl
           .release-smoke/bin/python -c "
           import importlib.metadata as im
-          assert im.version('vllm-ascend-quantized-kv-cache') == '0.2.0.dev0'
           from vllm_ascend_quantized_kv_cache import kv_methods, __version__
-          assert __version__ == '0.2.0.dev0'
+          assert im.version('vllm-ascend-quantized-kv-cache') == __version__
           names = kv_methods.list()
           assert names == ['int8_dynamic', 'kivi_int4']
           int8 = kv_methods.get('int8_dynamic', head_size=128)
@@ -46,4 +45,4 @@ jobs:
           "
       - name: Validate Bundle v1 manifest
         run: |
-          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend'}; assert len(p['components'])==2"
+          python -c "import json; p=json.load(open('src/vllm_ascend_quantized_kv_cache/manifests/vllm-hust-extension-v1.json')); assert p['schema_version']=='1.0'; assert p['host']=={'provider':'vllm','name':'vllm-ascend-hust'}; assert len(p['components'])==2"

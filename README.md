@@ -101,3 +101,27 @@ pydantic 的 `Literal` 拒绝，清单与已核行号见
   一律 fail-closed 并报明确错误，不猜布局。
 - 调研引用的外部数字（精度、吞吐、压缩比）全部来自论文或厂商口径，我们自己
   没复测过；对外引用前先跑自己的 benchmark。
+
+## 发行元数据
+
+两份 manifest 都打进 wheel：
+
+- `manifests/vllm-hust-extension-v1.json` —— Bundle v1，供需要静态准入的宿主经
+  `VLLM_EXTENSION_MANIFESTS` 显式读取；声明本插件提供的两个 backend 组件
+  （int8 / kivi_int4），运行时接入仍由 `vllm.general_plugins` 调
+  `install_kv_impl_dispatch()` 完成。
+- `extension_manager_manifest/vllm-hust-extension-v0.2.json` —— vLLM-HUST
+  Extension Manager 的发现清单（`vllm-hust.extension_bundles` entry point）。
+  **发现不等于激活**：清单只让 `vllm-hust-ext extension list` 看得见，量化路径
+  仍要命令行显式选 dtype。
+
+仓库身份、直接责任人、advisor 状态、默认关闭与回滚承诺、适用范围与证据定级记录在
+[`MOD_METADATA.json`](MOD_METADATA.json)。`advisor_status: unknown` 不等于已确认
+`none`；其中的性能表述只覆盖所列 workload 与证据标签，不是通用在线结论。
+
+已验证环境（2026-09-16，插件 `0.2.0.dev0`，宿主 vLLM-HUST `8a6655cf62` /
+vLLM-Ascend-HUST `f4f49832`）：单卡 Ascend 910B + Qwen2.5-14B-Instruct(BF16)、
+动态 per-channel INT8、8192 上下文，prefill / decode、ACL Graph capture/replay
+与 OpenAI Chat API(3×HTTP 200) 全通过；后续 INT4 的设备与 serve 记录见上面的
+"查证据"。该验证不代表已覆盖多卡、context parallel、所有模型或所有宿主版本，
+正式发布前要在目标宿主版本上用目标 wheel 重跑。

@@ -12,17 +12,24 @@ dependencies = []
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "ruff>=0.12"]
+test = [
+  "pytest>=8",
+  "ruff>=0.12",
+  "tomli>=2; python_version < '3.11'",
+]
 
 # Runtime plugin hook. It registers the backends; --kv-cache-dtype int8 or
 # kivi_int4 is the explicit activation switch.
 [project.entry-points."vllm.general_plugins"]
 "vllm-ascend-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
 
-# Extension-manager discovery hook. It makes the bundle visible to
-# `vllm-hust-ext extension list`; it does not activate anything by itself.
+# Extension-manager discovery hook: makes the bundle visible to
+# `vllm-hust-ext extension list` by reading the Manager manifest without
+# importing this package. Runtime registration stays on the
+# `vllm.general_plugins` hook above, so discovery alone activates nothing.
+# One table only -- a second declaration makes the file invalid TOML.
 [project.entry-points."vllm_hust.extension_bundles"]
-"org.vllm-hust.ascend-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.manifests"
+"org.vllm-hust.ascend-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.extension_manager_manifest"
 
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"
@@ -31,7 +38,12 @@ path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 packages = ["src/vllm_ascend_quantized_kv_cache"]
 
 [tool.hatch.build]
-exclude = ["src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md"]
+exclude = [
+  ".venv/",
+  "venv/",
+  ".release-venv/",
+  ".release-smoke/",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -39,7 +51,6 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py310"
 line-length = 88
-extend-exclude = ["src/vllm_ascend_quantized_kv_cache/BidKV打包与发布指南.md"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "SIM", "UP"]

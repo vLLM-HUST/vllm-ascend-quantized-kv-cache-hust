@@ -5,6 +5,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.venv/
+venv/
+.release-venv/
 
 .release-smoke/
 .zcode/
