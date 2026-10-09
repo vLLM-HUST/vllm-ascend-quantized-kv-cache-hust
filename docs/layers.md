@@ -112,19 +112,21 @@ vllm serve 启动
 ## 5. 常用调用速查
 
 ```python
-from vllm_ascend_quantized_kv_cache import kv_methods, adapters
+from vllm_ascend_quantized_kv_cache import adapters, kv_methods
 
-kv_methods.list()                                   # 六方法名（任何进程）
-kv_methods.describe("kivi_int4")                    # 元数据（不触发重导入）
-kv_methods.get("int8_dynamic", head_size=128)       # 句柄（构造即校验）
+kv_methods.list()
+# ['fp8_per_token_head', 'int8_dynamic', 'kivi_int4']  （任何进程，零重导入）
+kv_methods.describe("kivi_int4")["supports"]           # ['vllm_ascend_hust']
+kv_methods.get("int8_dynamic", head_size=128)          # 句柄（构造即校验）
 
 # 宿主激活（二选一：显式指定 or 自动探测）
 kv_methods.activate("int8_dynamic", host="vllm_ascend_hust")
-kv_methods.activate("kivi_int4")                    # host=None → detect_host()
+kv_methods.activate("kivi_int4")                       # host=None -> detect_host()
 
-# 低层等价形式（适配器直接操作）
-adapters.adapter_for("vllm_hust")                   # 惰性取适配器类
-kv_methods.get("int8_dynamic").host_adapter("vllm_hust").register()
+# 低层等价形式（适配器直接操作）。本分支只有 vllm_ascend_hust：
+# host_adapter("vllm_hust") 抛 ValueError，vllm_hust 适配器在 dev 分支。
+adapters.adapter_for("vllm_ascend_hust")
+kv_methods.get("int8_dynamic").host_adapter("vllm_ascend_hust").register()
 ```
 
 命令行（运维）等价物见 [how-to-run.md](how-to-run.md) §6–§7。

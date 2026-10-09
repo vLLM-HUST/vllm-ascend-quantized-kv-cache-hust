@@ -52,6 +52,12 @@ testpaths = ["tests"]
 target-version = "py310"
 line-length = 88
 
+[tool.ruff.format]
+# Docs align inline comments in code blocks on purpose; ruff >=0.13 reflows
+# markdown code blocks, and the pinned local toolchain (0.12) does not -- that
+# version skew is what made CI red on docs/layers.md. Keep prose free-form.
+exclude = ["**/*.md"]
+
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "SIM", "UP"]
 
