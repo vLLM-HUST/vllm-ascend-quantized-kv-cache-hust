@@ -19,6 +19,11 @@ test = ["pytest>=8", "ruff>=0.12"]
 [project.entry-points."vllm.general_plugins"]
 "vllm-ascend-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.bootstrap:register_plugins"
 
+# Extension-manager discovery hook. It makes the bundle visible to
+# `vllm-hust-ext extension list`; it does not activate anything by itself.
+[project.entry-points."vllm_hust.extension_bundles"]
+"org.vllm-hust.ascend-quantized-kv-cache" = "vllm_ascend_quantized_kv_cache.manifests"
+
 [tool.hatch.version]
 path = "src/vllm_ascend_quantized_kv_cache/_version.py"
 

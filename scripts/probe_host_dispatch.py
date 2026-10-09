@@ -54,9 +54,10 @@ DELEGATED = ("fp8", "fp8_e4m3", "float16")
 def select(cache_dtype: str, *, context_parallel: bool = False) -> type:
     """Ask the live host factory which impl class a dtype literal resolves to.
 
-    The context-parallel flags are *not* stubbed here: this host revision has no
-    ``enable_cp``, so the guard has to answer from the real ``enable_dcp`` /
-    ``enable_pcp`` pair. ``enable_dcp`` is lru_cached, hence the cache_clear.
+    The context-parallel flags are *not* stubbed: the guard answers from
+    whichever CP helpers this host revision exposes (``enable_cp`` on the
+    ba82f2122 pair, the ``enable_dcp``/``enable_pcp`` pair on older hosts).
+    ``enable_dcp`` is lru_cached, hence the cache_clear when present.
     """
     config = VllmConfig(cache_config=CacheConfig(), parallel_config=ParallelConfig())
     # The host's cache_dtype is a validated Literal that does not carry the
@@ -65,7 +66,14 @@ def select(cache_dtype: str, *, context_parallel: bool = False) -> type:
     object.__setattr__(config.cache_config, "cache_dtype", cache_dtype)
     if context_parallel:
         object.__setattr__(config.parallel_config, "decode_context_parallel_size", 2)
-    attention_utils.enable_dcp.cache_clear()
+    # Host CP probes drifted across revisions: older hosts expose only the
+    # lru_cached enable_dcp/enable_pcp pair, newer ones a single enable_cp —
+    # which is lru_cached here too. Clear whichever exist before switching
+    # the config, or the first (non-CP) answer sticks forever.
+    for name in ("enable_cp", "enable_dcp", "enable_pcp"):
+        fn = getattr(attention_utils, name, None)
+        if fn is not None and hasattr(fn, "cache_clear"):
+            fn.cache_clear()
     with set_current_vllm_config(config):
         return AscendAttentionBackend.get_impl_cls()
 
