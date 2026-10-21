@@ -34,7 +34,10 @@ jobs:
           from vllm_ascend_quantized_kv_cache import kv_methods, __version__
           assert im.version('vllm-ascend-quantized-kv-cache') == __version__
           names = kv_methods.list()
-          assert names == ['int8_dynamic', 'kivi_int4']
+          assert names == ['fp8_per_token_head', 'int8_dynamic', 'kivi_int4']
+          fp8 = kv_methods.get('fp8_per_token_head', head_size=128)
+          assert fp8.resolve_layout().storage_dtype == 'uint8'
+          assert fp8.resolve_layout().packed_last_dim == 128
           int8 = kv_methods.get('int8_dynamic', head_size=128)
           assert int8.resolve_layout().storage_dtype == 'int8'
           assert int8.resolve_layout().packed_last_dim == 128

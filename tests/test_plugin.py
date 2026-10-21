@@ -530,7 +530,7 @@ assert "torch" not in sys.modules, sorted(sys.modules)
 def test_shipped_dispatch_maps_each_dtype_to_its_own_mixin(monkeypatch, host_stack):
     pytest.importorskip(
         "torch",
-        reason="building the shipped impl classes needs torch (host runtime dependency)",
+        reason="building shipped impl classes needs torch (host runtime dependency)",
     )
     """The builder table itself must map each dtype to that dtype's mixin.
 

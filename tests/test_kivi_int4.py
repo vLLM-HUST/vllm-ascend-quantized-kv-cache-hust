@@ -15,14 +15,16 @@ import pytest
 # the device kernels, so the whole module skips there rather than erroring.
 torch = pytest.importorskip("torch", reason="needs torch (host runtime dependency)")
 
-from vllm_ascend_quantized_kv_cache.methods.base import MethodConfig
-from vllm_ascend_quantized_kv_cache.methods.kivi_int4 import (
+from vllm_ascend_quantized_kv_cache.methods.base import (  # noqa: E402
+    MethodConfig,
+)
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4 import (  # noqa: E402 — runtime prerequisite must run before imports
     attention_backend as ab,
 )
-from vllm_ascend_quantized_kv_cache.methods.kivi_int4.geometry import (
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4.geometry import (  # noqa: E402 — runtime prerequisite must run before imports
     validate_kivi_config,
 )
-from vllm_ascend_quantized_kv_cache.methods.kivi_int4.semantics import (
+from vllm_ascend_quantized_kv_cache.methods.kivi_int4.semantics import (  # noqa: E402 — runtime prerequisite must run before imports
     KiviInt4Semantics,
 )
 
