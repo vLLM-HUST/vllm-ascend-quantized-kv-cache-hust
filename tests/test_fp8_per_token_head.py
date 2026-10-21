@@ -28,11 +28,11 @@ from vllm_ascend_quantized_kv_cache.methods.fp8_per_token_head.byte_cache import
 from vllm_ascend_quantized_kv_cache.methods.fp8_per_token_head.semantics import (  # noqa: E402 — runtime prerequisite must run before imports
     Fp8PerTokenHeadSemantics,
 )
-from vllm_ascend_quantized_kv_cache.methods.registry import (
-    get_method,  # noqa: E402 — runtime prerequisite must run before imports
+from vllm_ascend_quantized_kv_cache.methods.registry import (  # noqa: E402
+    get_method,
 )
-from vllm_ascend_quantized_kv_cache.ops.triton import (
-    per_token_head_store,  # noqa: E402 — runtime prerequisite must run before imports
+from vllm_ascend_quantized_kv_cache.ops.triton import (  # noqa: E402
+    per_token_head_store,
 )
 
 HEAD = 128
